@@ -350,8 +350,8 @@ def cmd_cluster(a):
     """Group keywords by how much their SERPs agree. One cluster = one page.
 
     The question this answers is the one that decides the whole content plan and
-    that nothing else in this skill answers: are `cs 1.6 crosshair generator`
-    and `how to change crosshair cs 1.6` one page or two? Guessing from the
+    that nothing else in this skill answers: are `widget crosshair generator`
+    and `how to change a widget crosshair` one page or two? Guessing from the
     words is unreliable - phrasings that look identical routinely return
     disjoint SERPs, and phrasings that look unrelated routinely return the same
     ten URLs.

@@ -152,11 +152,14 @@ All stdlib Python 3, no installs. Every one prints JSON.
 | `serp.py` | live SERPs through the provider ladder, plus the weakness/authority scoring the gate needs |
 | `keywords.py` | autocomplete expansion, tool-intent sweeps, DataForSEO volume/KD, Search Console → candidates |
 | `sameness.py` | the corpus sameness gate + a pairwise drift audit |
-| `authority.py` | DR-equivalent, and the KD zones / volume band that follow from it |
+| `authority.py` | DR-equivalent, and the KD zones / volume band that follow from it. Also `--bulk` competitor scoring, free referring-domain counts, a 12-month authority trend, and a Cloudflare Radar popularity bucket |
+| `bing.py` | **the only free source of real search volume AND backlinks** — Bing Webmaster Tools for a site you own. Impressions per query, related-keyword expansion with numbers, inbound links, query stats |
+| `trendfeeds.py` | **keyless demand signals**: Google Trends' RSS feed (works where the 429-ing JSON API does not), Wikimedia pageviews as absolute topic demand, and HN + StackExchange chatter |
 | `rankcheck.py` | batch rank checks for every tracked keyword |
 | `serpd.py` | **the fast path for SERP-heavy runs**: a long-lived headed Chrome behind `localhost:8791`. One curl per check, real Google, no DOM in your context. 25 checks in ~37s and 1.4KB of verdicts. |
 | `indexnow.py` | get published pages crawled: IndexNow ping (free, keyless, Bing/Yandex) + the batched Google "Request indexing" follow-up |
 | `test_guards.py` | regression tests for the SERP guards, against real captured responses |
+| `test_providers.py` | regression tests for the free-provider integrations — chiefly that Open PageRank's `found: false` can never become a DR of 0 |
 | `seodoctor.py` | **self-healing preflight** - idempotent check+repair of the daemon, its Chrome, deps and project state. Run it first, every run. |
 | `crawllog.py` | **the access log**: crawl budget by silo, status codes served to bots, AI-crawler ingestion, and reverse+forward DNS bot verification. `--remote` runs the aggregation on the server so the log never crosses the wire. |
 | `decay.py` | two Search Console periods -> pages that LOST RANK, separated from pages whose demand fell. Plus self-cannibalisation. |
@@ -178,7 +181,20 @@ python3 $SEO/serp.py "keyword" --count 10 --target-domain example.com
 python3 $SEO/keywords.py expand --seed "<facet>" --groups commercial comparison
 python3 $SEO/sameness.py check --draft new.md --corpus content/blog --keyword "kw" --pages .seo/pages.json
 python3 $SEO/authority.py --domain example.com --save
+python3 $SEO/authority.py --domain example.com --bulk rival1.com,rival2.com   # who actually outranks you
 python3 $SEO/rankcheck.py --all --depth 20
+
+# keyless demand signals (no key, no browser - see data-sources.md)
+python3 $SEO/trendfeeds.py trending --geo US            # Trends RSS: the API 429s, this does not
+python3 $SEO/trendfeeds.py wiki --topic "<topic>"       # resolve the article title FIRST
+python3 $SEO/trendfeeds.py pageviews --article "<Title>" --days 90
+python3 $SEO/trendfeeds.py discussions --query "<problem>" --site webmasters
+
+# real numbers (Bing Webmaster - needs a verified property)
+python3 $SEO/bing.py sites                          # auth control; run first if anything looks odd
+python3 $SEO/bing.py keyword --q "<kw>" --days 90   # impressions, NOT Google volume
+python3 $SEO/bing.py expand  --seed "<kw>" --limit 25
+python3 $SEO/bing.py backlinks
 
 # SERP-heavy run (research): start the daemon once, then one call for the lot
 # NEVER append `&` - --start already detaches, and the `&` only kills the poller
@@ -227,6 +243,10 @@ well as in the quality bar:
 - **Never fabricate data.** No invented volumes, difficulties, positions, or
   stats, ever. A failed tool call is **reported**, not papered over. Missing data
   is a data gate that does not apply — never a gate the candidate failed.
+  This includes **absence returned by a working API**: Open PageRank's
+  `found: false` means the link graph has never seen that domain, which is not
+  a DR of 0, and Wikimedia pageviews are topic interest, not search volume.
+  Neither may be substituted for the number it resembles.
 - **A negative result is only as good as its control.** Before reporting that
   something is absent — not indexed, not crawled, not cited, not in the corpus,
   a bot that is spoofed — run the same probe against something you KNOW is

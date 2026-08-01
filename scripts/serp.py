@@ -21,10 +21,21 @@ query?" The provider ladder runs cheapest-and-keyless first:
                 --provider browser prints a hardened recipe to run.
     searxng     Any SearXNG instance with the JSON API enabled (self-hosted is
                 the reliable form - public instances antibot).
-    brave       Brave Search API. Free tier: 1 query/s, 2000/month, BYO key.
+    brave       Brave Search API. NO LONGER a flat free tier: usage-billed at
+                $5/1k with $5/month in credits, and a key needs a card-backed
+                subscription. BYO key / ~/.brave_search_key.
+    serper      Serper.dev. Real Google, 1 credit per search, 2500 free
+                credits, no monthly reset. Cheapest real-Google query here and
+                the one to reach for first among the keyed providers.
+                SERPER_API_KEY or ~/.serper_key.
     serpapi     SerpApi. Free tier 250 searches/month, BYO key. Real Google,
-                top-100 in one credit, includes the AI Overview inline.
+                top-100 in one credit, includes the AI Overview inline. Spend
+                its 250 on the checks that need DEPTH; use serper for volume.
+                SERPAPI_KEY or ~/.serpapi_key.
     dataforseo  DataForSEO live SERP. Paid, BYO login/password. Real Google.
+
+Keys are read from the environment first, then from a chmod-600 dotfile, so
+they survive a new shell without ever landing in a committed file.
 
 Bing is deliberately NOT a provider. See RELEVANCE below.
 
@@ -70,10 +81,11 @@ UA = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-# The full browser header set, not just a User-Agent. A sibling project's
-# backend/src/gametracker-ba.js:20-39 records the measurement: a bare UA gets
-# the request reset or 403'd, the full set returns 200. It is also what made
-# DuckDuckGo answer consistently here.
+# The full browser header set, not just a User-Agent. Measured against a
+# scraping-hostile endpoint: a bare UA gets the request reset or 403'd, the
+# full set returns 200. It is also what made DuckDuckGo answer consistently
+# here. Sending only User-Agent is the common mistake - the Sec-Fetch-* and
+# Sec-Ch-Ua headers are part of what makes the request look real.
 BROWSER_HEADERS = {
     "User-Agent": UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -362,7 +374,7 @@ def verify_relevance(query: str, results: list[dict]) -> dict:
     # matched 1 of 4 tokens. Neither exemption below touches that case.
     verdict_override = None
 
-    # (1) One surviving token cannot discriminate. "cs 1.6 unblocked" reduces to
+    # (1) One surviving token cannot discriminate. "foo 1.6 unblocked" reduces to
     # ["unblocked"], so coverage is a binary "does this exact word appear". The
     # real page 1 was entirely browser-play results - the RIGHT intent - and
     # scored 0.0 because no title said "unblocked". Google broadening a
@@ -373,7 +385,7 @@ def verify_relevance(query: str, results: list[dict]) -> dict:
 
     # (2) Full coverage means every distinct query token IS present across the
     # top 10, which definitionally excludes the wrong-query failure. A low
-    # hit_rate there measures synonym spread, not correctness: "cs 1.6 zombie
+    # hit_rate there measures synonym spread, not correctness: "foo 1.6 zombie
     # mode online" returned Zombie Plague servers, Zombie Escape and zombie-mod
     # server lists - unmistakably the right SERP - and missed by 0.25 vs 0.30
     # because titles say "mod"/"servers" rather than "mode"/"online".
@@ -553,9 +565,9 @@ def provider_searxng(query: str, count: int, *, instance=None, proxy=None, **_) 
 
 
 def provider_brave(query: str, count: int, *, proxy=None, **_) -> list[dict]:
-    key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
+    key = read_key("BRAVE_SEARCH_API_KEY", "~/.brave_search_key")
     if not key:
-        raise RuntimeError("brave needs BRAVE_SEARCH_API_KEY (free tier: 2000 queries/month)")
+        raise RuntimeError("brave needs BRAVE_SEARCH_API_KEY (usage-billed; a key requires a card-backed subscription)")
     qs = urllib.parse.urlencode({"q": query, "count": min(count, 20), "country": "us", "search_lang": "en"})
     status, text = fetch(f"https://api.search.brave.com/res/v1/web/search?{qs}",
                          headers={"Accept": "application/json", "X-Subscription-Token": key}, proxy=proxy)
@@ -566,10 +578,63 @@ def provider_brave(query: str, count: int, *, proxy=None, **_) -> list[dict]:
             for r in (data.get("web", {}).get("results") or [])[:count]]
 
 
-def provider_serpapi(query: str, count: int, *, gl="us", hl="en", proxy=None, **_) -> list[dict]:
-    key = os.environ.get("SERPAPI_KEY", "").strip()
+def read_key(env_name: str, path: str) -> str:
+    """Env first, then a chmod-600 dotfile. Never a committed file.
+
+    The dotfile fallback exists so a key survives a new shell without anyone
+    being tempted to put it in a repo or a shell profile that gets committed.
+    """
+    val = os.environ.get(env_name, "").strip()
+    if val:
+        return val
+    try:
+        p = os.path.expanduser(path)
+        if os.path.isfile(p):
+            return open(p).read().strip()
+    except OSError:
+        pass
+    return ""
+
+
+def provider_serper(query: str, count: int, *, gl="us", hl="en", proxy=None, **_) -> list[dict]:
+    """Serper.dev - real Google, 1 credit per search, 2500 free credits.
+
+    Cheapest real-Google option per query and the fastest to set up, so it sits
+    above serpapi in the fallback order. It does NOT do top-100 in one credit
+    the way serpapi does; `num` is capped at 100 but deep pages cost more.
+    """
+    key = read_key("SERPER_API_KEY", "~/.serper_key")
     if not key:
-        raise RuntimeError("serpapi needs SERPAPI_KEY")
+        raise RuntimeError("serper needs SERPER_API_KEY (or ~/.serper_key)")
+    payload = json.dumps({"q": query, "num": min(count, 100), "gl": gl, "hl": hl})
+    status, text = fetch("https://google.serper.dev/search", data=payload,
+                         headers={"X-API-KEY": key, "Content-Type": "application/json"},
+                         timeout=45, proxy=proxy)
+    if status != 200:
+        raise RuntimeError(f"serper returned HTTP {status}: {text[:160]}")
+    data = json.loads(text)
+    if data.get("message") and not data.get("organic"):
+        raise RuntimeError(f"serper: {data['message']}")
+    results = [{"title": r.get("title", ""), "url": r.get("link", ""),
+                "snippet": (r.get("snippet") or "")[:300], "position": r.get("position")}
+               for r in (data.get("organic") or [])[:count]]
+    # Serper exposes the AI Overview as `answerBox`/`aiOverview` depending on
+    # the SERP. Record presence either way - the authority gate reads it.
+    ai = data.get("aiOverview") or data.get("answerBox")
+    if ai:
+        refs = ai.get("references") or ai.get("sources") or []
+        results_meta["ai_overview"] = {
+            "present": True,
+            "references": [{"domain": host_of(r.get("link", "")), "url": r.get("link"),
+                            "title": r.get("title")} for r in refs if isinstance(r, dict)],
+        }
+    return results
+
+
+def provider_serpapi(query: str, count: int, *, gl="us", hl="en", proxy=None, **_) -> list[dict]:
+    key = read_key("SERPAPI_KEY", "~/.serpapi_key")
+    if not key:
+        raise RuntimeError("serpapi needs SERPAPI_KEY (or ~/.serpapi_key)")
     qs = urllib.parse.urlencode({"engine": "google", "q": query, "num": min(count, 100),
                                  "gl": gl, "hl": hl, "api_key": key})
     status, text = fetch(f"https://serpapi.com/search.json?{qs}", timeout=45, proxy=proxy)
@@ -627,6 +692,7 @@ PROVIDERS = {
     "ddg": provider_ddg,
     "searxng": provider_searxng,
     "brave": provider_brave,
+    "serper": provider_serper,
     "serpapi": provider_serpapi,
     "dataforseo": provider_dataforseo,
 }
@@ -842,7 +908,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("query", nargs="?", help="the search query")
     p.add_argument("--provider", default=os.environ.get("SEO_SERP_PROVIDER", "ddg"),
-                   choices=["ddg", "serpd", "searxng", "brave", "serpapi", "dataforseo", "browser"])
+                   choices=["ddg", "serpd", "searxng", "brave", "serper", "serpapi", "dataforseo", "browser"])
     p.add_argument("--count", type=int, default=10)
     p.add_argument("--instance", help="searxng base URL")
     p.add_argument("--gl", default="us", help="country (serpapi/brave) or location_code (dataforseo)")
@@ -907,9 +973,11 @@ def main():
                     avail.append("serpd")   # real Google, so it outranks the keyed ones
         except Exception:
             pass
-        if os.environ.get("SERPAPI_KEY"):
+        if read_key("SERPER_API_KEY", "~/.serper_key"):
+            avail.append("serper")
+        if read_key("SERPAPI_KEY", "~/.serpapi_key"):
             avail.append("serpapi")
-        if os.environ.get("BRAVE_SEARCH_API_KEY"):
+        if read_key("BRAVE_SEARCH_API_KEY", "~/.brave_search_key"):
             avail.append("brave")
         if os.environ.get("DATAFORSEO_LOGIN") and os.environ.get("DATAFORSEO_PASSWORD"):
             avail.append("dataforseo")

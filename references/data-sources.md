@@ -21,8 +21,10 @@ so this is the ladder that matters most.
 | **`serpd`** (local SERP daemon) | free | no | ✅ **verified - the fast path** | The same headed Chrome, held open behind a small HTTP server. One curl returns a fully scored result; `/batch` did **25 queries in 37s**. Compact verdicts are **1.4KB where the full payload is 164KB**. Start with `serpd.py --start`. See below. |
 | **`browser`** (real Google via browser MCP) | free | no | ✅ **verified working** | Real Google page 1 with positions, titles, URLs, the AI-Overview flag and People-Also-Ask. Verified returning 8 clean results at the exact moment every HTTP provider was refusing. Cannot run unattended from a script — `serp.py --provider browser` prints a hardened recipe, and you pipe the result back through `serp.py --score-json -`. |
 | **`ddg`** (DuckDuckGo HTML) | free | no | ⚠️ **works, then refuses for a while** | The scripted default. Real, relevant results, ~10/page. Not Google, so treat ordering as *directional*. Goes into blanket HTTP 202 refusal under load — **see below, this is the fact that will bite you.** |
-| **`serpapi`** | free tier 250/mo | yes | untested here | Real Google, **top-100 in one credit**, AI Overview inline. The best upgrade if you want unattended rank tracking. `SERPAPI_KEY`. |
-| **`brave`** | free tier | yes | untested here | Brave Search API: 2000 queries/month, 1 q/s. Independent index. `BRAVE_SEARCH_API_KEY`. |
+| **`serper`** | **2500 free credits** (one-off, no monthly reset) | yes | ✅ **verified live** | Real Google, **1 credit per search**, organic + PAA + related searches. The cheapest real-Google query available here — reach for this first among keyed providers. `SERPER_API_KEY` or `~/.serper_key`. |
+| **`serpapi`** | free tier 250/mo | yes | ✅ **verified live** | Real Google, **top-100 in one credit**, **AI Overview inline** (confirmed present in a live response). Spend its 250 on checks that need DEPTH or the AI-Overview read; use `serper` for volume. `SERPAPI_KEY` or `~/.serpapi_key`. |
+| **`brave`** | ⚠️ **card required** | yes | ⚠️ **not free-without-a-card any more** | Usage-billed at $5/1k requests with $5/month in credits; a key needs an active subscription. See "The keyed SERP providers" below. `BRAVE_SEARCH_API_KEY`. |
+| **`marginalia`** | free | no | ✅ **verified keyless** | `api.marginalia.nu/public/search/<q>` answers 200 JSON with no key at all. A genuinely independent index that deliberately favours non-commercial pages — **useless for the authority gate** (it down-ranks exactly the commercial results the gate counts) but a real seam for information-gain research. |
 | **`dataforseo`** | paid | yes | untested here | Real Google, live, per-request billing. |
 | **`searxng`** | free (self-host) | no | ⚠️ **public instances blocked** | A *self-hosted* SearXNG with `format: json` is an excellent free aggregator. Public ones are not: `searx.be` answered with an antibot challenge, `priv.au` with 429. |
 | ~~Bing~~ | — | — | ❌ **actively hostile — never add it** | See the wrong-query warning below. |
@@ -357,8 +359,56 @@ The whole quality bar scales off this one number.
 | Source | Cost | Key? | Status | Notes |
 |---|---|---|---|---|
 | **DataForSEO backlinks summary** | paid | yes | — | What the original uses. `rank / 10` → DR. Also gives referring domains, backlinks, spam score. |
-| **Open PageRank** | **free** | yes (free) | ✅ endpoint live (needs a key) | **The recommended free substitute.** Built from the Common Crawl link graph, 1000 requests/day. Register at <https://www.domcop.com/openpagerank/> — it takes two minutes. Set `OPENPAGERANK_API_KEY`. The 0–10 log scale ×10 lines up usefully with the 0–100 DR scale. It is not Ahrefs DR and will disagree at the edges; for picking a KD ceiling that is close enough. |
+| **Open PageRank** | **free** | yes (free) | ✅ **verified end-to-end 2026-08-01** | **The recommended free substitute, and the only free referring-domain count in this skill.** Built from the Common Crawl link graph. Free plan **30,000 domains/month, 100 domains per call**, monthly history back to 2018. Set `OPENPAGERANK_API_KEY` or drop the key in `~/.openpagerank_key` (chmod 600). |
+| **Cloudflare Radar** | free | yes (any CF token) | ✅ **verified working** | `radar/ranking/domain/<d>` returns a popularity **bucket** (`200`, `>200000`) from 1.1.1.1 resolver traffic. A completely independent second opinion on authority, and it answers for domains Common Crawl has never seen. |
 | **Keyless estimate** | free | no | ✅ **verified working** | `authority.py` composite from domain age (RDAP), live page count (the site's own sitemap), and Search Console footprint. **Capped at 25 on purpose.** |
+
+### ⚠️ Open PageRank MOVED — the old signup is closed (measured 2026-08-01)
+
+`domcop.com/openpagerank/` **no longer accepts new signups at all**. OPR was
+acquired by Keywords Everywhere and the live service is now at
+<https://openpagerank.keywordseverywhere.com/>. Existing legacy keys keep
+working on the old endpoint **until 2026-09-30**, then stop.
+
+Anyone following the old instructions gets a dead end, so:
+
+| | legacy | current |
+|---|---|---|
+| host | `openpagerank.com/api/v1.0/getPageRank` | `openpagerank.keywordseverywhere.com/v1/domains/bulk` |
+| auth | `API-OPR: <40-hex>` | `Authorization: Bearer opr_live_...` |
+| free tier | 1000 req/day | **30,000 domains/month** |
+| per call | 1 domain | **100 domains** |
+| returns | score + rank | score + rank + **referring_domains** + **monthly history since 2018** |
+
+`authority.py` **auto-detects which key you have** from its prefix and speaks
+the matching protocol, so a legacy key needs no config change. Registration is
+two steps and takes about five minutes: get a free Keywords Everywhere API key
+at <https://keywordseverywhere.com/first-install-addon.html> (emailed link),
+then sign in with it at the OPR site and create an `opr_live_` key.
+
+⚠️ **A free KE key does NOT buy KE keyword volume.** Measured: their
+`get_keyword_data` endpoint returns **`402 Insufficient Credits`**. The key is
+only a login for the OPR free tier. Do not add KE as a volume provider.
+
+### ⛔ `found: false` is NOT authority zero
+
+The single most important detail in this integration. OPR returns an explicit
+`found` flag, and a domain absent from the Common Crawl link graph gets **no
+score at all** — which is a different thing from a score of zero.
+
+Measured on the real API: `google.com` 10.0 (2,242,263 referring domains),
+`github.com` 9.5 (269,173), `tildes.net` 3.93 (128) — and a small, real, live
+site of our own came back **`found: false`**: genuinely absent from the link
+graph, not weak.
+
+So `from_openpagerank()` treats `found: false` as a **failed read** and falls
+through to the keyless estimate, exactly like an HTTP error would. Mapping it
+to `dr: 0` would hand the quality bar a fabricated measurement, and because
+`dr` drives the KD ceiling and the volume band, that one substitution would
+silently re-scope every keyword decision that follows. In `--bulk` competitor
+tables it stays `null` for the same reason: rendering an unmeasured competitor
+as 0 sorts it below you and reads as "weaker than us", which is the opposite
+of "unknown".
 
 ### Why the estimate is capped
 
@@ -384,21 +434,70 @@ about its provenance.
 
 ---
 
-## Google Trends
+## Google Trends — the JSON API is 429, the RSS feed is NOT
 
-❌ **HTTP 429 from this container**, both by curl and through the browser MCP —
-the Trends API rate-limits by IP reputation and a datacenter address starts
-throttled.
+❌ The **Trends JSON API** answers **HTTP 429 from this container**, both by curl
+and through the browser MCP — it rate-limits by IP reputation and a datacenter
+address starts throttled.
 
-Treat Trends as an **optional, best-effort** signal:
+✅ **The `trending/rss` feed is a different surface and it works.** Measured
+2026-08-01, in the same container, in the same minute the JSON API was still
+refusing: **HTTP 200, ~21 KB, 10 items**, each carrying an `approx_traffic`
+band. That is the whole reason `trendfeeds.py` exists — the radar had no
+quantitative signal at all, and it turned out one was reachable the entire time
+behind a different URL.
 
-- If you have a residential IP or a proxy, the API works and is genuinely useful
-  for the trend radar.
-- Otherwise the radar runs fine without it: autocomplete reflects new queries
-  within days, and Reddit/HN/vendor-changelog sweeps (`workflow-trends.md` step 3)
-  are the real hype signal anyway.
-- **A 429 is an unavailable signal, not a dry niche.** Never report "no trends
-  found" when what happened is "trends refused to answer".
+```bash
+python3 $SEO/trendfeeds.py trending --geo US --limit 25
+```
+
+⚠️ **It is NATIONAL trending-now, not your niche.** A typical read is football,
+politics and celebrity names. Filter it against the site's facets before
+treating anything in it as a signal, and remember `approx_traffic` is a floor
+band (`"200+"`), not a keyword's search volume.
+
+**A 429 is an unavailable signal, not a dry niche.** Never report "no trends
+found" when what happened is "Trends refused to answer" — `trendfeeds.py`
+returns `ok: false` with an explicit `REFUSED, not empty` note precisely so the
+two cannot be confused.
+
+## Topic demand — Wikimedia pageviews (keyless, and *absolute*)
+
+✅ **verified working.** Real daily counts with years of history, no key:
+
+```bash
+python3 $SEO/trendfeeds.py wiki --topic "<your topic>"          # resolve the title first
+python3 $SEO/trendfeeds.py pageviews --article "<Exact_Article_Title>" --days 90
+```
+
+Measured: a mid-size topic returned 78,820 views over 91 days, 866/day
+average, a peak of 1,948 on one day, and a first-half vs second-half change of
+−2.0% → `flat`.
+
+Two things make this genuinely better than Trends for the radar: the numbers
+are **absolute counts, not a 0–100 index**, so two topics are directly
+comparable; and there is no rate limiting to work around.
+
+**It measures interest in a TOPIC, not queries typed at Google.** It cannot
+satisfy the quality bar's volume floor — that floor stays a data gate that does
+not apply until you have real volume data. Never report a pageview count as a
+search volume.
+
+⚠️ Resolve the article title before asking for views. A wrong title returns a
+clean **404**, which the script surfaces as `ok: false` with a hint rather than
+as zeros — verified against a deliberately bogus article.
+
+## Where a niche argues — HN + StackExchange
+
+✅ Both keyless, both verified. `trendfeeds.py discussions --query "..."`
+returns Hacker News (Algolia) stories with points/comments and StackExchange
+questions with score/views/answered, from any SE site (`--site gaming`,
+`webmasters`, `stackoverflow`, …).
+
+❌ **Reddit is blocked** — `403` on `/r/<sub>/top.json` from this container,
+direct and via `old.reddit.com`, with a browser UA and with a tool UA. Reading
+it needs an OAuth app or the browser MCP. HN + StackExchange cover the same
+"what is this niche actually stuck on" seam without an account.
 
 ---
 
@@ -486,6 +585,166 @@ person actually followed.
 
 ---
 
+## The keyed SERP providers — what registration actually costs (measured 2026-08-01)
+
+The table at the top lists `serpapi`, `brave` and `dataforseo` as upgrades. All
+four were taken as far as they go from a container; here is where each one
+actually stops, so nobody budgets ten minutes for a signup that cannot be
+finished unattended.
+
+| Provider | Free tier | Signup blocker | Outcome |
+|---|---|---|---|
+| **Serper.dev** | 2,500 one-off credits | **visible reCAPTCHA v2 image challenge** on submit (400×580 panel), on top of a Turnstile that solves itself | ✅ **landed** (owner solved the CAPTCHA) |
+| **SerpApi** | 250 searches/month | same — reCAPTCHA v2 challenge renders on submit | ✅ **landed** (owner solved the CAPTCHA) |
+| **Bing Webmaster Tools** | genuinely free; real volume + the only free backlink data | requires **verified ownership** of the domain | ✅ **landed** (owner imported from GSC) |
+| **Brave** | ⚠️ **no longer a flat free tier** — see below | key minting requires an *active subscription*, and the only plans are usage-billed | ❌ **needs a card** — account created + verified, stops there |
+
+Three of the four are in. The two CAPTCHA gates each cost the owner about
+twenty seconds; everything either side of them — form fill, verification mail,
+emailed OTP — ran unattended.
+
+### ⚠️ Brave's free tier changed — "2000 queries/month" is stale
+
+Measured on the live dashboard: the Search plan is now **$5.00 per 1,000
+requests** with **"free $5 in credits every month, automatically applied"** —
+i.e. ~1,000 free requests/month, not 2,000, and structured as credit against a
+usage-billed plan rather than as a free plan.
+
+The consequence matters more than the number: `/app/keys` says *"Go to the
+Available plans page to subscribe to a plan before generating API keys"*, and
+every plan is usage-billed, so **a payment method is required before any key
+exists**. An account can be created and verified for free (this was done end to
+end — register → email verify → login → emailed OTP → dashboard), and it stops
+there. Under a "free only, no card" rule Brave is **out**, despite the
+effective cost being zero.
+
+### Bing Webmaster Tools is worth it, but only the owner can do it
+
+It is the one genuinely free source of **backlink data**, plus keyword research
+with real volume — for sites you have **verified ownership of**. That
+verification is the whole point and the whole blocker: it needs the site
+owner's own Microsoft or Google identity, not a throwaway. The fastest route
+for an existing site is *Import from Google Search Console*, which reuses a GSC
+property that is already verified.
+
+**This is an owner action. Do not attempt it with a disposable identity** — a
+throwaway account cannot verify a domain it does not own, and would produce an
+account with no data in it.
+
+### Signing up for the ones that need a human
+
+Two of the four just need someone to click a CAPTCHA. Everything else can be
+automated, including reading the confirmation mail — that is what
+[tempmail-cli](https://github.com/coffeegrind123/tempmail-cli) is for:
+
+```bash
+ADDR=$(tempmail new)
+SINCE=$(date +%s)                       # BEFORE triggering the signup
+# ... fill the form, human solves the CAPTCHA, submit ...
+tempmail wait "$ADDR" --match 'verif|confirm' --since "$SINCE"
+tempmail code <id>          # emailed OTP
+tempmail links <id> --match verif --first
+```
+
+Verified against the real thing: the Brave flow needed an email verification
+link *and* a 6-digit login OTP, and both came out of that loop without a human
+touching an inbox.
+
+## Bing Webmaster Tools — real volume and real backlinks, free
+
+**The most valuable addition to this skill, and the only source here that
+answers two questions nothing else could.** Landed 2026-08-01 against a
+verified property. `scripts/bing.py`.
+
+| Question | Command | Status |
+|---|---|---|
+| How much demand does this query have? | `bing.py keyword --q "..."` | ✅ **real impression counts** |
+| What related queries exist, and how big? | `bing.py expand --seed "..."` | ✅ **expansion WITH numbers** |
+| Who links to us? | `bing.py backlinks` | ✅ works (empty on a new property) |
+| What do we appear for on Bing? | `bing.py queries` | ✅ works |
+| Clicks/impressions over time | `bing.py traffic` | ✅ works |
+
+Measured live (90d, us/en-US): `running shoes` → **10,681 impressions /
+87,198 broad**; `chess openings` → 3,188 / 6,466. And
+`expand --seed "chess openings"` → **27 related queries** ordered by real
+counts: `chess.com` 357,780 · `chess reps` 2,259 · `chessreps` 1,755 ·
+`great openings` 1,203 · `best chess openings` 1,056 · `chess moves` 788.
+
+That expand result also shows what the ordering is worth and where it stops: it
+surfaces a navigational giant (`chess.com`), a genuine long-tail phrase
+(`best chess openings`), and a misspelling cluster (`chess reps`/`chessreps`)
+in one call — but it will not tell you which of those your product can answer.
+The remit test still runs first.
+
+### ⛔ These are BING impressions. They are not Google search volume.
+
+The single rule that governs this whole integration. Bing is a minority engine
+— single-digit share in most markets, and skewed by demographic and device in
+ways that vary per niche. A Bing number **cannot** be converted into a Google
+number without a multiplier this skill does not have and must not invent.
+
+So `bing.py` reports `bing_impressions` and **never** `volume`, and **the
+quality bar's volume floor is NOT applied to it.** Writing a Bing impression
+count into a keyword's `volume` field would silently re-scope every gate that
+reads it — the same class of error as mapping Open PageRank's `found:false` to
+DR 0.
+
+What it is legitimately good for, and this is a real upgrade on what came
+before:
+
+- **Relative ranking of candidates.** If A gets 10× the Bing impressions of B,
+  that ordering is real information — and it is the first demand signal in this
+  skill backed by *counts* rather than by autocomplete position. The
+  `demand_proxy` was always explicitly ordinal; this is ordinal too, but with a
+  far better-grounded ordering.
+- **A floor on absolute demand.** A query with real Bing impressions has real
+  demand somewhere. **The converse does not hold** — near-zero on Bing does not
+  prove near-zero on Google.
+
+### Three things measured that the docs get wrong
+
+- **Dates are plain ISO `YYYY-MM-DD`.** The SOAP-era `/Date(1780000000000)/`
+  form is rejected with `String was not recognized as a valid DateTime`, which
+  reads like a parameter-name problem and is not.
+- **A query Bing has never seen returns `Query: null` with zeroes**, so
+  `bing.py` reports `known_to_bing: false` and `bing_impressions: null` rather
+  than a measured zero. Verified with a nonsense-term control.
+- **Legacy SOAP and POX APIs retire 2026-08-31** (Microsoft's own banner). The
+  JSON endpoint used here, `ssl.bing.com/webmaster/api.svc/json/<Method>`, is
+  the surviving one.
+
+### ⚠️ Empty is only trustworthy because of the control
+
+`backlinks` on a freshly imported property returns empty arrays. That is a
+**real** answer and not a broken call — proven by asking for a site we do NOT
+own, which returns `NotAuthorized` (ErrorCode 14) instead of empty. Any future
+endpoint added here must keep that property, and `bing.py` attaches an
+explicit `empty_means` field saying *"authorised and genuinely empty — Bing has
+no link data for this site YET"*, because on a new property that is the normal
+state and **not** a finding about the site's backlink profile.
+
+Getting a key is an **owner action** (it requires verified domain ownership):
+sign in at <https://www.bing.com/webmasters>, import the property from Google
+Search Console, then **Settings → API Access → Generate API Key**. The key is
+**per user, not per site**, and only one can exist at a time — regenerating
+breaks everything using the old one.
+
+## Evaluated and REJECTED — do not re-add these
+
+Each was probed from this container on 2026-08-01. Recording the negatives so
+the same "free SEO API" shortlist does not get re-litigated every few months.
+
+| Candidate | Why not |
+|---|---|
+| **Datamuse** | Looks perfect for keyword expansion and is not. It is a **word-level thesaurus**, not a query expander: `ml=browser+game` returned `elk`, `eland`, `smap`; `rel_trg` on a hyphenated phrase returned `[]`; `sug` returned `[]`. Google Autocomplete already does this job properly. |
+| **Keywords Everywhere volume API** | `402 Insufficient Credits` on a free key. Volume/CPC is strictly paid. Free key is a login for OPR only. |
+| **PageSpeed Insights (keyless)** | **429 from this container** — the keyless quota is exhausted at the shared-IP level. Needs a Google API key, which needs a GCP project + console access. |
+| **Google Custom Search JSON** | Genuinely 100 free Google queries/day, but needs a GCP API key **and** a CSE id. The GSC service account **cannot** mint one (`apikeys.googleapis.com` → 403), so it is an owner action, not something this skill can self-provision. |
+| **Reddit JSON** | `403` from this container by every route and UA tried. |
+| **Wayback CDX** | Timed out at 25s and 30s on repeated attempts. |
+| **Mojeek / Bing Search API** | Mojeek's JSON needs a requested key; Microsoft retired the Bing Search APIs in 2025. |
+| **Moz / Ahrefs / Majestic / Semrush** | No free API tier that returns link data. Unchanged. |
+
 ## Related skills to reach for
 
 | Skill | Use it for |
@@ -514,8 +773,19 @@ export SEO_PROXY_URL=http://USER:PASS@proxy.example-provider.com:8080
 export DATAFORSEO_LOGIN=...
 export DATAFORSEO_PASSWORD=...
 
-# Domain authority (free key)
-export OPENPAGERANK_API_KEY=...
+# SERP - real Google (dotfile fallback shown; env wins)
+export SERPER_API_KEY=...            # ~/.serper_key   - 2500 free credits, 1/search
+export SERPAPI_KEY=...               # ~/.serpapi_key  - 250/month, top-100 + AI Overview
+
+# Bing Webmaster - real volume + backlinks for a VERIFIED property
+export BING_WEBMASTER_API_KEY=...    # ~/.bing_webmaster_key
+
+# Domain authority (free key, 30k domains/month)
+#   also read from ~/.openpagerank_key (chmod 600) if the env var is unset
+export OPENPAGERANK_API_KEY=opr_live_...
+
+# Cloudflare Radar domain popularity - ANY Cloudflare API token works
+export CLOUDFLARE_API_TOKEN=...        # or ~/.cloudflare_token
 
 # State root override (defaults to the nearest .seo/ or .git/)
 export SEO_ROOT=/path/to/site/repo

@@ -11,11 +11,27 @@ Source ladder, best first:
 
   dataforseo   Paid backlinks summary. rank/10 -> DR. Exactly what the
                original uses. BYO DATAFORSEO_LOGIN + DATAFORSEO_PASSWORD.
-  openpagerank Open PageRank (domcop). FREE API key, 1000 req/day, built from
-               Common Crawl's link graph. 0-10 scale -> x10 -> DR-equivalent.
-               Register at https://www.domcop.com/openpagerank/ - it is the
-               single best free substitute and takes two minutes.
-               BYO OPENPAGERANK_API_KEY.
+  openpagerank Open PageRank. FREE, built from Common Crawl's link graph.
+               0-10 scale -> x10 -> DR-equivalent, and it also returns a
+               REFERRING-DOMAIN COUNT, which is the only free backlink-volume
+               number in this whole skill.
+               BYO OPENPAGERANK_API_KEY, or a chmod-600 ~/.openpagerank_key.
+
+               TWO generations of this API exist and the key tells them apart:
+                 - `opr_live_...`  -> the CURRENT host, run by Keywords
+                   Everywhere, which acquired Open PageRank. Free plan is
+                   30,000 domains/month, up to 100 domains per call, with
+                   monthly history back to 2018 and spam-scored-down link
+                   networks. Sign up at
+                   https://openpagerank.keywordseverywhere.com/ (it wants a
+                   free Keywords Everywhere API key first, from
+                   https://keywordseverywhere.com/first-install-addon.html).
+                 - 40-char hex   -> the LEGACY domcop endpoint, 1000 req/day.
+                   Still served, but its own operators retire it on
+                   2026-09-30. Kept here only so an existing key keeps working.
+               Measured 2026-08-01: www.domcop.com/openpagerank/ no longer
+               takes new signups at all, so the legacy path is a migration
+               shim, not a thing to point anyone at.
   estimate     Keyless composite from signals anyone can measure: domain age
                (RDAP), how many pages the site has indexed, and its Search
                Console footprint if you pass one. Deliberately CONSERVATIVE
@@ -129,35 +145,226 @@ def from_dataforseo(domain: str):
     }
 
 
+def read_secret(env_name: str, path: str):
+    """Env first, then a chmod-600 dotfile. Never a committed file."""
+    val = os.environ.get(env_name, "").strip()
+    if val:
+        return val
+    try:
+        p = os.path.expanduser(path)
+        if os.path.isfile(p):
+            return open(p).read().strip()
+    except OSError:
+        pass
+    return ""
+
+
+# OPR is a 0-10 log-scale PageRank over the Common Crawl link graph. x10 lines
+# it up with the 0-100 DR-equivalent scale the zones use. It is not Ahrefs DR
+# and will disagree at the edges; for picking a KD ceiling it is close enough,
+# and it is free.
+def _opr_dr(decimal):
+    try:
+        return round(float(decimal) * 10)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opr_trend(history):
+    """Is this domain's authority climbing, flat, or collapsing?
+
+    History is monthly since 2018. Compare the newest point against ~12 months
+    back. Returns None when there is not enough history to say - which is a
+    different thing from 'flat', and must stay different.
+    """
+    pts = [h for h in (history or []) if h.get("open_page_rank") is not None]
+    if len(pts) < 13:
+        return None
+    now, then = pts[-1], pts[-13]
+    try:
+        delta = round(float(now["open_page_rank"]) - float(then["open_page_rank"]), 2)
+    except (TypeError, ValueError, KeyError):
+        return None
+    return {
+        "delta_12mo": delta,
+        "direction": "rising" if delta > 0.05 else "falling" if delta < -0.05 else "flat",
+        "from": then.get("date"),
+        "to": now.get("date"),
+    }
+
+
 def from_openpagerank(domain: str):
-    key = os.environ.get("OPENPAGERANK_API_KEY", "").strip()
+    key = read_secret("OPENPAGERANK_API_KEY", "~/.openpagerank_key")
     if not key:
         return None
-    qs = urllib.parse.urlencode({"domains[0]": domain})
-    status, text = fetch(f"https://openpagerank.com/api/v1.0/getPageRank?{qs}", headers={"API-OPR": key})
-    if status != 200:
-        return {"error": f"openpagerank HTTP {status}: {text[:160]}"}
-    try:
-        row = json.loads(text)["response"][0]
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
-        return {"error": f"openpagerank returned no row: {text[:200]}"}
-    if str(row.get("status_code")) != "200":
-        return {"error": f"openpagerank: {row.get('error') or 'domain not found in the index'}"}
-    decimal = row.get("page_rank_decimal")
-    try:
-        dr = round(float(decimal) * 10)
-    except (TypeError, ValueError):
-        dr = None
+    rows = openpagerank_bulk([domain], key)
+    if isinstance(rows, dict) and rows.get("error"):
+        return rows
+    row = (rows or [{}])[0]
+
+    # A domain the link graph has never seen is NOT authority zero - it is NO
+    # ANSWER. Returning dr=0 here would be a fabricated measurement that the
+    # quality bar would then act on, so this falls through to the estimate
+    # exactly like a failed call does.
+    if not row.get("found"):
+        return {"error": f"openpagerank: {domain} is not in the Common Crawl link graph (no verdict)"}
+
     return {
         "source": "openpagerank",
         "confidence": "medium",
-        # OPR is a 0-10 log-scale PageRank over the Common Crawl link graph.
-        # x10 lines it up with the 0-100 DR-equivalent scale the zones use.
-        # It is not Ahrefs DR and will disagree at the edges; for picking a KD
-        # ceiling it is close enough, and it is free.
-        "dr": dr,
-        "page_rank_decimal": decimal,
+        "dr": _opr_dr(row.get("open_page_rank")),
+        "page_rank_decimal": row.get("open_page_rank"),
         "opr_rank": row.get("rank"),
+        # The only free referring-domain count anywhere in this skill.
+        "referring_domains": row.get("referring_domains"),
+        "trend": _opr_trend(row.get("history")),
+        "as_of": row.get("_as_of"),
+        "endpoint": row.get("_endpoint"),
+    }
+
+
+def _reconcile(requested, returned):
+    """Put the response back in step with the request.
+
+    Two measured behaviours make a naive read of this API wrong, and both fail
+    silently (2026-08-01):
+
+    1. ROWS CAN BE OMITTED. `httpbin.org` sent alone came back with an EMPTY
+       results array - not `found: false`, simply absent. So the response is
+       NOT positionally aligned with the request, and any caller zipping the
+       two by index attributes one domain's authority to another. That is a
+       wrong number that looks entirely plausible.
+
+    2. SUBDOMAINS ARE SILENTLY NORMALISED TO THE APEX. Asking for
+       `search.marginalia.nu` returns a row for `marginalia.nu`. Taken at face
+       value you have just credited a subdomain with its parent's authority,
+       which on any large host is an enormous overestimate.
+
+    So: return exactly one row per requested domain, in order; mark an omitted
+    one `found: false` with `no_data: true` (absent from the response, which is
+    weaker than an explicit not-found); and where the API answered about a
+    DIFFERENT name than the one asked for, keep the answer but record
+    `answered_for` so the substitution is visible rather than assumed.
+    """
+    by_name = {}
+    for r in returned:
+        if r.get("domain"):
+            by_name[r["domain"].lower()] = r
+    out = []
+    for d in requested:
+        key = d.lower()
+        row = by_name.get(key)
+        if row is None:
+            # The apex, in case this was a subdomain the API folded upward.
+            parts = key.split(".")
+            for i in range(1, len(parts) - 1):
+                cand = ".".join(parts[i:])
+                if cand in by_name:
+                    row = dict(by_name[cand])
+                    row["answered_for"] = cand
+                    row["requested"] = d
+                    break
+        if row is None:
+            out.append({"domain": d, "found": False, "no_data": True,
+                        "open_page_rank": None, "rank": None,
+                        "referring_domains": None, "history": None,
+                        "note": "omitted from the API response entirely - no data, not a measured zero"})
+        else:
+            out.append(row)
+    return out
+
+
+def openpagerank_bulk(domains, key=None):
+    """Score up to 100 domains in one call. Used for competitor benchmarking too.
+
+    Returns a list of rows each carrying `found`, or {"error": ...}. Both key
+    generations are normalised to the SAME row shape so callers never branch.
+    """
+    key = key or read_secret("OPENPAGERANK_API_KEY", "~/.openpagerank_key")
+    if not key:
+        return {"error": "no OPENPAGERANK_API_KEY (and no ~/.openpagerank_key)"}
+    domains = [clean_domain(d) for d in domains if d]
+    if not domains:
+        return []
+
+    if key.startswith("opr_"):
+        body = json.dumps({"domains": domains[:100], "include_history": True})
+        status, text = fetch(
+            "https://openpagerank.keywordseverywhere.com/v1/domains/bulk",
+            data=body,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            timeout=40,
+        )
+        if status != 200:
+            return {"error": f"openpagerank HTTP {status}: {text[:200]}"}
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return {"error": f"openpagerank: unparseable response: {text[:200]}"}
+        out = []
+        for r in payload.get("results", []):
+            r["_as_of"] = payload.get("as_of")
+            r["_endpoint"] = "keywordseverywhere"
+            out.append(r)
+        return _reconcile(domains[:100], out)
+
+    # Legacy domcop endpoint. Retires 2026-09-30; normalise it into the new shape.
+    qs = urllib.parse.urlencode([("domains[]", d) for d in domains[:100]])
+    status, text = fetch(f"https://openpagerank.com/api/v1.0/getPageRank?{qs}", headers={"API-OPR": key})
+    if status != 200:
+        return {"error": f"openpagerank(legacy) HTTP {status}: {text[:200]}"}
+    try:
+        resp = json.loads(text).get("response", [])
+    except json.JSONDecodeError:
+        return {"error": f"openpagerank(legacy): unparseable response: {text[:200]}"}
+    return _reconcile(domains[:100], [
+        {
+            "domain": r.get("domain"),
+            "found": str(r.get("status_code")) == "200",
+            "open_page_rank": r.get("page_rank_decimal"),
+            "rank": r.get("rank"),
+            "referring_domains": None,  # the legacy endpoint never returned this
+            "history": None,
+            "_endpoint": "domcop-legacy",
+        }
+        for r in resp
+    ])
+
+
+def from_cloudflare_radar(domain: str):
+    """Popularity bucket from Cloudflare's 1.1.1.1 resolver traffic.
+
+    A genuinely INDEPENDENT second opinion: OPR measures the link graph,
+    Radar measures how many real people resolve the name. A site can be
+    absent from one and present in the other, which is exactly what makes it
+    worth carrying - our own domain is `found: false` at OPR but Radar still
+    places it in a bucket.
+
+    Any Cloudflare API token works; no special scope is needed for Radar.
+    This is a SIGNAL, never the DR - it is a rank bucket, not a 0-100 score,
+    and converting it into one would be inventing precision that is not there.
+    """
+    key = read_secret("CLOUDFLARE_API_TOKEN", "~/.cloudflare_token")
+    if not key:
+        return None
+    status, text = fetch(
+        f"https://api.cloudflare.com/client/v4/radar/ranking/domain/{urllib.parse.quote(domain)}",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    if status != 200:
+        return {"error": f"cloudflare radar HTTP {status}: {text[:160]}"}
+    try:
+        d = json.loads(text)
+        if not d.get("success"):
+            return {"error": f"cloudflare radar: {json.dumps(d.get('errors'))[:160]}"}
+        det = d["result"]["details_0"]
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return {"error": f"cloudflare radar: unexpected shape: {text[:160]}"}
+    return {
+        "source": "cloudflare-radar",
+        "rank": det.get("rank"),
+        "bucket": det.get("bucket"),
+        "categories": [c.get("name") for c in (det.get("categories") or [])],
     }
 
 
@@ -269,8 +476,10 @@ def from_estimate(domain: str, gsc_impressions=None, gsc_clicks=None):
         "caveat": (
             "This is a keyless COMPOSITE, not a measured link-graph score, and it is capped at 25 "
             "so it can never unlock the DR-35 KD ceiling. Treat it as a floor on what you know. "
-            "For a real number set OPENPAGERANK_API_KEY (free, 2 minutes: "
-            "https://www.domcop.com/openpagerank/) or DataForSEO credentials."
+            "For a real number set OPENPAGERANK_API_KEY (free, ~5 minutes, 30k domains/month: "
+            "https://openpagerank.keywordseverywhere.com/) or DataForSEO credentials. "
+            "NOTE: a real OPR lookup can also come back with no verdict at all - a domain "
+            "absent from the Common Crawl link graph gets no score, and that is not a zero."
         ),
     }
 
@@ -281,6 +490,11 @@ def from_estimate(domain: str, gsc_impressions=None, gsc_clicks=None):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--domain", required=True)
+    p.add_argument(
+        "--bulk",
+        help="comma-separated EXTRA domains to score alongside --domain in one Open PageRank call "
+        "(up to 100 total). Competitor benchmarking: who on page 1 actually outranks you.",
+    )
     p.add_argument("--source", default="auto", choices=["auto", "dataforseo", "openpagerank", "estimate"])
     p.add_argument("--gsc-impressions", type=int, help="last 28d impressions, from the search-console skill")
     p.add_argument("--gsc-clicks", type=int, help="last 28d clicks")
@@ -330,6 +544,35 @@ def main():
         ),
         "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+
+    radar = from_cloudflare_radar(domain)
+    if radar is not None:
+        # Deliberately alongside the DR, never folded into it.
+        payload["popularity"] = radar
+
+    if a.bulk:
+        extra = [d for d in (x.strip() for x in a.bulk.split(",")) if d]
+        rows = openpagerank_bulk([domain] + extra)
+        if isinstance(rows, dict) and rows.get("error"):
+            payload["bulk"] = {"ok": False, "error": rows["error"]}
+        else:
+            # `found: false` stays visible as its own state. Rendering it as 0
+            # would put an unmeasured competitor at the bottom of the table and
+            # read as "weaker than us", which is the opposite of unknown.
+            payload["bulk"] = {
+                "ok": True,
+                "rows": [
+                    {
+                        "domain": r.get("domain"),
+                        "found": bool(r.get("found")),
+                        "dr_equivalent": _opr_dr(r.get("open_page_rank")) if r.get("found") else None,
+                        "referring_domains": r.get("referring_domains"),
+                        "trend": _opr_trend(r.get("history")),
+                    }
+                    for r in rows
+                ],
+                "note": "found=false means absent from the Common Crawl link graph - no verdict, NOT a zero.",
+            }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
     if a.save:
