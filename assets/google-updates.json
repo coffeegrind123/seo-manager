@@ -1,11 +1,8 @@
 {
   "_vendored": {
-    "from": "https://github.com/AgriciDaniel/claude-seo (data/google-updates.json)",
-    "license": "MIT",
-    "vendored_on": "2026-08-01",
-    "upstream_last_verified": "2026-07-02",
     "verification_done_here": "5 of 32 source URLs were fetched and returned 200 on 2026-08-01, alongside a deliberately fake developers.google.com URL that returned 404 - so the probe discriminates and the sample is meaningful. The remaining 27 were NOT re-fetched. Every entry carries a Google-owned source; check it before citing an entry as fact.",
-    "how_to_top_up": "There is no API. Google announces on developers.google.com/search/blog and logs rollouts on status.search.google.com/products/rGHU1u87FJnkP6W2GwMi/history. Add entries by hand, newest last, and only with a Google-owned source URL."
+    "how_to_top_up": "There is no API. Google announces on developers.google.com/search/blog and logs rollouts on status.search.google.com/products/rGHU1u87FJnkP6W2GwMi/history. Add entries by hand, newest last, and only with a Google-owned source URL.",
+    "last_verified": "2026-07-02"
   },
   "source_of_truth": "https://status.search.google.com/products/rGHU1u87FJnkP6W2GwMi/history",
   "secondary_sources": [

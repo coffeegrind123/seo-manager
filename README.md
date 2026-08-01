@@ -70,7 +70,3 @@ check.
 ## Licence
 
 [MIT](LICENSE).
-
-`assets/google-updates.json` is vendored from
-[claude-seo](https://github.com/AgriciDaniel/claude-seo) (MIT); its header
-carries the provenance and notes exactly what was and was not re-verified here.

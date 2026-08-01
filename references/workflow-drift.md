@@ -91,9 +91,8 @@ overlap as causation is astrology. Its real job is the reverse — to stop you
 inventing a content story for a fortnight when the whole index was moving, and
 to stop forty rewrites over a week Google had already announced.
 
-The calendar (`assets/google-updates.json`) is vendored from
-[claude-seo](https://github.com/AgriciDaniel/claude-seo) (MIT), every entry
-carrying a Google-owned source URL. It has **no API and needs manual top-up** —
+The calendar (`assets/google-updates.json`) carries a Google-owned source URL on
+every entry. It has **no API and needs manual top-up** —
 `_vendored.how_to_top_up` says how. It is not authoritative about anything it
 does not list; absence of an update in the window is not evidence there was none.
 
