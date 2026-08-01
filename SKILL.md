@@ -290,9 +290,12 @@ scripts:
 
 ---
 
-## Third-party content
+## Licence and third-party content
+
+This skill is **MIT** licensed (see `LICENSE`).
 
 `assets/google-updates.json` is vendored from
 [claude-seo](https://github.com/AgriciDaniel/claude-seo) (MIT) — its own header
 carries the licence, the provenance, and what was and was not re-verified here.
+MIT-on-MIT, so nothing further is required beyond keeping that notice intact.
 Everything else in this skill is original.

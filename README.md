@@ -66,3 +66,11 @@ python3 scripts/test_measure.py   # bot classification, log parsing, verificatio
 Both suites are built from bugs that actually shipped — the fixtures in
 `assets/fixtures/` are real responses, including the two that fooled every naive
 check.
+
+## Licence
+
+[MIT](LICENSE).
+
+`assets/google-updates.json` is vendored from
+[claude-seo](https://github.com/AgriciDaniel/claude-seo) (MIT); its header
+carries the provenance and notes exactly what was and was not re-verified here.
