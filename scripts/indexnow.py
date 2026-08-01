@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Get freshly published pages indexed - the honest, free half of it.
+
+WHAT IS AND IS NOT POSSIBLE (this matters, because the internet lies about it):
+
+  IndexNow            FREE, keyless, instant. Bing, Yandex, Seznam, Naver and
+                      DuckDuckGo (via Bing) accept a ping and crawl within
+                      minutes. NOT Google - Google has never joined IndexNow.
+  Google Indexing API Restricted to JobPosting and BroadcastEvent pages. Using
+                      it for ordinary content is against its terms and simply
+                      does not work. This script will not pretend otherwise.
+  URL Inspection API  READ-only. It can tell you whether Google has a page; it
+                      cannot ask Google to take one. (search-console skill.)
+  "Request indexing"  The fastest legitimate accelerator for Google, and it is
+                      a HUMAN clicking a button in Search Console. This script
+                      batches the pending list into one paste-ready set of
+                      steps rather than pretending it can be automated.
+
+So: ping IndexNow automatically, and hand the operator ONE batched Google
+follow-up instead of one per page. The Search Console quota is per property per
+day, so batching costs nothing and saves a session per page.
+
+    indexnow.py key --domain example.com          # generate + placement steps
+    indexnow.py ping --url https://example.com/a  # ping one or more URLs
+    indexnow.py ping --pending                    # every page not yet submitted
+    indexnow.py google-steps                      # the batched manual follow-up
+
+Stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ENDPOINT = "https://api.indexnow.org/IndexNow"
+
+
+def state(root, *args) -> dict:
+    cmd = [sys.executable, str(HERE / "seostate.py")]
+    if root:
+        cmd += ["--root", root]
+    proc = subprocess.run(cmd + list(args), capture_output=True, text=True)
+    if not proc.stdout.strip():
+        return {"ok": False, "error": (proc.stderr or "no output").strip()[:200]}
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": proc.stdout[:200]}
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def cmd_key(a):
+    cfg = state(a.root, "config").get("config", {})
+    domain = a.domain or cfg.get("domain")
+    if not domain:
+        print(json.dumps({"ok": False, "error": "no --domain and no project configured"}, indent=2))
+        return 1
+    key = cfg.get("indexnow_key") or uuid.uuid4().hex
+    if not cfg.get("indexnow_key"):
+        state(a.root, "config", "--set", f"indexnow_key={key}")
+    print(json.dumps({
+        "ok": True,
+        "domain": domain,
+        "key": key,
+        "keyfile": f"{key}.txt",
+        "must_be_served_at": f"https://{domain}/{key}.txt",
+        "file_contents": key,
+        "steps": [
+            f"Create a file named `{key}.txt` at the site's PUBLIC web root, containing exactly "
+            f"the key `{key}` and nothing else.",
+            "Commit and deploy it. IndexNow verifies ownership by fetching that file, so a ping "
+            "before it is live is rejected.",
+            f"Verify like a stranger:  curl -s https://{domain}/{key}.txt   -> must print the key.",
+            "Then: indexnow.py ping --pending",
+        ],
+        "note": "The key is stored in .seo/config.json as indexnow_key. It is not a secret - it is "
+                "a public ownership proof and is meant to be served publicly.",
+    }, indent=2))
+    return 0
+
+
+def submit(domain: str, key: str, urls: list[str]) -> dict:
+    body = json.dumps({
+        "host": domain,
+        "key": key,
+        "keyLocation": f"https://{domain}/{key}.txt",
+        "urlList": urls,
+    }).encode()
+    req = urllib.request.Request(ENDPOINT, data=body, method="POST",
+                                 headers={"Content-Type": "application/json; charset=utf-8",
+                                          "User-Agent": "seo-manager/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return {"status": resp.status, "body": resp.read().decode("utf-8", "replace")[:300]}
+    except urllib.error.HTTPError as exc:
+        return {"status": exc.code, "body": exc.read().decode("utf-8", "replace")[:300]}
+    except Exception as exc:
+        return {"status": 0, "body": f"{type(exc).__name__}: {exc}"}
+
+
+# IndexNow's documented status meanings - a 200 is not the only success, and a
+# 403 means exactly one thing, so say which rather than dumping a number.
+STATUS_MEANING = {
+    200: "accepted - the engines will crawl shortly",
+    202: "accepted, key validation pending",
+    400: "bad request - malformed URL list",
+    403: "key not valid: the key file is not being served at keyLocation, or its contents differ",
+    422: "URLs do not belong to the host, or the key does not match",
+    429: "too many requests - slow down",
+}
+
+
+def cmd_ping(a):
+    cfg = state(a.root, "config").get("config", {})
+    domain = (a.domain or cfg.get("domain") or "").replace("https://", "").strip("/")
+    key = cfg.get("indexnow_key")
+    if not domain:
+        print(json.dumps({"ok": False, "error": "no domain configured"}, indent=2))
+        return 1
+    if not key:
+        print(json.dumps({"ok": False, "error": "no IndexNow key yet - run: indexnow.py key"}, indent=2))
+        return 1
+
+    urls = list(a.url or [])
+    pages = state(a.root, "pages").get("pages", [])
+    if a.pending:
+        urls += [p["url"] for p in pages if p.get("url") and not p.get("indexnow_submitted_at")]
+    urls = [u for u in dict.fromkeys(urls) if u.startswith("http")]
+    if not urls:
+        print(json.dumps({"ok": True, "submitted": 0,
+                          "note": "nothing pending - every logged page has already been submitted"},
+                         indent=2))
+        return 0
+    if a.dry_run:
+        print(json.dumps({"ok": True, "would_submit": urls, "host": domain}, indent=2))
+        return 0
+
+    # IndexNow caps a batch at 10,000; chunk defensively anyway.
+    results = []
+    for i in range(0, len(urls), 500):
+        chunk = urls[i:i + 500]
+        res = submit(domain, key, chunk)
+        res["count"] = len(chunk)
+        res["meaning"] = STATUS_MEANING.get(res["status"], "unexpected status")
+        results.append(res)
+
+    ok = all(r["status"] in (200, 202) for r in results)
+    if ok:
+        # Stamp only on success, so a failed ping stays pending instead of
+        # silently dropping out of the queue.
+        stamp = now()
+        for p in pages:
+            if p.get("url") in urls:
+                state(a.root, "log-page", "--url", p["url"], "--indexnow-submitted", stamp)
+    print(json.dumps({
+        "ok": ok,
+        "host": domain,
+        "submitted": len(urls) if ok else 0,
+        "urls": urls,
+        "results": results,
+        "reaches": "Bing, Yandex, Seznam, Naver, DuckDuckGo (via Bing). NOT Google.",
+        "google": "Google does not participate in IndexNow. Run `indexnow.py google-steps` for the "
+                  "batched Search Console follow-up, which is the only legitimate accelerator.",
+    }, indent=2))
+    return 0 if ok else 1
+
+
+def cmd_google_steps(a):
+    cfg = state(a.root, "config").get("config", {})
+    domain = cfg.get("domain", "")
+    pages = state(a.root, "pages").get("pages", [])
+    pending = [p for p in pages if p.get("url") and not p.get("index_requested_at")]
+    if not pending:
+        print(json.dumps({"ok": True, "pending": 0,
+                          "note": "every logged page has already been through Request indexing"},
+                         indent=2))
+        return 0
+    urls = [p["url"] for p in pending]
+    print(json.dumps({
+        "ok": True,
+        "pending": len(urls),
+        "urls": urls,
+        "why_manual": "Google offers no API for this. The Indexing API is JobPosting/BroadcastEvent "
+                      "only, and URL Inspection is read-only. A human clicking 'Request indexing' is "
+                      "the fastest legitimate route, so these are batched into ONE session - the "
+                      "quota is per property per day, so batching costs nothing.",
+        "steps": [
+            f"Open Search Console for {domain} and make sure the right property is selected.",
+            "For each URL below: paste it into the inspection bar at the top, wait for the result, "
+            "then click 'Request indexing' and wait for the confirmation toast before the next one.",
+            "Expect a daily quota (~10-12 URLs). If you hit it, stop and finish tomorrow - the "
+            "remaining ones stay listed here.",
+            "When done, record it so they stop showing up:",
+        ],
+        "record_when_done": [f'seostate.py log-page --url "{u}" --index-requested' for u in urls[:3]]
+                            + (["... (one per URL)"] if len(urls) > 3 else []),
+        "browser_option": "The browser-automation skill can drive this: navigate to Search Console, "
+                          "inspect each URL, click Request indexing. Watch the quota, and confirm "
+                          "each toast before moving on.",
+        "verification": "The search-console skill's URL Inspection query tells you whether Google "
+                        "actually has each page - that is the real done signal, not the click.",
+    }, indent=2))
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--root", help="repo root (defaults to the nearest .seo/)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("key", help="generate the IndexNow key and print placement steps")
+    s.add_argument("--domain")
+    s.set_defaults(fn=cmd_key)
+
+    s = sub.add_parser("ping", help="submit URLs to IndexNow (Bing/Yandex/Seznam/Naver)")
+    s.add_argument("--url", action="append")
+    s.add_argument("--pending", action="store_true", help="every logged page not yet submitted")
+    s.add_argument("--domain")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_ping)
+
+    s = sub.add_parser("google-steps", help="the batched Search Console follow-up for Google")
+    s.set_defaults(fn=cmd_google_steps)
+
+    a = p.parse_args()
+    sys.exit(a.fn(a) or 0)
+
+
+if __name__ == "__main__":
+    main()

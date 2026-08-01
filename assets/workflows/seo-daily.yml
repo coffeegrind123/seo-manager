@@ -1,0 +1,121 @@
+name: SEO daily builder
+
+# Builds the guide at the top of the queue into a PR, unattended, through the
+# seo-manager skill's build-guide workflow (pace gate -> pick -> template ->
+# live SERP gate -> information gain -> draft -> visuals -> humanizer ->
+# sameness gate -> PR). If nothing is approved and nothing is promotable, it
+# exits cleanly.
+#
+# Skips if an SEO PR is already open, so there is never more than one at a
+# time - the steady state is build -> review/merge -> gone -> repeat. If a PR
+# gets stuck (failed check, or a tool PR awaiting you) the builder pauses
+# instead of piling more on top.
+#
+# Runs up to three times a day so a usage-limit hit is a quiet deferral, not a
+# lost day: the pace gate in .seo/ skips any later attempt once one of them
+# actually shipped a guide. Offset off the top of the hour - GitHub's scheduler
+# queues and drops on-the-hour triggers far more than odd minutes.
+
+on:
+  schedule:
+    - cron: "13 5 * * *"   # 05:13 UTC daily
+    - cron: "13 12 * * *"  # retry if the 05:13 attempt deferred
+    - cron: "13 19 * * *"  # retry if the 12:13 attempt deferred too
+  workflow_dispatch:
+
+concurrency:
+  group: seo-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The agent commits below. Pin an identity that maps to a real GitHub
+      # account - some hosts refuse to deploy commits from unknown author
+      # emails, and an unconfigured runner leaves the agent to improvise one.
+      - name: Pin git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Skip if an SEO PR is already open
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          open=$(gh pr list --repo "$GITHUB_REPOSITORY" --label seo --state open --json number --jq 'length')
+          echo "open=$open" >> "$GITHUB_OUTPUT"
+          [ "$open" = "0" ] || echo "An SEO PR is already open - skipping so only one is ever open at a time."
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.open == '0'
+        with:
+          python-version: "3.11"
+
+      - name: Pace gate
+        id: pace
+        if: steps.guard.outputs.open == '0'
+        run: |
+          allowed=$(python3 "$SKILL/scripts/seostate.py" pacing | python3 -c 'import sys,json;print(json.load(sys.stdin)["build_allowed"])')
+          echo "allowed=$allowed" >> "$GITHUB_OUTPUT"
+          [ "$allowed" = "True" ] || echo "A guide already shipped today - the next slot opens tomorrow."
+        env:
+          SKILL: ${{ github.workspace }}/.claude/skills/seo-manager
+
+      - name: Install Claude Code
+        if: steps.guard.outputs.open == '0' && steps.pace.outputs.allowed == 'True'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Build the next guide
+        if: steps.guard.outputs.open == '0' && steps.pace.outputs.allowed == 'True'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional research upgrades - the run works without every one of them.
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
+          OPENPAGERANK_API_KEY: ${{ secrets.OPENPAGERANK_API_KEY }}
+          # Residential exit for geo-pinned SERPs. Optional; note it does NOT
+          # work around DuckDuckGo's 202 (measured) - see references/data-sources.md.
+          SEO_PROXY_URL: ${{ secrets.SEO_PROXY_URL }}
+          DATAFORSEO_LOGIN: ${{ secrets.DATAFORSEO_LOGIN }}
+          DATAFORSEO_PASSWORD: ${{ secrets.DATAFORSEO_PASSWORD }}
+        run: |
+          claude -p "Use the seo-manager skill. Run the build-guide workflow exactly as \
+          references/workflow-build-guide.md specifies, start to finish, including the \
+          sameness gate and the PR step. This is a headless run: no human is present, so \
+          never ask a question - if a gate says stop, stop cleanly and report why." \
+            --permission-mode acceptEdits \
+            --allowedTools "Bash,Read,Write,Edit,Glob,Grep,WebFetch,Skill"
+
+      # A pushed branch with no PR and a green run is the worst outcome - it
+      # strands silently. build-guide exits non-zero when `gh pr create` fails,
+      # which turns this step red and sends GitHub's failure email.
+      - name: Report outcome
+        if: always()
+        run: |
+          python3 "$SKILL/scripts/seostate.py" log-run \
+            --workflow build-guide \
+            --summary "scheduled run: ${{ job.status }}" \
+            ${{ job.status == 'success' && ' ' || '--failed' }} || true
+        env:
+          SKILL: ${{ github.workspace }}/.claude/skills/seo-manager
+
+      - name: Commit state changes
+        if: always()
+        run: |
+          git add .seo || true
+          git diff --cached --quiet || {
+            git commit -m "chore(seo): record run state [skip ci]"
+            git push origin HEAD:${{ github.ref_name }} || true
+          }

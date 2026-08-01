@@ -1,0 +1,56 @@
+{
+ "query": "self hosted rank tracker",
+ "provider": "ddg",
+ "results": [
+  {
+   "title": "Introducing SerpTrail: A self-hosted SEO and GEO rank tracker for your ...",
+   "url": "https://serpapi.com/blog/introducing-serptrail-self-hosted-search-rank-tracker/",
+   "snippet": "SerpTrail is a brand new self-hosted SEO and GEO rank tracker from SerpApi built with Rails and SQLite for easy monitoring of search performance. Do you need to track keyword positions across location"
+  },
+  {
+   "title": "GitHub - Decodo/rank-tracker: About A self-hosted SEO rank tracker ...",
+   "url": "https://github.com/Decodo/rank-tracker",
+   "snippet": "A self-hosted SEO rank tracker built on the Decodo SERP Scraping API. It tracks organic position, AI Overview citations, featured snippets, and PAA presence across keywords, locations, and devices, st"
+  },
+  {
+   "title": "GitHub - bensblueprints/serpdeck: Self-hosted SEO rank tracker (BYO ...",
+   "url": "https://github.com/bensblueprints/serpdeck/tree/main",
+   "snippet": "Self-hosted keyword rank tracker: bring your own SERP API key, track unlimited keywords across projects, get daily position history, competitor comparisons, and big-move alerts."
+  },
+  {
+   "title": "OpenSERP: Open-Source, Self-Hosted & Free SERP API",
+   "url": "https://openserp.org/",
+   "snippet": "OpenSERP is a free, open-source and self-hosted SERP API for Google, Bing, Yandex, Baidu, DuckDuckGo and Ecosia, with an optional managed Cloud path."
+  },
+  {
+   "title": "SerpLynx - SERP Keyword Rank Tracker",
+   "url": "https://serplynx.com/",
+   "snippet": "Start Tracking View on GitHub 100% Free & Open Source \u2022 MIT License \u2022 Self-Hostable"
+  },
+  {
+   "title": "Self-Hosted Rank Tracking 2026: SerpBear, Fixed - apiserpent.com",
+   "url": "https://apiserpent.com/blog/self-hosted-rank-tracking-serpbear",
+   "snippet": "3 of SerpBear's 10 SERP providers are flagged dead by its own README. Here's a 40-line custom scraper adapter \u2014 built, Docker-tested, tracking real keywords."
+  },
+  {
+   "title": "15 Best Rank Tracking Software (Tested on Real Campaigns)",
+   "url": "https://onelittleweb.com/top-tools/best-rank-tracking-software/",
+   "snippet": "Over the years, we used a plethora of ranking tools for our clients. Now we're revealing the 15 best rank tracking software we're using for 2026."
+  },
+  {
+   "title": "SerpBear; The free open-source Rank Tracker",
+   "url": "https://jannicknijholt.nl/serpbear-rank-tracker/",
+   "snippet": "Want to track your website rankings without paying hundreds of dollars per month? Let me introduce you to SerpBear, an open-source rank tracker that you can host yourself. In this guide, I'll show you"
+  },
+  {
+   "title": "SerpBear (Open-Source SEO Rank Tracker & Analytics Tool)",
+   "url": "https://railway.com/deploy/serpbear-open-source-seo-rank-tracker-analytics-tool--serpbear",
+   "snippet": "SerpBear is an open-source, self-hosted search engine position tracking app that allows you to monitor your website's keyword rankings on Google. It provides features like unlimited keyword tracking, "
+  },
+  {
+   "title": "SerpBear: A Free Open-Source Google Page Ranking Tracker ... - LowEndBox",
+   "url": "https://lowendbox.com/blog/serpbear-a-free-open-source-google-page-ranking-tracker-thats-better-than-youd-expect/",
+   "snippet": "That's why I set out to find a simple self-hosted open-source alternative to page rank tracking. Thankfully, in a self-fulfilling manner, Google delivered, and I discovered SerpBear:"
+  }
+ ]
+}

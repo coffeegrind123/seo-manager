@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Keyword expansion + demand signals for the seo-manager skill.
+
+The free research primitive is Google Autocomplete (`suggestqueries`): keyless,
+no account, no quota worth worrying about, and it is what every "free keyword
+tool" is actually built on. It returns REAL queries people type - which is a
+better signal than a stale volume database for anything less than a year old -
+but it returns no volume numbers.
+
+So this script does three separable jobs:
+
+  expand    autocomplete sweeps (modifiers, questions, comparisons, alphabet
+            soup, tool-intent) -> a deduped candidate list with a demand PROXY
+  volume    enrich candidates with real volume/KD, when a paid source is
+            configured (DataForSEO). Never invents numbers.
+  gsc       turn Search Console's own query data into candidates - the single
+            best free seam, because those queries are proven relevant to THIS
+            domain and half-ranked already.
+
+The demand proxy is honest about what it is: autocomplete surfaces a query
+because enough people type it, and Google orders the list roughly by
+popularity, so `first seen at prefix depth D, rank R` is a real ordinal
+signal. It is NOT a monthly search volume and this script never labels it one.
+
+Stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import defaultdict
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+# The modifier sets, grouped by what they hunt for. The research workflow's
+# rung-1 seams map onto these directly.
+MODIFIERS = {
+    "question": ["how to", "how do i", "what is", "what are", "why", "when", "which", "can i", "does"],
+    "commercial": ["best", "top", "cheapest", "free", "alternative to", "review of"],
+    "comparison": ["vs", "or", "alternatives", "compared to", "versus"],
+    "audience": ["for beginners", "for developers", "for small business", "for teams", "for agencies", "for freelancers"],
+    "constraint": ["without", "with", "on windows", "on mac", "on linux", "open source", "self hosted", "no code"],
+    "problem": ["not working", "error", "fix", "troubleshoot", "slow", "failed", "issue"],
+    "tool_intent": ["generator", "calculator", "checker", "converter", "analyzer", "template",
+                    "builder", "validator", "estimator", "comparison tool"],
+    "commercial_tail": ["pricing", "cost", "worth it", "reddit", "example", "tutorial", "guide"],
+}
+ALPHABET = list("abcdefghijklmnopqrstuvwxyz")
+
+# Queries the tool-shaped sweep is looking for (build-guide vs build-tool split).
+TOOL_VERBS = re.compile(
+    r"\b(generat|calculat|convert|check|test|validat|estimat|build|creat|compar|pick|analyz|audit|format|encode|decode)\w*\b",
+    re.I,
+)
+COMMERCIAL_HINT = re.compile(r"\b(best|top|vs|versus|alternative|alternatives|pricing|cost|cheap|free|review|compare)\b", re.I)
+QUESTION_HINT = re.compile(r"^\s*(how|what|why|when|which|who|where|can|does|do|is|are|should)\b", re.I)
+TRANSACTIONAL_HINT = re.compile(r"\b(buy|download|install|sign ?up|trial|demo|coupon|discount)\b", re.I)
+
+
+def fetch_json(url: str, timeout=12):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json, text/javascript, */*"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode(resp.headers.get_content_charset() or "utf-8", errors="replace")
+    return json.loads(raw)
+
+
+# ------------------------------------------------------------ autocomplete
+
+
+def autocomplete(query: str, hl="en", gl="us", source="chrome") -> list[str]:
+    """One autocomplete call. `source` picks the endpoint flavour:
+    chrome  -> suggestqueries (10 suggestions, the classic)
+    youtube -> the youtube corpus (different demand shape, useful for video-led niches)
+    """
+    if source == "youtube":
+        url = "https://suggestqueries.google.com/complete/search?" + urllib.parse.urlencode(
+            {"client": "firefox", "ds": "yt", "hl": hl, "q": query}
+        )
+    else:
+        url = "https://suggestqueries.google.com/complete/search?" + urllib.parse.urlencode(
+            {"client": "firefox", "hl": hl, "gl": gl, "q": query}
+        )
+    try:
+        data = fetch_json(url)
+    except Exception:
+        return []
+    return [s for s in (data[1] if isinstance(data, list) and len(data) > 1 else []) if isinstance(s, str)]
+
+
+def classify_intent(kw: str) -> str:
+    if TRANSACTIONAL_HINT.search(kw):
+        return "transactional"
+    if re.search(r"\b(vs|versus|alternative|alternatives|compared to)\b", kw, re.I):
+        return "comparison"
+    if COMMERCIAL_HINT.search(kw):
+        return "commercial"
+    if QUESTION_HINT.search(kw):
+        return "informational"
+    return "informational"
+
+
+def cmd_expand(a):
+    seeds = [s.strip().lower() for s in a.seed if s.strip()]
+    groups = a.groups or ["question", "commercial", "comparison", "audience", "constraint", "problem", "commercial_tail"]
+    if a.tools:
+        groups = ["tool_intent"]
+
+    # depth 0 = the bare seed, 1 = seed + one modifier, 2 = alphabet soup
+    hits: dict[str, dict] = {}
+
+    def record(kw: str, depth: int, rank: int, via: str):
+        kw = re.sub(r"\s+", " ", kw.strip().lower())
+        if not kw or len(kw) < 3:
+            return
+        cur = hits.get(kw)
+        if cur is None:
+            hits[kw] = {"keyword": kw, "min_depth": depth, "best_rank": rank, "times_seen": 1, "via": [via]}
+        else:
+            cur["times_seen"] += 1
+            cur["min_depth"] = min(cur["min_depth"], depth)
+            cur["best_rank"] = min(cur["best_rank"], rank)
+            if via not in cur["via"]:
+                cur["via"].append(via)
+
+    queries: list[tuple[str, int, str]] = []
+    for seed in seeds:
+        queries.append((seed, 0, "seed"))
+        for group in groups:
+            for mod in MODIFIERS.get(group, []):
+                # prefix form for question words, suffix form for the rest -
+                # "how to <seed>" vs "<seed> alternatives"
+                if group == "question" or mod in ("best", "top", "cheapest", "free"):
+                    queries.append((f"{mod} {seed}", 1, group))
+                else:
+                    queries.append((f"{seed} {mod}", 1, group))
+        if a.alphabet:
+            for letter in ALPHABET:
+                queries.append((f"{seed} {letter}", 2, "alphabet"))
+
+    calls = 0
+    for q, depth, via in queries:
+        if a.max_calls and calls >= a.max_calls:
+            break
+        suggestions = autocomplete(q, hl=a.hl, gl=a.gl, source=a.source)
+        calls += 1
+        for rank, s in enumerate(suggestions, 1):
+            record(s, depth, rank, via)
+        if a.delay:
+            time.sleep(a.delay)
+
+    rows = []
+    for kw, row in hits.items():
+        if a.must_contain and not all(t in kw for t in a.must_contain):
+            continue
+        words = len(kw.split())
+        # Demand proxy: shallower prefix + higher autocomplete rank + seen via
+        # more sweeps = more people type it. 0-100, ordinal only.
+        proxy = max(0, 100 - row["min_depth"] * 22 - (row["best_rank"] - 1) * 4 + min(row["times_seen"] - 1, 6) * 3)
+        rows.append(
+            {
+                **row,
+                "words": words,
+                "intent": classify_intent(kw),
+                "tool_shaped": bool(TOOL_VERBS.search(kw)),
+                "mid_tail": 2 <= words <= 5,
+                "demand_proxy": proxy,
+            }
+        )
+
+    key = {"proxy": lambda r: -r["demand_proxy"], "words": lambda r: (r["words"], -r["demand_proxy"]),
+           "alpha": lambda r: r["keyword"]}[a.sort]
+    rows.sort(key=key)
+    if a.limit:
+        rows = rows[: a.limit]
+
+    by_intent = defaultdict(int)
+    for r in rows:
+        by_intent[r["intent"]] += 1
+    print(json.dumps(
+        {
+            "ok": True,
+            "seeds": seeds,
+            "autocomplete_calls": calls,
+            "candidates": len(rows),
+            "intent_mix": dict(by_intent),
+            "tool_shaped_count": sum(1 for r in rows if r["tool_shaped"]),
+            "mid_tail_count": sum(1 for r in rows if r["mid_tail"]),
+            "source": a.source,
+            "demand_proxy_note": "ORDINAL autocomplete signal (prefix depth + suggestion rank + "
+                                 "how many sweeps surfaced it), 0-100. NOT a monthly search volume - "
+                                 "never report it as one.",
+            "results": rows,
+        },
+        indent=2, ensure_ascii=False,
+    ))
+
+
+# ------------------------------------------------------------------ volume
+
+
+def dataforseo_ideas(seeds: list[str], location=2840, language="en", limit=200) -> dict:
+    login = os.environ.get("DATAFORSEO_LOGIN", "")
+    password = os.environ.get("DATAFORSEO_PASSWORD", "")
+    if not (login and password):
+        raise RuntimeError("volume via DataForSEO needs DATAFORSEO_LOGIN + DATAFORSEO_PASSWORD")
+    auth = base64.b64encode(f"{login}:{password}".encode()).decode()
+    payload = json.dumps([{
+        "keywords": seeds[:5],
+        "location_code": int(location),
+        "language_code": language,
+        "include_serp_info": False,
+        "include_seed_keyword": True,
+        "limit": limit,
+        "order_by": ["keyword_info.search_volume,desc"],
+    }])
+    req = urllib.request.Request(
+        "https://api.dataforseo.com/v3/dataforseo_labs/google/keyword_ideas/live",
+        data=payload.encode(),
+        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json", "User-Agent": UA},
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = json.loads(resp.read().decode())
+    try:
+        items = data["tasks"][0]["result"][0]["items"] or []
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"DataForSEO returned no items: {json.dumps(data)[:300]}")
+    return {
+        "results": [
+            {
+                "keyword": it.get("keyword"),
+                "volume": (it.get("keyword_info") or {}).get("search_volume"),
+                "kd": (it.get("keyword_properties") or {}).get("keyword_difficulty"),
+                "cpc": (it.get("keyword_info") or {}).get("cpc"),
+                "competition": (it.get("keyword_info") or {}).get("competition_level"),
+                "intent": classify_intent(it.get("keyword") or ""),
+            }
+            for it in items
+        ]
+    }
+
+
+def cmd_volume(a):
+    seeds = [s.strip() for s in a.seed if s.strip()]
+    if not seeds:
+        print(json.dumps({"ok": False, "error": "pass at least one --seed"}))
+        sys.exit(1)
+    if len(seeds) > 5:
+        print(json.dumps({"ok": False, "error": "DataForSEO expands at most 5 seeds per call - "
+                                                "that is the facet count by design. Batch them."}))
+        sys.exit(1)
+    try:
+        data = dataforseo_ideas(seeds, a.location, a.language, a.limit)
+    except Exception as exc:
+        print(json.dumps({
+            "ok": False,
+            "error": str(exc),
+            "fallback": "No paid volume source configured. That is a DATA GATE, not a failure: the "
+                        "quality bar's volume floor and KD ceiling are simply inapplicable when the "
+                        "data does not exist. Use `expand` for candidates, `serp.py` for the "
+                        "authority gate, and NEVER invent numbers to fill the gap.",
+        }, indent=2))
+        sys.exit(2)
+    rows = data["results"]
+    if a.min_volume:
+        rows = [r for r in rows if (r.get("volume") or 0) >= a.min_volume]
+    if a.max_kd is not None:
+        rows = [r for r in rows if r.get("kd") is None or r["kd"] <= a.max_kd]
+    print(json.dumps({"ok": True, "seeds": seeds, "count": len(rows), "results": rows[: a.limit]}, indent=2))
+
+
+# -------------------------------------------------------------------- gsc
+
+
+def cmd_gsc(a):
+    """Turn a Search Console search-analytics JSON export into candidates.
+
+    Produce the input with the `search-console` skill (its search-analytics
+    query), then pipe it here. Striking-distance queries - real impressions at
+    position 11-50 - are the highest-yield free seam there is: proven relevant
+    to this exact domain and already half-ranked.
+    """
+    text = sys.stdin.read() if a.file == "-" else open(a.file, encoding="utf-8").read()
+    data = json.loads(text)
+    rows = data.get("rows", data if isinstance(data, list) else [])
+    out = []
+    for r in rows:
+        keys = r.get("keys") or []
+        kw = (keys[0] if keys else r.get("query") or "").strip().lower()
+        if not kw:
+            continue
+        pos = r.get("position")
+        imp = r.get("impressions") or 0
+        clicks = r.get("clicks") or 0
+        ctr = r.get("ctr")
+        if imp < a.min_impressions:
+            continue
+        if pos is None:
+            band = "unknown"
+        elif pos <= 3:
+            band = "top3"
+        elif pos <= 10:
+            band = "page1"
+        elif pos <= 20:
+            band = "striking-distance"
+        elif pos <= 50:
+            band = "page3-5"
+        else:
+            band = "deep"
+        out.append({
+            "keyword": kw,
+            "impressions": imp,
+            "clicks": clicks,
+            "ctr": round(ctr, 4) if isinstance(ctr, (int, float)) else ctr,
+            "position": round(pos, 1) if isinstance(pos, (int, float)) else pos,
+            "band": band,
+            "intent": classify_intent(kw),
+            "tool_shaped": bool(TOOL_VERBS.search(kw)),
+            # Impressions with no clicks at a decent position = a CTR problem
+            # (title/description), not a ranking problem.
+            "ctr_underperformer": bool(pos and pos <= 10 and imp >= 100 and (ctr or 0) < 0.02),
+        })
+    order = {"striking-distance": 0, "page3-5": 1, "page1": 2, "top3": 3, "deep": 4, "unknown": 5}
+    out.sort(key=lambda r: (order.get(r["band"], 9), -r["impressions"]))
+    if a.band:
+        out = [r for r in out if r["band"] in a.band]
+    print(json.dumps({
+        "ok": True,
+        "count": len(out),
+        "striking_distance": sum(1 for r in out if r["band"] == "striking-distance"),
+        "ctr_underperformers": sum(1 for r in out if r["ctr_underperformer"]),
+        "results": out[: a.limit] if a.limit else out,
+    }, indent=2, ensure_ascii=False))
+
+
+# -------------------------------------------------------------------- main
+
+
+# ------------------------------------------------------- SERP-overlap clustering
+
+def cmd_cluster(a):
+    """Group keywords by how much their SERPs agree. One cluster = one page.
+
+    The question this answers is the one that decides the whole content plan and
+    that nothing else in this skill answers: are `cs 1.6 crosshair generator`
+    and `how to change crosshair cs 1.6` one page or two? Guessing from the
+    words is unreliable - phrasings that look identical routinely return
+    disjoint SERPs, and phrasings that look unrelated routinely return the same
+    ten URLs.
+
+    Google has already answered it. If two queries return substantially the
+    SAME page-1 URLs, Google considers them the same intent, and two pages
+    targeting them will compete with each other rather than add up. If the SERPs
+    disagree, they are different intents and one page cannot serve both.
+
+    Rule: >= `--overlap` shared URLs in the top `--top-n` merges the pair.
+    3-of-10 is the industry default and it holds up: at 2 you merge everything
+    through a single ubiquitous result (a Wikipedia page, a vendor homepage), at
+    4+ you split clusters that are obviously one topic.
+
+    Clustering is TRANSITIVE here (single-link): A~B and B~C puts all three in
+    one cluster even if A and C do not overlap directly. That matches how a hub
+    page actually works - B is the bridge - but it means one promiscuous keyword
+    can chain two real clusters together, so `bridges` names any keyword holding
+    a cluster together by a single link. Check those by eye.
+
+    A refused SERP read is NOT an empty overlap. Unreadable queries are excluded
+    and listed in `unread`, never silently clustered alone - a keyword that
+    failed to read looks exactly like a keyword with a unique SERP, and treating
+    them the same invents a cluster.
+    """
+    kws: list[str] = []
+    for k in a.keywords or []:
+        kws.append(k.strip())
+    if a.file:
+        raw = sys.stdin.read() if a.file == "-" else open(a.file, encoding="utf-8").read()
+        kws.extend(x.strip() for x in raw.splitlines() if x.strip())
+    kws = list(dict.fromkeys([k for k in kws if k]))
+
+    records = []
+    if a.serps:
+        try:
+            d = json.loads(open(a.serps, encoding="utf-8").read())
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": f"cannot read {a.serps}: {exc}"}))
+            sys.exit(2)
+        records = d.get("results", d if isinstance(d, list) else [])
+    else:
+        if not kws:
+            print(json.dumps({"ok": False, "error": "no keywords",
+                              "hint": "--keywords/--file, or --serps with a saved batch"}))
+            sys.exit(2)
+        body = json.dumps({"queries": kws, "depth": a.depth, "view": "full"}).encode()
+        req = urllib.request.Request(a.daemon.rstrip("/") + "/batch", data=body,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=max(120, 12 * len(kws))) as r:
+                d = json.loads(r.read().decode())
+        except Exception as exc:
+            print(json.dumps({
+                "ok": False,
+                "error": f"serpd batch failed: {type(exc).__name__}: {exc}",
+                "hint": "python3 seodoctor.py --hard, then serpd.py --start (NO trailing &)",
+            }))
+            sys.exit(2)
+        records = d.get("results", [])
+        if a.save_serps:
+            open(a.save_serps, "w", encoding="utf-8").write(json.dumps(d))
+
+    urls: dict[str, list[str]] = {}
+    unread: list[dict] = []
+    for r in records:
+        q = r.get("query")
+        if not q:
+            continue
+        if not r.get("ok"):
+            unread.append({"keyword": q, "error": r.get("error") or "refused read"})
+            continue
+        rows = r.get("results") or []
+        if not rows:
+            unread.append({"keyword": q, "error": "no results in a read marked ok"})
+            continue
+        urls[q] = [(x.get("url") or "").split("#")[0].rstrip("/") for x in rows[: a.top_n]]
+
+    keys = list(urls)
+    parent = {k: k for k in keys}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    edges = []
+    for i, x in enumerate(keys):
+        sx = set(urls[x])
+        for y in keys[i + 1:]:
+            shared = sx & set(urls[y])
+            if len(shared) >= a.overlap:
+                edges.append({"a": x, "b": y, "shared": len(shared),
+                              "urls": sorted(shared)[:5]})
+                rx, ry = find(x), find(y)
+                if rx != ry:
+                    parent[rx] = ry
+
+    groups: dict[str, list[str]] = defaultdict(list)
+    for k in keys:
+        groups[find(k)].append(k)
+
+    degree = defaultdict(int)
+    for e in edges:
+        degree[e["a"]] += 1
+        degree[e["b"]] += 1
+
+    out = []
+    for members in sorted(groups.values(), key=len, reverse=True):
+        # The head is the keyword sharing the most SERP with the rest - the one
+        # a single page should actually target.
+        head = max(members, key=lambda m: (degree[m], -len(m)))
+        bridges = [m for m in members
+                   if len(members) > 2 and degree[m] == 1]
+        common = set(urls[head])
+        for m in members:
+            common &= set(urls[m])
+        out.append({
+            "size": len(members),
+            "head": head,
+            "members": members,
+            "bridges": bridges,
+            "shared_by_all": sorted(common)[:5],
+            "verdict": ("ONE page - Google returns the same results for all of these"
+                        if len(members) > 1 else "its own page - no SERP overlap with the rest"),
+        })
+
+    print(json.dumps({
+        "ok": True,
+        "keywords_in": len(kws) or len(records),
+        "keywords_clustered": len(keys),
+        "unread": unread,
+        "unread_count": len(unread),
+        "rule": f">={a.overlap} shared URLs in the top {a.top_n} merges two keywords",
+        "clusters": len(out),
+        "multi_keyword_clusters": sum(1 for c in out if c["size"] > 1),
+        "detail": out,
+        "reading": "Each cluster is ONE page targeting its `head`, with the other members as "
+                   "sections and H2s - not one page each. Building a page per member inside a "
+                   "cluster is self-cannibalisation you can predict before writing a word. "
+                   "`bridges` are members attached by a single overlapping pair: if one looks "
+                   "wrong, it is chaining two real clusters together and should be split out. "
+                   "`unread` keywords have NO verdict - re-run them, do not assume they are singletons.",
+    }, indent=2, ensure_ascii=False))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("expand", help="autocomplete sweep -> candidate keywords")
+    s.add_argument("--seed", action="append", required=True, help="repeatable")
+    s.add_argument("--groups", nargs="*", choices=list(MODIFIERS), help="which modifier sets to sweep")
+    s.add_argument("--tools", action="store_true", help="tool-intent sweep only (the build-tool queue)")
+    s.add_argument("--alphabet", action="store_true", help="also run a-z suffix soup (26 extra calls/seed)")
+    s.add_argument("--must-contain", nargs="*", help="keep only candidates containing all these tokens")
+    s.add_argument("--hl", default="en")
+    s.add_argument("--gl", default="us")
+    s.add_argument("--source", default="chrome", choices=["chrome", "youtube"])
+    s.add_argument("--sort", default="proxy", choices=["proxy", "words", "alpha"])
+    s.add_argument("--limit", type=int, default=200)
+    s.add_argument("--max-calls", type=int, default=120)
+    s.add_argument("--delay", type=float, default=0.15)
+    s.set_defaults(fn=cmd_expand)
+
+    s = sub.add_parser("volume", help="real volume + KD (needs DataForSEO creds)")
+    s.add_argument("--seed", action="append", required=True, help="up to 5 MID-TAIL seeds, never head terms")
+    s.add_argument("--location", type=int, default=2840)
+    s.add_argument("--language", default="en")
+    s.add_argument("--limit", type=int, default=200)
+    s.add_argument("--min-volume", type=int)
+    s.add_argument("--max-kd", type=float)
+    s.set_defaults(fn=cmd_volume)
+
+    s = sub.add_parser("cluster", help="SERP-overlap clustering - one page or five?")
+    s.add_argument("--keywords", action="append", help="keyword. Repeatable.")
+    s.add_argument("--file", help="newline-delimited keywords, or - for stdin")
+    s.add_argument("--serps", help="pre-fetched serpd /batch view=full JSON (skips fetching)")
+    s.add_argument("--daemon", default="http://127.0.0.1:8791")
+    s.add_argument("--depth", type=int, default=10)
+    s.add_argument("--overlap", type=int, default=3,
+                   help="shared top-N URLs required to merge two keywords")
+    s.add_argument("--top-n", type=int, default=10, help="SERP depth compared for overlap")
+    s.add_argument("--save-serps", help="write the fetched SERPs here for reuse")
+    s.set_defaults(fn=cmd_cluster)
+
+    s = sub.add_parser("gsc", help="Search Console rows -> candidates (striking distance first)")
+    s.add_argument("file", help="search-analytics JSON, or - for stdin")
+    s.add_argument("--min-impressions", type=int, default=10)
+    s.add_argument("--band", nargs="*", choices=["top3", "page1", "striking-distance", "page3-5", "deep", "unknown"])
+    s.add_argument("--limit", type=int)
+    s.set_defaults(fn=cmd_gsc)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

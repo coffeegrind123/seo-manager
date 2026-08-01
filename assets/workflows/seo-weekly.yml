@@ -1,0 +1,114 @@
+name: SEO weekly research + rank check
+
+# Two jobs that keep the daily builder fed and the outcome data honest:
+#
+#   research   fills the queue to quota (7 approved guides, 1-2 tool ideas)
+#   ranks      checks every tracked keyword and appends to .seo/ranks.jsonl
+#
+# The rank job runs FIRST and commits, so the research job's step-0 learning
+# step reads fresh positions when it grades last month's targeting.
+
+on:
+  schedule:
+    - cron: "27 4 * * 1"  # Monday 04:27 UTC
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: "Scope research to one topic (optional)"
+        required: false
+
+concurrency:
+  group: seo-weekly
+  cancel-in-progress: false
+
+jobs:
+  ranks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Refresh the site's authority score
+        env:
+          OPENPAGERANK_API_KEY: ${{ secrets.OPENPAGERANK_API_KEY }}
+          # Residential exit for geo-pinned SERPs. Optional; note it does NOT
+          # work around DuckDuckGo's 202 (measured) - see references/data-sources.md.
+          SEO_PROXY_URL: ${{ secrets.SEO_PROXY_URL }}
+          DATAFORSEO_LOGIN: ${{ secrets.DATAFORSEO_LOGIN }}
+          DATAFORSEO_PASSWORD: ${{ secrets.DATAFORSEO_PASSWORD }}
+          SKILL: ${{ github.workspace }}/.claude/skills/seo-manager
+        run: |
+          domain=$(python3 "$SKILL/scripts/seostate.py" config | python3 -c 'import sys,json;print(json.load(sys.stdin)["config"]["domain"])')
+          python3 "$SKILL/scripts/authority.py" --domain "$domain" --save || true
+
+      - name: Check ranks
+        env:
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
+          DATAFORSEO_LOGIN: ${{ secrets.DATAFORSEO_LOGIN }}
+          DATAFORSEO_PASSWORD: ${{ secrets.DATAFORSEO_PASSWORD }}
+          SEO_PROXY_URL: ${{ secrets.SEO_PROXY_URL }}
+          SKILL: ${{ github.workspace }}/.claude/skills/seo-manager
+        # The keyless ddg provider goes into blanket 202 refusal under load and
+        # NO proxy, endpoint or header change clears it (measured) - so the delay
+        # is deliberately slow and a proxy does not let you lower it. With
+        # SERPAPI_KEY set, drop --delay and raise --depth to 100: one credit buys
+        # the full top-100.
+        run: |
+          python3 "$SKILL/scripts/rankcheck.py" --all --depth 20 --delay 8 || true
+
+      - name: Commit rank history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .seo
+          git diff --cached --quiet || git commit -m "chore(seo): weekly rank snapshot [skip ci]"
+          git push || true
+
+  research:
+    needs: ranks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: npm install -g @anthropic-ai/claude-code
+
+      - name: Fill the queue
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
+          OPENPAGERANK_API_KEY: ${{ secrets.OPENPAGERANK_API_KEY }}
+          # Residential exit for geo-pinned SERPs. Optional; note it does NOT
+          # work around DuckDuckGo's 202 (measured) - see references/data-sources.md.
+          SEO_PROXY_URL: ${{ secrets.SEO_PROXY_URL }}
+          DATAFORSEO_LOGIN: ${{ secrets.DATAFORSEO_LOGIN }}
+          DATAFORSEO_PASSWORD: ${{ secrets.DATAFORSEO_PASSWORD }}
+        run: |
+          claude -p "Use the seo-manager skill. Run the research workflow exactly as \
+          references/workflow-research.md specifies${{ github.event.inputs.topic && format(', scoped to the topic: {0}', github.event.inputs.topic) || '' }}. \
+          Work the full ladder before reporting any miss. This is a headless run: no human \
+          is present, so never ask a question." \
+            --permission-mode acceptEdits \
+            --allowedTools "Bash,Read,Write,Edit,Glob,Grep,WebFetch,Skill"
+
+      - name: Commit the queue
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .seo
+          git diff --cached --quiet || git commit -m "chore(seo): weekly research [skip ci]"
+          git push || true
