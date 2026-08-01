@@ -201,6 +201,39 @@ strength:
 4. **(d)** an original worked example or end-to-end config no docs page shows;
 5. **(e)** a clear, defended stance where every page-1 result hedges.
 
+6. **(f)** a **primary source page 1 never opened** — a peer-reviewed finding, a
+   real citation count, a dated figure from the literature. `factcheck.py`
+   surfaces these keylessly:
+
+   ```bash
+   python3 scripts/factcheck.py sources --query "<the underlying question>" --since-year 2020
+   ```
+
+   It returns titles, years, citation counts, DOIs and open-access links from
+   OpenAlex and Crossref. On a topic where every page-1 result is restating the
+   same blog post, one properly-cited primary source *is* the information gain.
+
+   ⚠ **These are candidates to READ.** The tool has not verified that a paper's
+   finding is sound, current, or applicable to your niche — only that it exists.
+   Citing one you did not open is a fabricated fact with a DOI attached, which is
+   worse than an unsourced claim because it looks checked. Open it, confirm the
+   number says what you think it says, then cite it.
+
+### Semantic completeness — a cheap second pass, not a gate
+
+Once a draft exists, check what a thorough page on the subject would be expected
+to touch and you did not:
+
+```bash
+python3 scripts/factcheck.py coverage --draft <draft>.md --topic "<Wikipedia article title>"
+```
+
+⚠ It matches **words, not meaning** — a draft covering a concept in different
+vocabulary scores as a gap, and one that name-drops a term without explaining it
+scores as covered. Read every gap and decide. **Never close a gap by inserting
+the phrase**: that is precisely the template convergence the sameness gate
+exists to catch, and it will fail you there instead.
+
 ### Only what THIS run can honestly do
 
 You hold the repo, the current official docs, the local scripts, and the agent

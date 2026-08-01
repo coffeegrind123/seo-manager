@@ -445,6 +445,23 @@ authority gate because nobody bothered to target them:
    ```
 6. **Trend radar.** `seostate.py trends --status new` — fresh topics have the
    thinnest SERPs on the internet.
+7. **Cross-engine agreement.** The same sweep against six independent suggestion
+   corpora instead of one:
+   ```bash
+   python3 scripts/keywords.py expand --seed "<facet>" --engines all --sort agreement
+   ```
+   A phrase surfaced by Google, Bing AND DuckDuckGo is corroborated by three
+   different audiences and three different algorithms — which is a far better
+   reason to spend a build slot than "it ranked first in one autocomplete list".
+   It also returns `intent_evidence`: `video` when YouTube's corpus surfaced the
+   phrase, `product` when Amazon's did. That is **observed** intent, and when it
+   disagrees with the guessed `intent` field, believe the observation — a phrase
+   Amazon suggests is someone about to buy something, whatever its wording.
+
+   ⚠ `engine_agreement` is still **ordinal corroboration, not a volume**, and it
+   never satisfies the volume floor. ⚠ Check `engines_silent` before reading the
+   scores: an engine that answered nothing all sweep is a dead instrument, and
+   agreement is scored only against the ones that answered.
 
 **Coming back short while any of these seams is unworked is a FAILED run, not an
 honest one.** Name in the report which seams you mined.

@@ -729,6 +729,233 @@ Search Console, then **Settings → API Access → Generate API Key**. The key i
 **per user, not per site**, and only one can exist at a time — regenerating
 breaks everything using the old one.
 
+## The 2026-08-01 expansion — eleven keyless sources, all measured live
+
+Everything in this section was probed from this container on 2026-08-01 and is
+registered in **`scripts/providers.py`**, which is now the single place a data
+source is declared. `python3 scripts/providers.py status` probes the whole
+ladder for real and prints what is usable *right now* — measurement, not a
+table that went stale. `seodoctor.py` reports credential presence cheaply and
+`seodoctor.py --providers` runs the live sweep.
+
+Live result at the time of writing: **23–24 usable of 24.**
+
+⚠ **Two members are genuinely intermittent, and a red mark on either is usually
+the service, not you.** Both retry internally; neither is worth chasing.
+
+- **crt.sh** — measured 404, 404, 502 inside one 10-second window on a query
+  that returns ~1,100 rows when healthy, then four straight failures on a later
+  sweep. Its 404 is **ambiguous** on a real domain (no certificates vs unhappy
+  server), which is why crt.sh is only ever used to enumerate subdomains it
+  does return, and **never to assert that a domain has none**.
+- **GDELT** — 429s under load, then answers seconds later. The parallel status
+  sweep aggravates this; a single real call rarely trips it.
+
+### Keyword expansion is now SIX independent corpora, not one
+
+| Engine | Endpoint | Why it is not redundant |
+|---|---|---|
+| Google | `suggestqueries` | the base corpus; everything is compared to it |
+| **Bing** | `api.bing.com/osjson.aspx` | independent index *and* audience, keyless |
+| **DuckDuckGo** | `duckduckgo.com/ac/` | third web corpus, no personalisation |
+| **YouTube** | `suggestqueries…&ds=yt` | **video intent** |
+| **Yandex** | `suggest.yandex.com/suggest-ff.cgi` | fourth engine; dominant RU/TR |
+| **Amazon** | `completion.amazon.com` | **product/buying intent** |
+
+`keywords.py expand --engines all` sweeps them together and adds two fields:
+
+- **`engine_agreement`** — how many independent corpora surfaced this exact
+  phrase. Four engines out of five is corroboration in a way that "rank 1 on
+  Google autocomplete" is not, because the engines share neither audience nor
+  algorithm. Still **ordinal, still not a volume.**
+- **`intent_evidence`** — `video` if YouTube's corpus surfaced it, `product` if
+  Amazon's did. Intent is normally *guessed* from the wording of a phrase; this
+  is **observed**, and it beats the guess when the two disagree.
+
+⚠ **A silent engine is never counted against a phrase.** Agreement is scored
+against `engines_answering`, not against the engines requested — otherwise one
+dead endpoint quietly re-scores every candidate as weakly corroborated. The
+response lists `engines_silent` explicitly. There is a regression test for it.
+
+### Authority gained a keyless second opinion: Tranco
+
+`tranco-list.eu/api/ranks/domain/<d>` — no key, no account, and it carries
+**~40 days of daily history**, so a competitor's rank becomes a *trajectory*.
+It is the only authority signal that still answers on a machine with no
+credentials at all.
+
+⚠ It is a **popularity** rank, not a link-graph score and **not a DR**. It sits
+in `payload.popularity` beside Cloudflare Radar and is never folded into
+`dr_equivalent`. A mismatch between the two is itself information: heavy
+traffic + thin links is a brand searching for itself, not a site that will
+outrank you on a new query.
+
+**Absence is safe to report here, and only because of the control**: a domain
+that is certainly not in the top 1M answers **HTTP 200 with an empty `ranks`
+array**, while an outage does not answer 200 at all. So `in_list: false` is a
+measurement; a non-200 is an error and says so.
+
+### Trends: a per-topic timeline at last (GDELT), plus Google News
+
+The trend radar had no way to ask "how has interest in THIS phrase moved" —
+Trends RSS only answers "what is spiking nationally right now" and Wikimedia
+pageviews only work for topics with an article.
+
+- **`trendfeeds.py newsvolume`** — GDELT's daily news-coverage timeline for any
+  phrase, keyless, months of history, with a rising/falling/flat read.
+  ⚠ It measures **press coverage, not search demand.** A rise is a reason to go
+  *check* demand, never demand itself.
+  ⚠ It **429s under shared-IP load and then answers fine seconds later**
+  (measured: first call 429, retry 200 with 86 datapoints). It retries by
+  default; a single-shot call reports a permanent failure that is transient.
+- **`trendfeeds.py news`** — Google News RSS. Doubles as research: it names the
+  publishers currently ranking for the phrase, i.e. who owns the topic.
+
+### Information gain got a starting point: `factcheck.py`
+
+The hardest rule in the quality bar to satisfy honestly, and the easiest to
+fake. Four keyless subcommands:
+
+| Command | Source | What it gives |
+|---|---|---|
+| `sources` | OpenAlex + Crossref | peer-reviewed work with citation counts, years, DOIs, OA links |
+| `entities` | Wikidata | what a topic formally *is*, with types and descriptions |
+| `related` | Wikipedia `morelike` | the article neighbourhood — what a thorough page would touch |
+| `coverage` | the above, vs a draft | which strongly-related concepts the draft never mentions |
+
+⚠ **These are candidates to READ, not citations to paste.** Citing a paper this
+returned without opening it is the same fabrication the quality bar forbids —
+with a DOI attached, which makes it worse, not better.
+
+⚠ **`coverage` matches WORDS, not meaning.** A draft covering a concept in
+different vocabulary scores as a gap; one that name-drops a term without
+explaining it scores as covered. Every gap is a prompt to think, never a verdict
+— and "fixing" a gap by inserting the phrase is precisely the template
+convergence the sameness gate exists to catch. Verified with both controls: an
+unrelated draft scores 0%, a draft naming the concepts scores 100%.
+
+### Technical checks for any URL, keyless: `pagecheck.py`
+
+| Command | Source | Notes |
+|---|---|---|
+| `html` | W3C Nu validator | validity only matters where it breaks something that *is* a ranking input |
+| `schema` | **validator.schema.org** | Google's own extractor, keyless, any public URL |
+| `history` | Wayback CDX | when a page actually changed — including a competitor's |
+| `vitals` | PageSpeed Insights | the one that needs a credential; see below |
+
+⚠ **The schema validator's node shape is `typeGroup` + `types`, NOT `type`.**
+The obvious parser reads `node["type"]`, gets `None` for every node, and reports
+a page full of perfect structured data as having **none at all**. Caught only by
+running it against `nytimes.com`, which certainly has some. Nested objects live
+under `nodeProperties`, so the walk must recurse or it under-counts. Both are
+pinned by tests.
+
+⚠ **Wayback CDX: a positive `limit` returns the OLDEST N rows.** On a long-lived
+URL that answers every recency question with the year 2003 — `example.com`
+capped at 20,000 reported `last_capture: 2022` and "0 changes since 2026-01-01"
+while the page had been captured that morning. A **negative** limit gives the
+most recent N, which is the window anyone actually wants. When the window is
+truncated, `versions_since.reliable` says so rather than quietly answering.
+
+⚠ **`distinct_versions_in_window` is byte-level variation, not editorial
+rewrites.** `collapse=digest` only merges *adjacent* identical digests, so a
+rotating ad slot or a footer timestamp mints a new row on every capture —
+`example.com` shows 63,263 of them across 24 years. Compare pages against each
+other; never quote the raw count as "times updated".
+
+### PageSpeed Insights: ✅ LIVE — and it needed no new key at all
+
+The account already has a Google service account (the Search Console one). PSI
+accepts an OAuth bearer, so no API key is needed — but **the scope you mint with
+decides whether you see the real problem**:
+
+| Scope | What PSI says |
+|---|---|
+| `cloud-platform` | 403 *"Request had insufficient authentication scopes"* |
+| `webmasters.readonly` | 403 *"Request had insufficient authentication scopes"* |
+| **`openid`** | 403 ***"PageSpeed Insights API has not been used in project &lt;PROJECT_NUMBER&gt; before or it is disabled"*** |
+
+Only the third is the truth. The first two read like "you need a different
+credential" and send you looking for a key that was never the blocker. So
+`psi_token()` mints with `openid` **deliberately** — a worse-looking error that
+is a far more useful one.
+
+**Enabled 2026-08-01 and verified working** — `pagecheck.py vitals` returns lab
+metrics and a performance score against the existing GSC service account, with
+no API key anywhere.
+
+⚠ **ALWAYS use the project-PINNED enable link.** The bare console URL applies to
+whatever project the browser last had selected, so the first enable silently
+landed on a different project and PSI kept 403ing with an identical message.
+Google puts the correct link in the error itself — use that one verbatim:
+
+```
+https://console.developers.google.com/apis/api/pagespeedonline.googleapis.com/overview?project=<PROJECT_NUMBER>
+```
+
+⚠ **Do not diagnose that state by retrying.** Six attempts over 2.5 minutes
+looked exactly like slow propagation and was not — it was the wrong project.
+The distinguishing check is to confirm the project NUMBER named in the 403 is
+really the service account's own project, rather than assuming it:
+
+```bash
+# the number in the error vs the project the service account belongs to
+python3 -c "import json,pathlib; print(json.loads(
+  pathlib.Path('~/.gsc_service_account.json').expanduser().read_text())['project_id'])"
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://cloudresourcemanager.googleapis.com/v1/projects/<PROJECT_ID>" | grep projectNumber
+```
+
+⚠ **The service account cannot read its own API enablement state** — it lacks
+`serviceusage.services.get` and answers *"Permission denied to get service"*.
+That is a permissions gap, **not** evidence the API is disabled, and reading it
+as one sends you to fix the wrong thing.
+
+`GOOGLE_API_KEY` (or `~/.google_api_key`) is honoured as an alternative and
+takes precedence — quicker than the console dance if a key already exists.
+
+### ✅ CrUX field data arrives INSIDE the PSI response — the CrUX API is moot
+
+Confirmed live: `pagecheck.py vitals` returns `field_crux` with 75th-percentile
+**LCP, CLS and INP from real users**, plus a FAST/AVERAGE/SLOW category, out of
+PSI's `loadingExperience` block. So the separately-rejected CrUX API (which
+would not take a service-account bearer) buys nothing — one call now yields both
+lab and field data.
+
+⚠ **Empty `field_crux` is not a score of zero.** Measured on a real low-traffic
+site: every field metric came back `null` while the lab metrics were fully
+populated. CrUX only reports origins with enough real-user traffic to be
+statistically meaningful, so `null` means *"too little traffic to measure"* —
+which is a fact about sample size, never a fact about the page's speed. The lab
+numbers are still valid; they are one synthetic run, and the field numbers are
+the ranking-relevant ones when they exist.
+
+⚠ Keyless PSI stays **429** (*"Quota exceeded … for consumer project_number…"*)
+— the anonymous quota is exhausted at the shared level, and **the proxy does not
+fix it** (measured below).
+
+### ⛔ The proxy fixes none of these — measured, so nobody re-tries it
+
+Every failure above was re-probed through the residential proxy, with the exit
+IP confirmed different from the direct one *before* the run — otherwise the
+whole comparison proves nothing. The result was unambiguous:
+
+| Source | Direct | Proxied | Verdict |
+|---|---|---|---|
+| Reddit (search / sub / api) | 403 | 403 | not IP-shaped |
+| Qwant | 403 | 403 | not IP-shaped |
+| yep.com | 403 | 403 | not IP-shaped |
+| PSI keyless | 429 | 429 | quota is per-*project*, not per-IP |
+| ConceptNet | 502 | 502 | server-side |
+| DBpedia Spotlight | conn fail | conn fail | service down |
+| crt.sh | 200 | 200 | works either way |
+
+The proxy's value remains exactly what the section above says — **sustained
+SERP volume and geo-pinning** — and nothing else here. Do not spend a session
+re-testing these behind it.
+
+---
+
 ## Evaluated and REJECTED — do not re-add these
 
 Each was probed from this container on 2026-08-01. Recording the negatives so
@@ -743,7 +970,16 @@ the same "free SEO API" shortlist does not get re-litigated every few months.
 | **Reddit JSON** | `403` from this container by every route and UA tried. |
 | **Wayback CDX** | Timed out at 25s and 30s on repeated attempts. |
 | **Mojeek / Bing Search API** | Mojeek's JSON needs a requested key; Microsoft retired the Bing Search APIs in 2025. |
-| **Moz / Ahrefs / Majestic / Semrush** | No free API tier that returns link data. Unchanged. |
+| **Moz / Ahrefs / Majestic / Semrush** | No free API tier that returns link data. Unchanged. **Moz's Links API free tier (2,500 rows/mo) is real but requires a credit card to register**, so it fails the same free-without-a-card rule that ruled out Brave. |
+| **Common Crawl host-level web graph** | Rejected on **measured cost, not availability**. The domain-ranks file for one release is **3.5 GB gzipped** and is not indexed by domain, so a single lookup streams a large fraction of it. Open PageRank is built from the *same* link graph and returns the referring-domain count in one call — paying 3.5 GB for a second opinion on data you already have is not a trade worth making. (`claude-seo`'s `commoncrawl_graph.py` does exactly this stream-and-filter; it works, it is just expensive.) |
+| **Reddit JSON** | Still `403` from every route tried — `www/search.json`, `old.reddit.com`, `api.reddit.com`, with a compliant UA. **Re-tested through the residential proxy: still 403**, so it is not IP-shaped and a proxy will not rescue it. The official OAuth API (free, script app) is the only route left, and it is an owner action. |
+| **Qwant / yep.com** | `403` behind an antibot page, direct and proxied alike. |
+| **ConceptNet** | `502` on repeated attempts, direct and proxied. Also word-level, like Datamuse — the same reason that one was rejected. |
+| **DBpedia Spotlight** | Both `api.` and `demo.` hosts failed to connect. Entity extraction now goes through Wikidata + Wikipedia `morelike` instead (`factcheck.py`). |
+| **searchmysite.net** | `404` on every documented API path tried. |
+| **CrUX API** | `400 "Request contains an invalid argument"` for every documented body shape, with a service-account bearer. Unlike PSI it never names a fixable cause, so there is nothing to act on. **Moot now**: real-user LCP/CLS/INP arrive inside the PSI response (`loadingExperience`) — verified live — so one call gives both lab and field data. |
+| **Google Knowledge Graph Search API** | `403 "Method doesn't allow unregistered callers"` — it requires an actual API key and will not take an OAuth bearer, so the existing service account cannot reach it. |
+| **Majestic Million / Tranco / Umbrella top-1M CSVs** | All three download fine keylessly (80 MB / ~10 MB / ~10 MB). Not integrated as bulk files because **Tranco's per-domain API answers the same question in one keyless call with history attached**. Revisit only if bulk scoring of thousands of domains becomes a real need. |
 
 ## Related skills to reach for
 
@@ -786,6 +1022,14 @@ export OPENPAGERANK_API_KEY=opr_live_...
 
 # Cloudflare Radar domain popularity - ANY Cloudflare API token works
 export CLOUDFLARE_API_TOKEN=...        # or ~/.cloudflare_token
+
+# PageSpeed Insights / Core Web Vitals. NOT required if a Google service
+# account exists AND the PSI API is enabled on its project - see above.
+export GOOGLE_API_KEY=...              # or ~/.google_api_key
+export GSC_SERVICE_ACCOUNT=...         # default ~/.gsc_service_account.json
+
+# Where the provider layer caches (Tranco, archive reads, etc.)
+export SEO_CACHE_DIR=~/.cache/seo-manager
 
 # State root override (defaults to the nearest .seo/ or .git/)
 export SEO_ROOT=/path/to/site/repo

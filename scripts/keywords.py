@@ -76,24 +76,79 @@ def fetch_json(url: str, timeout=12):
 # ------------------------------------------------------------ autocomplete
 
 
-def autocomplete(query: str, hl="en", gl="us", source="chrome") -> list[str]:
-    """One autocomplete call. `source` picks the endpoint flavour:
-    chrome  -> suggestqueries (10 suggestions, the classic)
-    youtube -> the youtube corpus (different demand shape, useful for video-led niches)
+# Six keyless suggestion corpora, all verified answering from a datacenter IP on
+# 2026-08-01. They are not redundant: each is a DIFFERENT population typing into
+# a DIFFERENT box, so a phrase surfaced by several of them is corroborated by
+# independent evidence rather than by one algorithm's ordering.
+#
+#   google   the base corpus - broadest, what everything else is compared to
+#   bing     an independent web-search index and audience (keyless osjson)
+#   ddg      a third web-search corpus, no personalisation at all
+#   youtube  VIDEO intent - a phrase strong here wants a demo, not an essay
+#   yandex   a fourth engine; dominant in RU/TR, useful sanity check elsewhere
+#   amazon   PRODUCT intent - a phrase strong here is someone about to buy
+#
+# The last two lines are the point: intent is usually GUESSED from the wording
+# of a phrase. Which engines surface it is evidence instead of a guess.
+SUGGEST_ENGINES = {
+    "google": lambda q, hl, gl: (
+        "https://suggestqueries.google.com/complete/search?"
+        + urllib.parse.urlencode({"client": "firefox", "hl": hl, "gl": gl, "q": q})),
+    "youtube": lambda q, hl, gl: (
+        "https://suggestqueries.google.com/complete/search?"
+        + urllib.parse.urlencode({"client": "firefox", "ds": "yt", "hl": hl, "q": q})),
+    "bing": lambda q, hl, gl: (
+        "https://api.bing.com/osjson.aspx?" + urllib.parse.urlencode({"query": q})),
+    "ddg": lambda q, hl, gl: (
+        "https://duckduckgo.com/ac/?" + urllib.parse.urlencode({"type": "list", "q": q})),
+    "yandex": lambda q, hl, gl: (
+        "https://suggest.yandex.com/suggest-ff.cgi?" + urllib.parse.urlencode({"part": q})),
+    "amazon": lambda q, hl, gl: (
+        "https://completion.amazon.com/api/2017/suggestions?"
+        + urllib.parse.urlencode({"mid": "ATVPDKIKX0DER", "alias": "aps", "limit": "10", "prefix": q})),
+}
+INTENT_ENGINES = {"youtube": "video", "amazon": "product"}
+# Legacy `--source` values, kept working.
+_SOURCE_ALIAS = {"chrome": "google", "google": "google", "youtube": "youtube"}
+
+
+def _parse_suggestions(engine: str, data) -> list[str]:
+    """Every engine answers a different shape. Normalising them here keeps the
+    difference in one place instead of spread through the sweep."""
+    if engine == "amazon":
+        if isinstance(data, dict):
+            return [s.get("value", "") for s in data.get("suggestions", []) if isinstance(s, dict)]
+        return []
+    if isinstance(data, list) and len(data) == 2 and isinstance(data[1], list):
+        return [s for s in data[1] if isinstance(s, str)]      # opensearch pair
+    if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
+        return [s for s in data[1] if isinstance(s, str)]
+    if isinstance(data, list):                                  # ddg type=list flat form
+        return [s for s in data if isinstance(s, str)]
+    return []
+
+
+def autocomplete(query: str, hl="en", gl="us", source="chrome", engine=None) -> list[str]:
+    """One suggestion call against one engine.
+
+    `engine` is the current parameter; `source` is the older one and still maps
+    onto it, so existing callers and saved commands keep working unchanged.
     """
-    if source == "youtube":
-        url = "https://suggestqueries.google.com/complete/search?" + urllib.parse.urlencode(
-            {"client": "firefox", "ds": "yt", "hl": hl, "q": query}
-        )
-    else:
-        url = "https://suggestqueries.google.com/complete/search?" + urllib.parse.urlencode(
-            {"client": "firefox", "hl": hl, "gl": gl, "q": query}
-        )
+    engine = engine or _SOURCE_ALIAS.get(source, "google")
+    build = SUGGEST_ENGINES.get(engine)
+    if not build:
+        return []
     try:
-        data = fetch_json(url)
+        data = fetch_json(build(query, hl, gl))
     except Exception:
         return []
-    return [s for s in (data[1] if isinstance(data, list) and len(data) > 1 else []) if isinstance(s, str)]
+    out, seen = [], set()
+    for s in _parse_suggestions(engine, data):
+        s = s.strip()
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            out.append(s)
+    return out
 
 
 def classify_intent(kw: str) -> str:
@@ -108,6 +163,28 @@ def classify_intent(kw: str) -> str:
     return "informational"
 
 
+def _resolve_engines(a) -> list[str]:
+    """Which corpora to sweep. `--engines` wins; `--source` is the fallback so
+    every existing invocation keeps its exact old behaviour (one engine)."""
+    req = getattr(a, "engines", None)
+    if not req:
+        return [_SOURCE_ALIAS.get(getattr(a, "source", "chrome"), "google")]
+    out: list[str] = []
+    for e in req:
+        if e == "all":
+            out.extend(SUGGEST_ENGINES)
+        elif e == "web":
+            out.extend(["google", "bing", "ddg"])
+        else:
+            out.append(e)
+    seen, uniq = set(), []
+    for e in out:
+        if e not in seen:
+            seen.add(e)
+            uniq.append(e)
+    return uniq
+
+
 def cmd_expand(a):
     seeds = [s.strip().lower() for s in a.seed if s.strip()]
     groups = a.groups or ["question", "commercial", "comparison", "audience", "constraint", "problem", "commercial_tail"]
@@ -115,21 +192,26 @@ def cmd_expand(a):
         groups = ["tool_intent"]
 
     # depth 0 = the bare seed, 1 = seed + one modifier, 2 = alphabet soup
+    engines = _resolve_engines(a)
+
     hits: dict[str, dict] = {}
 
-    def record(kw: str, depth: int, rank: int, via: str):
+    def record(kw: str, depth: int, rank: int, via: str, engine: str):
         kw = re.sub(r"\s+", " ", kw.strip().lower())
         if not kw or len(kw) < 3:
             return
         cur = hits.get(kw)
         if cur is None:
-            hits[kw] = {"keyword": kw, "min_depth": depth, "best_rank": rank, "times_seen": 1, "via": [via]}
+            hits[kw] = {"keyword": kw, "min_depth": depth, "best_rank": rank, "times_seen": 1,
+                        "via": [via], "engines": [engine]}
         else:
             cur["times_seen"] += 1
             cur["min_depth"] = min(cur["min_depth"], depth)
             cur["best_rank"] = min(cur["best_rank"], rank)
             if via not in cur["via"]:
                 cur["via"].append(via)
+            if engine not in cur["engines"]:
+                cur["engines"].append(engine)
 
     queries: list[tuple[str, int, str]] = []
     for seed in seeds:
@@ -147,16 +229,26 @@ def cmd_expand(a):
                 queries.append((f"{seed} {letter}", 2, "alphabet"))
 
     calls = 0
+    calls_by_engine: dict[str, int] = defaultdict(int)
+    engines_answering: set[str] = set()
     for q, depth, via in queries:
         if a.max_calls and calls >= a.max_calls:
             break
-        suggestions = autocomplete(q, hl=a.hl, gl=a.gl, source=a.source)
-        calls += 1
-        for rank, s in enumerate(suggestions, 1):
-            record(s, depth, rank, via)
+        for engine in engines:
+            suggestions = autocomplete(q, hl=a.hl, gl=a.gl, engine=engine)
+            calls += 1
+            calls_by_engine[engine] += 1
+            if suggestions:
+                engines_answering.add(engine)
+            for rank, s in enumerate(suggestions, 1):
+                record(s, depth, rank, via, engine)
         if a.delay:
             time.sleep(a.delay)
 
+    # An engine that answered NOTHING all sweep is a dead instrument, not a
+    # verdict that nobody searches there - so agreement is scored against the
+    # engines that actually answered, never against the ones we asked for.
+    live_engines = sorted(engines_answering)
     rows = []
     for kw, row in hits.items():
         if a.must_contain and not all(t in kw for t in a.must_contain):
@@ -165,19 +257,25 @@ def cmd_expand(a):
         # Demand proxy: shallower prefix + higher autocomplete rank + seen via
         # more sweeps = more people type it. 0-100, ordinal only.
         proxy = max(0, 100 - row["min_depth"] * 22 - (row["best_rank"] - 1) * 4 + min(row["times_seen"] - 1, 6) * 3)
+        agreeing = [e for e in row["engines"] if e in engines_answering]
         rows.append(
             {
                 **row,
                 "words": words,
                 "intent": classify_intent(kw),
+                "intent_evidence": sorted({INTENT_ENGINES[e] for e in agreeing if e in INTENT_ENGINES}),
                 "tool_shaped": bool(TOOL_VERBS.search(kw)),
                 "mid_tail": 2 <= words <= 5,
                 "demand_proxy": proxy,
+                "engine_agreement": len(agreeing),
+                "engine_agreement_pct": (round(100 * len(agreeing) / len(live_engines))
+                                         if live_engines else None),
             }
         )
 
     key = {"proxy": lambda r: -r["demand_proxy"], "words": lambda r: (r["words"], -r["demand_proxy"]),
-           "alpha": lambda r: r["keyword"]}[a.sort]
+           "alpha": lambda r: r["keyword"],
+           "agreement": lambda r: (-r["engine_agreement"], -r["demand_proxy"])}[a.sort]
     rows.sort(key=key)
     if a.limit:
         rows = rows[: a.limit]
@@ -195,9 +293,23 @@ def cmd_expand(a):
             "tool_shaped_count": sum(1 for r in rows if r["tool_shaped"]),
             "mid_tail_count": sum(1 for r in rows if r["mid_tail"]),
             "source": a.source,
+            "engines_requested": engines,
+            "engines_answering": live_engines,
+            "engines_silent": sorted(set(engines) - engines_answering),
+            "calls_by_engine": dict(calls_by_engine),
             "demand_proxy_note": "ORDINAL autocomplete signal (prefix depth + suggestion rank + "
                                  "how many sweeps surfaced it), 0-100. NOT a monthly search volume - "
                                  "never report it as one.",
+            "engine_agreement_note": (
+                "how many INDEPENDENT suggestion corpora surfaced this exact phrase, out of "
+                "engines_answering. Different engines, different audiences, different "
+                "algorithms - so 4/5 is corroboration in a way that rank 1 on one engine is "
+                "not. Still ordinal, still not a volume. An engine in engines_silent was NOT "
+                "counted against anything: a dead instrument is not evidence of no demand."),
+            "intent_evidence_note": (
+                "'video' means YouTube's corpus surfaced it, 'product' means Amazon's did. "
+                "That is OBSERVED intent rather than intent guessed from the wording, and it "
+                "beats the `intent` field when the two disagree."),
             "results": rows,
         },
         indent=2, ensure_ascii=False,
@@ -511,8 +623,14 @@ def main():
     s.add_argument("--must-contain", nargs="*", help="keep only candidates containing all these tokens")
     s.add_argument("--hl", default="en")
     s.add_argument("--gl", default="us")
-    s.add_argument("--source", default="chrome", choices=["chrome", "youtube"])
-    s.add_argument("--sort", default="proxy", choices=["proxy", "words", "alpha"])
+    s.add_argument("--source", default="chrome", choices=["chrome", "youtube"],
+                   help="legacy single-engine selector; --engines supersedes it")
+    s.add_argument("--engines", nargs="*", default=None,
+                   choices=list(SUGGEST_ENGINES) + ["all", "web"],
+                   help="suggestion corpora to sweep. 'web' = google+bing+ddg (the three "
+                        "web-search engines), 'all' = those plus youtube/yandex/amazon. "
+                        "More engines = more calls, but a real agreement signal.")
+    s.add_argument("--sort", default="proxy", choices=["proxy", "words", "alpha", "agreement"])
     s.add_argument("--limit", type=int, default=200)
     s.add_argument("--max-calls", type=int, default=120)
     s.add_argument("--delay", type=float, default=0.15)

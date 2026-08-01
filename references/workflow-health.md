@@ -21,6 +21,30 @@ program needs *work items*, and nothing connected the two.
 | One dimension across the site | the specific audit skill (below) |
 | What bots actually did | **`workflow-crawl-log.md`** (this skill) |
 | Generated silo at scale | **`workflow-programmatic.md`** (this skill) |
+| One URL, right now, no crawl | **`pagecheck.py`** (this skill) |
+
+`pagecheck.py` is the quick single-URL read, and it works on **any** URL —
+including a competitor's, which the audit skills are not aimed at:
+
+```bash
+python3 scripts/pagecheck.py schema  https://rival.example/page   # Google's own extractor
+python3 scripts/pagecheck.py html    https://oursite.example/page # W3C validity
+python3 scripts/pagecheck.py history https://rival.example/page --since 2026-05-01
+python3 scripts/pagecheck.py vitals  https://oursite.example/page # lab + real-user CWV
+```
+
+`history` is the one with no equivalent elsewhere in this skill: when a page
+starts losing rank, it tells you whether the page-1 result that replaced you was
+rewritten recently or has sat untouched for two years. ⚠ Read its caveats before
+quoting a number — the version count is byte-level variation inside a recency
+window, not an edit count.
+
+`vitals` returns BOTH a lab run and `field_crux` — real-user 75th-percentile
+LCP/CLS/INP, which is the ranking-relevant half. ⚠ **Empty `field_crux` is not a
+zero and not a failure**: CrUX only reports origins with enough traffic to be
+statistically meaningful, so `null` means *too few real users to measure*. On a
+small site expect the lab numbers alone, and never report the absence as a
+performance finding.
 
 The single-dimension audits: `sitemap-audit`, `robots-txt-audit`,
 `redirect-audit`, `internal-link-audit`, `external-link-audit`,

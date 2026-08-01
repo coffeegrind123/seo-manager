@@ -34,6 +34,7 @@ import argparse
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -255,6 +256,106 @@ def discussions(query, limit=10, site="webmasters"):
     return out
 
 
+def newsvolume(query, months=3, retries=2):
+    """GDELT: how much NEWS COVERAGE a topic got, day by day, keyless.
+
+    This fills the gap the rest of the file leaves. Google Trends' RSS answers
+    "what is trending RIGHT NOW" and nothing else; Wikimedia pageviews answer
+    "how much attention does this ARTICLE get" and only for topics with an
+    article. GDELT answers "how much has the press written about this PHRASE,
+    every day, for months" - which is the shape you need to tell a topic that
+    is genuinely rising from one that had a single spike.
+
+    ⚠ It is COVERAGE, not search demand. A press-driven spike and a
+    people-are-searching spike are different things, and this measures the
+    first. Treat a rise as a REASON to check demand, never as demand itself.
+
+    ⚠ It 429s under shared-IP load and then answers fine seconds later
+    (measured: first call 429, retry 200 with 86 datapoints). A single-shot
+    call reports a permanent failure that is really a transient one, so this
+    retries by default.
+    """
+    q = query if query.startswith('"') else f'"{query}"'
+    url = ("https://api.gdeltproject.org/api/v2/doc/doc?"
+           + urllib.parse.urlencode({"query": q, "mode": "timelinevol",
+                                     "format": "json", "timespan": f"{months}m"}))
+    status = body = None
+    for attempt in range(retries + 1):
+        status, body = fetch(url, timeout=45)
+        if status == 200:
+            break
+        if attempt < retries:
+            time.sleep(5 * (attempt + 1))
+    if status != 200:
+        return _fail("gdelt", status, body)
+    try:
+        timeline = (json.loads(body) or {}).get("timeline") or []
+    except json.JSONDecodeError:
+        return _fail("gdelt", status, body)
+    if not timeline:
+        return {"ok": True, "source": "gdelt", "query": query, "points": 0, "series": [],
+                "empty_means": "GDELT answered but has no coverage for this phrase in the "
+                               "window. That is a real answer - a phrase the press has not "
+                               "covered - not a failed read."}
+    data = timeline[0].get("data") or []
+    series = [{"date": (d.get("date") or "")[:10], "value": d.get("value")} for d in data]
+    values = [d["value"] for d in series if isinstance(d.get("value"), (int, float))]
+    half = len(values) // 2
+    first_half = sum(values[:half]) / half if half else 0.0
+    second_half = sum(values[half:]) / (len(values) - half) if len(values) - half else 0.0
+    peak = max(series, key=lambda d: d.get("value") or 0) if series else None
+    return {
+        "ok": True, "source": "gdelt", "query": query, "months": months,
+        "points": len(series),
+        "peak": peak,
+        "recent_vs_earlier": round(second_half - first_half, 4),
+        "direction": ("rising" if second_half > first_half * 1.2 else
+                      "falling" if second_half < first_half * 0.8 else "flat"),
+        "series": series,
+        "means": "share of monitored world news mentioning the phrase, per day. COVERAGE, "
+                 "not search demand - use a rise as a prompt to check demand, never as demand.",
+    }
+
+
+def news(query, limit=25, hl="en-US", gl="US"):
+    """Google News RSS: who is covering a topic right now, keyless.
+
+    Two uses, both concrete. As a trend read it says whether a subject is live
+    this week. As RESEARCH it names the publishers currently ranking in Google
+    News for the phrase - which is a free look at who owns the topic, and a
+    shortlist of outlets worth citing or pitching.
+    """
+    url = ("https://news.google.com/rss/search?"
+           + urllib.parse.urlencode({"q": query, "hl": hl, "gl": gl, "ceid": f"{gl}:{hl.split('-')[0]}"}))
+    status, body = fetch(url, headers={"User-Agent": BROWSER_UA}, timeout=30)
+    if status != 200:
+        return _fail("google-news", status, body)
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as e:
+        return _fail("google-news", status, f"unparseable RSS: {e}")
+    items, sources = [], {}
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        src_el = item.find("source")
+        src = (src_el.text or "").strip() if src_el is not None else ""
+        if src:
+            sources[src] = sources.get(src, 0) + 1
+        if len(items) < limit:
+            items.append({"title": title, "published": pub, "source": src,
+                          "link": (item.findtext("link") or "").strip()})
+    return {
+        "ok": True, "source": "google-news-rss", "query": query,
+        "items_total": sum(sources.values()) or len(items),
+        "top_publishers": sorted(({"publisher": k, "items": v} for k, v in sources.items()),
+                                 key=lambda r: -r["items"])[:10],
+        "items": items,
+        "empty_means": "no items is a real answer (nothing in Google News for this phrase), "
+                       "not a failed read - the feed parsed.",
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -277,6 +378,16 @@ def main():
     d.add_argument("--limit", type=int, default=10)
     d.add_argument("--site", default="webmasters", help="StackExchange site key (webmasters, gaming, stackoverflow...)")
 
+    n = sub.add_parser("newsvolume", help="GDELT daily news-coverage timeline for a phrase (keyless)")
+    n.add_argument("--query", required=True)
+    n.add_argument("--months", type=int, default=3)
+
+    g = sub.add_parser("news", help="Google News RSS - who is covering this topic now (keyless)")
+    g.add_argument("--query", required=True)
+    g.add_argument("--limit", type=int, default=25)
+    g.add_argument("--hl", default="en-US")
+    g.add_argument("--gl", default="US")
+
     a = p.parse_args()
     if a.cmd == "trending":
         out = trending(a.geo, a.limit)
@@ -284,6 +395,10 @@ def main():
         out = wiki_search(a.topic, lang=a.lang)
     elif a.cmd == "pageviews":
         out = pageviews(a.article, a.days, a.lang)
+    elif a.cmd == "newsvolume":
+        out = newsvolume(a.query, a.months)
+    elif a.cmd == "news":
+        out = news(a.query, a.limit, a.hl, a.gl)
     else:
         out = discussions(a.query, a.limit, a.site)
 

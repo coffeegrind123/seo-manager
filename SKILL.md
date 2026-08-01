@@ -13,11 +13,17 @@ description: >-
   Googlebot, and AI-crawler ingestion (training vs search vs live user fetch); Search
   Console decay that separates a page losing rank from a query losing demand; whole-page-1
   drift with algorithm-update correlation; index-bloat scoring across generated silos; and
-  real traffic-sending backlinks from referrers. Runs entirely on free, keyless data by
-  default (DuckDuckGo SERPs, Google Autocomplete, real Google via the browser, Search
-  Console, access logs, Common Crawl, RDAP, sitemaps) and upgrades to SerpApi / Brave /
-  DataForSEO / Open PageRank when keys exist. State lives in a committed .seo/ directory —
-  no backend, no database, no MCP server.
+  real traffic-sending backlinks from referrers. Runs on 18 free keyless sources by
+  default — six independent suggestion corpora (Google, Bing, DuckDuckGo, YouTube, Yandex,
+  Amazon) that together give a cross-engine agreement signal and observed video/product
+  intent, DuckDuckGo SERPs, real Google via the browser, Tranco authority with rank
+  history, GDELT news-volume timelines, Google News, Wikidata and Wikipedia for entity
+  coverage, OpenAlex and Crossref for citable facts, W3C and Google's own structured-data
+  validators, Wayback change history, Search Console, access logs, Common Crawl, RDAP and
+  sitemaps — and upgrades to SerpApi / Serper / Bing Webmaster / Open PageRank / PageSpeed
+  / DataForSEO when keys exist. Every source is declared once in a registry that
+  live-probes itself, so "what works right now" is measured rather than assumed. State
+  lives in a committed .seo/ directory — no backend, no database, no MCP server.
 when_to_use: >-
   Use when the user wants to do SEO on a site they control as an ongoing program rather
   than a one-off check: research keywords, decide what to write next, build a guide or a
@@ -150,17 +156,20 @@ All stdlib Python 3, no installs. Every one prints JSON.
 |---|---|
 | `seostate.py` | **all state**: queue, keywords, ranks, pages, trends, prospects, profile, conventions, pacing, overview, next-actions, run log |
 | `serp.py` | live SERPs through the provider ladder, plus the weakness/authority scoring the gate needs |
-| `keywords.py` | autocomplete expansion, tool-intent sweeps, DataForSEO volume/KD, Search Console → candidates |
+| `keywords.py` | expansion across **six independent suggestion corpora** (Google, Bing, DuckDuckGo, YouTube, Yandex, Amazon) with a cross-engine agreement signal and observed video/product intent, plus tool-intent sweeps, DataForSEO volume/KD, and Search Console → candidates |
 | `sameness.py` | the corpus sameness gate + a pairwise drift audit |
-| `authority.py` | DR-equivalent, and the KD zones / volume band that follow from it. Also `--bulk` competitor scoring, free referring-domain counts, a 12-month authority trend, and a Cloudflare Radar popularity bucket |
+| `authority.py` | DR-equivalent, and the KD zones / volume band that follow from it. Also `--bulk` competitor scoring, free referring-domain counts, a 12-month authority trend, and two independent popularity reads (Cloudflare Radar + **Tranco**, which is keyless and carries 40 days of rank history) |
 | `bing.py` | **the only free source of real search volume AND backlinks** — Bing Webmaster Tools for a site you own. Impressions per query, related-keyword expansion with numbers, inbound links, query stats |
-| `trendfeeds.py` | **keyless demand signals**: Google Trends' RSS feed (works where the 429-ing JSON API does not), Wikimedia pageviews as absolute topic demand, and HN + StackExchange chatter |
+| `trendfeeds.py` | **keyless demand signals**: Google Trends' RSS feed (works where the 429-ing JSON API does not), Wikimedia pageviews as absolute topic demand, HN + StackExchange chatter, **GDELT's per-topic news-volume timeline**, and Google News (who is covering the topic now) |
 | `rankcheck.py` | batch rank checks for every tracked keyword |
 | `serpd.py` | **the fast path for SERP-heavy runs**: a long-lived headed Chrome behind `localhost:8791`. One curl per check, real Google, no DOM in your context. 25 checks in ~37s and 1.4KB of verdicts. |
 | `indexnow.py` | get published pages crawled: IndexNow ping (free, keyless, Bing/Yandex) + the batched Google "Request indexing" follow-up |
 | `test_guards.py` | regression tests for the SERP guards, against real captured responses |
 | `test_providers.py` | regression tests for the free-provider integrations — chiefly that Open PageRank's `found: false` can never become a DR of 0 |
-| `seodoctor.py` | **self-healing preflight** - idempotent check+repair of the daemon, its Chrome, deps and project state. Run it first, every run. |
+| `seodoctor.py` | **self-healing preflight** - idempotent check+repair of the daemon, its Chrome, deps and project state. Run it first, every run. `--providers` adds a live sweep of every data source |
+| `providers.py` | **the provider registry**: every data source declared once, each with a live probe and its own control. `providers.py status` answers "what can I use right now?" by measuring, not by reading a table |
+| `factcheck.py` | **information gain, sourced**: OpenAlex + Crossref papers with citation counts and DOIs, Wikidata entities, the Wikipedia neighbourhood of a topic, and a draft-vs-neighbourhood coverage gap |
+| `pagecheck.py` | keyless technical checks for ANY url: W3C HTML validity, Google's own structured-data extractor, Wayback change history (yours or a competitor's), and Core Web Vitals |
 | `crawllog.py` | **the access log**: crawl budget by silo, status codes served to bots, AI-crawler ingestion, and reverse+forward DNS bot verification. `--remote` runs the aggregation on the server so the log never crosses the wire. |
 | `decay.py` | two Search Console periods -> pages that LOST RANK, separated from pages whose demand fell. Plus self-cannibalisation. |
 | `drift.py` | whole-page-1 snapshots and their diff: new entrants, AI-Overview changes, site-wide volatility, algorithm-update correlation |
@@ -179,6 +188,7 @@ python3 $SEO/seostate.py suggestions --status approved --type guide   # the buil
 python3 $SEO/seostate.py pacing                                       # can a guide ship today?
 python3 $SEO/serp.py "keyword" --count 10 --target-domain example.com
 python3 $SEO/keywords.py expand --seed "<facet>" --groups commercial comparison
+python3 $SEO/keywords.py expand --seed "<facet>" --engines all --sort agreement  # 6 corpora
 python3 $SEO/sameness.py check --draft new.md --corpus content/blog --keyword "kw" --pages .seo/pages.json
 python3 $SEO/authority.py --domain example.com --save
 python3 $SEO/authority.py --domain example.com --bulk rival1.com,rival2.com   # who actually outranks you
@@ -189,6 +199,23 @@ python3 $SEO/trendfeeds.py trending --geo US            # Trends RSS: the API 42
 python3 $SEO/trendfeeds.py wiki --topic "<topic>"       # resolve the article title FIRST
 python3 $SEO/trendfeeds.py pageviews --article "<Title>" --days 90
 python3 $SEO/trendfeeds.py discussions --query "<problem>" --site webmasters
+
+# per-topic trend + who is covering it (keyless)
+python3 $SEO/trendfeeds.py newsvolume --query "<phrase>" --months 3   # COVERAGE, not demand
+python3 $SEO/trendfeeds.py news --query "<phrase>"                    # + the publishers
+
+# information gain, with real sources behind it (keyless)
+python3 $SEO/factcheck.py sources --query "<topic>" --since-year 2020  # papers, citations, DOIs
+python3 $SEO/factcheck.py related --topic "<Article Title>"            # the topic neighbourhood
+python3 $SEO/factcheck.py coverage --draft new.md --topic "<Article Title>"
+
+# any-URL technical checks, incl. a COMPETITOR's change history (keyless)
+python3 $SEO/pagecheck.py schema https://rival.example/page
+python3 $SEO/pagecheck.py history https://rival.example/page --since 2026-05-01
+python3 $SEO/pagecheck.py vitals https://oursite.example/page         # lab + real-user CWV
+
+# what data sources actually work right now (measured, not assumed)
+python3 $SEO/providers.py status
 
 # real numbers (Bing Webmaster - needs a verified property)
 python3 $SEO/bing.py sites                          # auth control; run first if anything looks odd
@@ -246,7 +273,18 @@ well as in the quality bar:
   This includes **absence returned by a working API**: Open PageRank's
   `found: false` means the link graph has never seen that domain, which is not
   a DR of 0, and Wikimedia pageviews are topic interest, not search volume.
-  Neither may be substituted for the number it resembles.
+  Neither may be substituted for the number it resembles. The same rule governs
+  every source added since: **Bing impressions are not Google volume**,
+  **engine agreement is ordinal corroboration, not a volume**, **Tranco rank is
+  popularity, not authority**, and **GDELT is press coverage, not demand**. Each
+  is a real measurement of a real thing — just not of the thing it resembles,
+  and the resemblance is exactly what makes the substitution tempting.
+- **A source you cannot cite, you have not verified.** `factcheck.py` returns
+  papers with DOIs and citation counts; that makes them **candidates to read**.
+  Citing one because a tool returned it, without opening it, is fabrication with
+  a reference attached — worse than an unsourced claim, because it looks
+  checked. The information-gain requirement is satisfied by reading, never by
+  retrieving.
 - **A negative result is only as good as its control.** Before reporting that
   something is absent — not indexed, not crawled, not cited, not in the corpus,
   a bot that is spoofed — run the same probe against something you KNOW is
@@ -257,7 +295,13 @@ well as in the quality bar:
   `404`. Both would have shipped as confident conclusions. `crawllog.py verify`
   and `backlinks.py footprint` now refuse to return a verdict when their control
   fails, and any new probe must do the same. **"Cannot ask" and "the answer is
-  no" must never share a code path.**
+  no" must never share a code path.** `providers.py` enforces this structurally:
+  a probe whose control fails is reported `control_failed` and treated as
+  **unusable**, not as quiet. Two more instruments were caught broken by their
+  own controls while this was being built — a schema parser that read the wrong
+  key and so reported every page as having no structured data, and a crt.sh
+  probe aimed at a domain with no certificates. Both would have shipped as
+  confident findings about the web rather than bugs in the reader.
 - **A refused SERP read is a failed read, never an empty page 1.** `serp.py`
   rejects two shapes that both look like success: an HTTP 200 with nothing
   parseable, and — measured on real Bing responses — a full page of well-formed

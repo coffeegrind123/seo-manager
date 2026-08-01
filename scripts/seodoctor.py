@@ -189,6 +189,46 @@ def check_deps() -> dict:
     return out
 
 
+def check_providers(live: bool) -> dict:
+    """What data sources are actually available.
+
+    Two modes on purpose. The default is CHEAP - it reports which credentials
+    exist without spending a single network call, because the preflight runs
+    before every workflow and must stay a ~2s no-op on a healthy setup. `live`
+    probes every source for real, which is what you want when a data call has
+    started behaving oddly and you need to know whether the source or the code
+    is at fault.
+    """
+    try:
+        import providers as P
+    except Exception as e:
+        return {"ok": False, "error": f"provider registry unavailable: {e}"}
+    if live:
+        rows = P.probe_all()
+        by_state: dict[str, list[str]] = {}
+        for r in rows:
+            by_state.setdefault(r["state"], []).append(r["provider"])
+        return {"ok": True, "mode": "live", "by_state": by_state, "providers": rows}
+    configured, missing = [], []
+    for name, _cat, _cost, needs_key, _fn, _note in P.PROVIDERS:
+        if not needs_key:
+            continue
+        env = {"openpagerank": ("OPENPAGERANK_API_KEY", "~/.openpagerank_key"),
+               "cloudflare-radar": ("CLOUDFLARE_API_TOKEN", "~/.cloudflare_token"),
+               "bing-webmaster": ("BING_WEBMASTER_API_KEY", "~/.bing_webmaster_key"),
+               "serper": ("SERPER_API_KEY", "~/.serper_key"),
+               "serpapi": ("SERPAPI_KEY", "~/.serpapi_key"),
+               "pagespeed": ("GOOGLE_API_KEY", "~/.google_api_key")}.get(name)
+        (configured if env and P.read_secret(*env) else missing).append(name)
+    keyless = [n for n, _c, _co, k, _f, _no in P.PROVIDERS if not k]
+    return {"ok": True, "mode": "cheap", "keyless_always_available": len(keyless),
+            "keyed_configured": configured, "keyed_missing": missing,
+            "note": "credential presence only - no network was touched. Run with --providers "
+                    "for live probes. A source in keyed_missing is an UPGRADE that is not "
+                    "installed, never a fault: the pipeline runs end to end on the keyless "
+                    f"{len(keyless)}."}
+
+
 def check_project(root: Path) -> dict:
     seo = root / ".seo"
     if not (seo / "config.json").exists():
@@ -211,12 +251,16 @@ def main() -> int:
     p.add_argument("--check", action="store_true", help="report only, repair nothing")
     p.add_argument("--hard", action="store_true", help="force-restart the daemon even if healthy")
     p.add_argument("--root", default=".", help="repo root holding .seo/")
+    p.add_argument("--providers", action="store_true",
+                   help="LIVE-probe every data source (network, ~30s) instead of just "
+                        "reporting which credentials exist")
     a = p.parse_args()
 
     report = {
         "ok": True,
         "deps": check_deps(),
         "project": check_project(Path(a.root).resolve()),
+        "providers": check_providers(live=a.providers),
         "serpd": ensure_serpd(hard=a.hard, repair=not a.check),
     }
     hard_fail = []

@@ -12,6 +12,7 @@ Run: python3 test_providers.py     (no network, no keys)
 
 from __future__ import annotations
 
+import json
 import sys
 
 import authority
@@ -132,6 +133,126 @@ def main():
     check("a refusal is not ok", f["ok"], False)
     check("a refusal keeps its status code", f["status"], 429)
     check("a refusal says so in words", "REFUSED" in f["note"], True)
+
+    # ------------------------------------------------------------------ tranco
+    print("\ntranco: absent from the list is a measurement, not a rank of zero")
+    orig_fetch = authority.fetch
+    try:
+        authority.fetch = lambda url, **kw: (200, json.dumps({"ranks": []}))
+        got = authority.from_tranco("young-site.example")
+        check("empty ranks -> in_list false", got.get("in_list"), False)
+        check("...and rank stays None, never 0", got.get("rank"), None)
+        check("...and it is not an error either", got.get("error"), None)
+
+        # A refusal must NOT be reported as "not in the list".
+        authority.fetch = lambda url, **kw: (503, "upstream down")
+        got = authority.from_tranco("x.example")
+        check("a 503 is an error, not an absence", bool(got.get("error")), True)
+        check("...and never claims in_list", got.get("in_list"), None)
+
+        # Direction must come from the oldest-vs-newest rank, sorted by DATE -
+        # the API does not promise an order, and trusting the array order
+        # inverts the trend for any domain returned newest-first.
+        authority.fetch = lambda url, **kw: (200, json.dumps({"ranks": [
+            {"date": "2026-07-31", "rank": 100}, {"date": "2026-06-22", "rank": 500}]}))
+        got = authority.from_tranco("climbing.example")
+        check("newest rank wins regardless of array order", got.get("rank"), 100)
+        check("a climb from 500 to 100 reads as improving", got.get("direction"), "improving")
+        check("popularity is flagged as NOT a DR", "NOT a DR" in got.get("means", ""), True)
+    finally:
+        authority.fetch = orig_fetch
+
+    # ----------------------------------------------------- engine agreement
+    print("\nkeyword expansion: a silent engine is not evidence of no demand")
+    import keywords
+
+    class A:  # argparse stand-in
+        seed = ["widget"]; groups = ["question"]; tools = False; alphabet = False
+        must_contain = None; hl = "en"; gl = "us"; source = "chrome"
+        engines = ["google", "bing", "amazon"]; sort = "agreement"
+        limit = 10; max_calls = 1; delay = 0
+
+    # google + bing answer, amazon is dead. Agreement must be scored out of the
+    # TWO that answered - scoring out of three would quietly mark every phrase
+    # as weakly-corroborated because one endpoint was down.
+    def fake_ac(q, hl="en", gl="us", source="chrome", engine=None):
+        return {"google": ["widget guide"], "bing": ["widget guide"], "amazon": []}.get(engine, [])
+
+    orig_ac = keywords.autocomplete
+    captured = {}
+    try:
+        keywords.autocomplete = fake_ac
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            keywords.cmd_expand(A())
+        captured = json.loads(buf.getvalue())
+    finally:
+        keywords.autocomplete = orig_ac
+    check("a silent engine is excluded from the denominator",
+          captured.get("engines_answering"), ["bing", "google"])
+    check("...and is reported rather than hidden", captured.get("engines_silent"), ["amazon"])
+    row = (captured.get("results") or [{}])[0]
+    check("both live engines agreeing scores 2", row.get("engine_agreement"), 2)
+    check("...which is 100% of the engines that answered", row.get("engine_agreement_pct"), 100)
+    check("agreement is labelled ordinal, not a volume",
+          "not a volume" in captured.get("engine_agreement_note", ""), True)
+
+    # ------------------------------------------------------- schema parsing
+    print("\npagecheck: the schema validator's node shape is typeGroup/types, not type")
+    import pagecheck
+    from providers import HttpResult
+    # The exact shape the live validator returns (trimmed). Reading node["type"]
+    # here yields None and reports a page full of schema as having none.
+    payload = {"isRendered": True, "numObjects": 1, "totalNumErrors": 0, "totalNumWarnings": 0,
+               "tripleGroups": [{"nodes": [{
+                   "typeGroup": "WebSite",
+                   "types": [{"pred": "itemtype", "value": "WebSite"}],
+                   "properties": [{"pred": "name", "value": "X", "errors": []}],
+                   "nodeProperties": [{"pred": "publisher", "value": [
+                       {"typeGroup": "Organization",
+                        "types": [{"pred": "itemtype", "value": "Organization"}],
+                        "properties": [], "nodeProperties": []}]}]}]}]}
+    orig_http = pagecheck.http
+    try:
+        pagecheck.http = lambda *a, **k: HttpResult(status=200, body=json.dumps(payload).encode())
+        got = pagecheck.check_schema("https://x.example/")
+        check("the top-level type is found", got["types"].get("WebSite"), 1)
+        check("a NESTED type is found too", got["types"].get("Organization"), 1)
+        check("...so the count is not zero", got.get("type_count"), 2)
+
+        pagecheck.http = lambda *a, **k: HttpResult(status=200, body=json.dumps(
+            {"isRendered": True, "numObjects": 0, "tripleGroups": []}).encode())
+        got = pagecheck.check_schema("https://bare.example/")
+        check("a page with no schema is a successful read", got.get("ok"), True)
+        check("...reporting zero types", got.get("type_count"), 0)
+        check("...and saying an absence needs a positive control",
+              "KNOW has schema" in got.get("empty_means", ""), True)
+
+        pagecheck.http = lambda *a, **k: HttpResult(status=500, body=b"nope")
+        got = pagecheck.check_schema("https://down.example/")
+        check("a 500 is NOT zero structured data", got.get("ok"), False)
+    finally:
+        pagecheck.http = orig_http
+
+    # ------------------------------------------------- gzipped error bodies
+    print("\nproviders: an error body is gzipped too, and its MESSAGE is the useful part")
+    import gzip as _gz
+    import providers as P
+    msg = {"error": {"message": "PageSpeed Insights API has not been used in project 1 before"}}
+    fake = HttpResult(status=403, body=_gz.decompress(_gz.compress(json.dumps(msg).encode())))
+    check("a decompressed error body still parses", fake.json()["error"]["message"][:9], "PageSpeed")
+    check("the XSSI guard is stripped before parsing",
+          HttpResult(status=200, body=b")]}'\n{\"a\":1}").json(), {"a": 1})
+
+    # ------------------------------------------------------ control failure
+    print("\nproviders: a probe whose CONTROL fails is unusable, not merely quiet")
+    row = P._run_probe(("fake", "test", "free", False, lambda: (True, "200 n=5", False), "x"))
+    check("main call ok + control failed -> control_failed", row["state"], "control_failed")
+    row = P._run_probe(("fake", "test", "free", False, lambda: (True, "200 n=5", True), "x"))
+    check("both ok -> usable", row["state"], "usable")
+    row = P._run_probe(("fake", "test", "free", False, lambda: (None, "no key", None), "x"))
+    check("no credential -> unconfigured, never failing", row["state"], "unconfigured")
 
     print()
     if FAILURES:

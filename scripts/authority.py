@@ -368,6 +368,64 @@ def from_cloudflare_radar(domain: str):
     }
 
 
+def from_tranco(domain: str):
+    """Tranco rank - keyless, no account, and it carries ~40 days of history.
+
+    Tranco is the research-grade domain popularity list (it averages several
+    underlying lists over a window specifically to resist the day-to-day churn
+    and manipulation that makes Alexa/Umbrella-style lists jumpy). Two things
+    make it worth carrying next to Open PageRank and Radar:
+
+      - it needs NO credential at all, so it is the only authority signal that
+        still answers on a machine with no keys configured whatsoever;
+      - the history turns a single rank into a TRAJECTORY. A competitor at
+        rank 90k that was 300k in June is a different threat from one that has
+        sat at 90k for a year, and no other free source here shows that.
+
+    ⚠ It is a popularity rank, NOT a link-graph score, and NOT a DR. It is
+    reported alongside the DR and never folded into it - a heavily-visited site
+    with few links and a rarely-visited site with many are both real, and
+    averaging them would erase the distinction that makes two sources useful.
+
+    Absence is a REAL answer here and is safe to report as one: measured
+    2026-08-01, a domain that is certainly not in the list answers HTTP 200
+    with an empty `ranks` array, while an outage would not answer 200 at all.
+    """
+    status, text = fetch(f"https://tranco-list.eu/api/ranks/domain/{urllib.parse.quote(domain)}",
+                         timeout=20)
+    if status != 200:
+        return {"error": f"tranco HTTP {status}: {text[:160]}"}
+    try:
+        ranks = (json.loads(text) or {}).get("ranks") or []
+    except json.JSONDecodeError:
+        return {"error": f"tranco: unparseable response: {text[:160]}"}
+    if not ranks:
+        return {"source": "tranco", "in_list": False, "rank": None,
+                "means": "not in the Tranco top-1M. That is a real measurement (the API "
+                         "answered 200 with an empty list), but it is a popularity floor "
+                         "only - it says nothing about the link graph or about DR."}
+    # Newest first is not guaranteed; sort explicitly rather than trusting order.
+    ordered = sorted([r for r in ranks if r.get("rank")], key=lambda r: r.get("date", ""))
+    if not ordered:
+        return {"source": "tranco", "in_list": False, "rank": None,
+                "means": "listed but with no usable rank values"}
+    newest, oldest = ordered[-1], ordered[0]
+    delta = oldest["rank"] - newest["rank"]      # positive = improving (lower rank number)
+    return {
+        "source": "tranco",
+        "in_list": True,
+        "rank": newest["rank"],
+        "as_of": newest.get("date"),
+        "history_days": len(ordered),
+        "rank_then": oldest["rank"],
+        "since": oldest.get("date"),
+        "direction": "improving" if delta > 0 else "declining" if delta < 0 else "flat",
+        "rank_change": delta,
+        "means": "popularity rank (1 = most popular). NOT a DR and NOT a link metric - "
+                 "carried alongside the DR, never folded into it.",
+    }
+
+
 def domain_age_days(domain: str):
     """RDAP - the modern WHOIS. Free, keyless, no account."""
     labels = [x for x in domain.split(".") if x]
@@ -545,10 +603,24 @@ def main():
         "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
+    # Two independent popularity reads, both kept SEPARATE from the DR. Radar
+    # measures resolver traffic and needs a token; Tranco measures list
+    # membership and needs nothing, so on a keyless machine it is the only one
+    # of the two that answers.
+    popularity = {}
     radar = from_cloudflare_radar(domain)
     if radar is not None:
-        # Deliberately alongside the DR, never folded into it.
-        payload["popularity"] = radar
+        popularity["cloudflare_radar"] = radar
+    tranco = from_tranco(domain)
+    if tranco is not None:
+        popularity["tranco"] = tranco
+    if popularity:
+        popularity["note"] = ("popularity is NOT authority. These say how many people visit "
+                              "or resolve a domain; dr_equivalent says how the link graph "
+                              "rates it. Report them side by side - a mismatch is itself "
+                              "information (heavy traffic + thin links = a brand searching "
+                              "for itself, not a site that will outrank you on a new query).")
+        payload["popularity"] = popularity
 
     if a.bulk:
         extra = [d for d in (x.strip() for x in a.bulk.split(",")) if d]
