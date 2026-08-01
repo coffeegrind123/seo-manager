@@ -291,6 +291,24 @@ sounds better and is not: it breaks any engine that does a redirect + cookie hop
 because each hop lands in a different country. `serp.py` is sticky per run and
 rotates only on demand.
 
+⛔ **Do not hand-roll the selector to test it — build the URL with `serp.Proxy`.**
+Measured 2026-08-01: a hand-written probe that appended
+`_country-de_session-abc123_lifetime-10` to the password returned a **US** exit
+for every country asked for, which reads exactly like "this account has no
+geo-targeting". It was the probe that was wrong. The same countries through
+`serp.Proxy(url, country=cc).url()` resolved correctly on the first try —
+`de → DE`, `nl → NL`, `gr → GR`, and no selector at all rotating across RU and
+KR as designed. A **reused session token pins the exit that token already has**,
+and it outranks a country selector added afterwards, so a fixed literal token in
+a test silently defeats the thing the test is checking. `Proxy._token()` mints a
+fresh one per run for exactly this reason.
+
+```python
+import serp
+p = serp.Proxy(serp._read_proxy_file()["SEO_PROXY_URL"], country="de")
+# curl -x p.url() https://ipinfo.io/json   -> {"country": "DE", ...}
+```
+
 **Country pool** (`--proxy-country`): whatever your provider actually serves —
 verify it rather than trusting the marketing list. On the provider this was
 measured against, `gr se nl it de es pl ro pt be at cz dk ie ch` all resolved and

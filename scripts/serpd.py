@@ -202,6 +202,39 @@ def _reconcile_orphan_chrome(want_proxy: bool) -> int | None:
     return None
 
 
+
+def _proxy_file_url() -> str:
+    """Read SEO_PROXY_URL out of ~/.seo-proxy.
+
+    serp.py has always honoured this file; serpd.py did not, and read the
+    environment alone. That split is worse than either choice on its own: you
+    configure the file, `serp.py --provider ddg` correctly goes out on the
+    residential exit, and the DAEMON - the fast path that does the actual
+    volume - silently keeps using the datacenter IP. Nothing reports the
+    difference, and Google starts serving /sorry to the half you thought was
+    protected. Same rule as adoption: never let the caller believe they are
+    proxied when they are not.
+    """
+    try:
+        for line in open(os.path.expanduser("~/.seo-proxy"), encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k.strip() in ("SEO_PROXY_URL", "SERPD_PROXY"):
+                return v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def resolve_proxy_url() -> str:
+    """Env first, then ~/.seo-proxy. One resolver, used everywhere."""
+    return (os.environ.get("SERPD_PROXY")
+            or os.environ.get("SEO_PROXY_URL")
+            or _proxy_file_url()).strip()
+
+
 def ensure_chrome() -> int:
     """Start our own headed Chrome, or adopt the one we started earlier.
 
@@ -210,7 +243,7 @@ def ensure_chrome() -> int:
     all. There is an Xvfb display in this environment, so headed is free.
     """
     global CDP_PORT
-    want_proxy = bool((os.environ.get("SERPD_PROXY") or os.environ.get("SEO_PROXY_URL") or "").strip())
+    want_proxy = bool(resolve_proxy_url())
     # Adoption must not silently change what the caller asked for. A Chrome
     # launched WITHOUT a proxy cannot be reused when a proxy is now configured -
     # you would believe you were on a residential exit while every request went
@@ -278,8 +311,7 @@ def ensure_chrome() -> int:
     ]
     if os.path.isdir(UBLOCK):
         args.append(f"--load-extension={UBLOCK}")
-    proxy = os.environ.get("SERPD_PROXY") or os.environ.get("SEO_PROXY_URL") or ""
-    proxy = proxy.strip()
+    proxy = resolve_proxy_url()
     if proxy:
         # Credentials get handled by a local forwarder (see above) because
         # Chrome's --proxy-server cannot carry them itself.
@@ -987,8 +1019,33 @@ def main():
                     "port": (lambda m: int(m.group(1)) if m else None)(
                         re.search(r"--remote-debugging-port=(\d+)", _cmdline(pid)))}
                    for pid in _chrome_pids_on_profile()]
+
+        # Proxy state, read off the LIVE process argv rather than the config.
+        # A config value says what was intended; argv says what is. The gap
+        # between those two is exactly the failure this daemon already guards
+        # against on adoption - believing you are on a residential exit while
+        # every request leaves on the datacenter IP - and `--status` was silent
+        # about it in both directions.
+        configured = bool(resolve_proxy_url())
+        live = [pid for pid in _chrome_pids_on_profile()
+                if "--proxy-server=" in _cmdline(pid)]
+        proxy_state = {
+            "configured": configured,
+            "source": ("env" if (os.environ.get("SERPD_PROXY") or os.environ.get("SEO_PROXY_URL"))
+                       else "~/.seo-proxy" if configured else None),
+            "chrome_launched_with_proxy": bool(live),
+        }
+        if configured and not live and _chrome_pids_on_profile():
+            proxy_state["warning"] = ("a proxy IS configured but the running chrome was launched "
+                                      "WITHOUT one - restart the daemon (--stop --force, then "
+                                      "--start) or every SERP goes out on the datacenter IP")
+        elif live and not configured:
+            proxy_state["warning"] = ("chrome is proxied but nothing is configured now - it is "
+                                      "running on an older config; restart to make them agree")
+
         if health:
-            print(json.dumps({**health, "chrome_on_profile": orphans}, indent=2))
+            print(json.dumps({**health, "proxy": proxy_state,
+                              "chrome_on_profile": orphans}, indent=2))
             return 0
         print(json.dumps({
             "ok": False,
