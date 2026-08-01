@@ -425,6 +425,36 @@ The site's build/verify command (from the conventions file) must pass — this a
 compiles the visual components. Sanity-check internal links resolve to real
 slugs and the FAQ mirror holds.
 
+### First the SLOP SCAN — advisory, and it runs BEFORE the sameness gate
+
+```bash
+python3 scripts/slop.py scan <the FINAL guide file>
+```
+
+Order matters: a rewrite for slop changes the text, so running the sameness gate
+first wastes the check. This one detects **AI writing tells** — the "It's not X,
+it's Y" reframe, "Experts say", delve/leverage/robust, throat-clearing openers,
+bold-first bullets — mechanically, with line numbers and the fix for each.
+
+It is the one thing here a model genuinely cannot self-assess: these are exactly
+the patterns it reaches for without noticing, so a model reviewing its own draft
+for them is the same instrument grading itself. A regex is not.
+
+Read `flagged` (over tolerance) and act on it; `within_tolerance` is shown for
+awareness, not action — one binary contrast is rhetoric, ten is a fingerprint.
+Two rules deserve special attention:
+
+- **`vague_attribution`** ("Experts say…") also **fails the information-gain
+  requirement outright** — a citation-shaped phrase with no citation. Name the
+  source or cut the claim.
+- **`binary_contrast`** is the most-cited AI tell there is. The fix is always
+  to state the positive and drop the negation.
+
+**Advisory, not blocking** — unlike the sameness gate. A `fail` on a first draft
+is expected. Rewrite, re-scan, and use `slop.py diff before.md after.md` to
+confirm the rewrite removed tells rather than trading them for new ones (read
+`introduced`). Full catalog and rationale: `references/deslop.md`.
+
 ### Then the SAMENESS GATE — mandatory
 
 ```bash

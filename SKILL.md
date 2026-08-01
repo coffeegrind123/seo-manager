@@ -13,7 +13,14 @@ description: >-
   Googlebot, and AI-crawler ingestion (training vs search vs live user fetch); Search
   Console decay that separates a page losing rank from a query losing demand; whole-page-1
   drift with algorithm-update correlation; index-bloat scoring across generated silos; and
-  real traffic-sending backlinks from referrers. Runs on 18 free keyless sources by
+  real traffic-sending backlinks from referrers. It also GUARDS the site's own markup: a
+  post-deploy contract check that catches a shipped noindex, a dropped schema block, a
+  rewritten canonical or a page that started 404ing; a full hreflang mesh audit (return
+  tags, x-default, code validity, and whether every advertised alternate actually exists)
+  plus a content-parity check that catches a locale still serving English; an
+  agent-readiness audit that resolves robots.txt per AI crawler across the
+  search/user/training split and measures what an agent actually receives; and a
+  deterministic detector for AI writing tells. Runs on 18 free keyless sources by
   default — six independent suggestion corpora (Google, Bing, DuckDuckGo, YouTube, Yandex,
   Amazon) that together give a cross-engine agreement signal and observed video/product
   intent, DuckDuckGo SERPs, real Google via the browser, Tranco authority with rank
@@ -37,7 +44,10 @@ when_to_use: >-
   our niche?", "do AI assistants cite us?", "find backlink prospects", "set up the SEO
   pipeline", "run the daily build", "what is Googlebot crawling?", "is GPTBot reading
   us?", "check the crawl budget", "which pages are losing traffic?", "did we get hit by
-  an update?", "are our generated pages too thin?", "who links to us?". Do NOT use for a
+  an update?", "are our generated pages too thin?", "who links to us?", "did the deploy
+  break anything?", "check the SEO contract", "is our hreflang right?", "are the
+  translations real or still English?", "can ChatGPT read us?", "are we blocking AI
+  crawlers?", "does this draft sound AI-written?". Do NOT use for a
   one-page technical audit — that is seo-audit / seo-audit-full (the `health` workflow
   bridges to them). Do NOT use for raw Search Console queries — that is the
   search-console skill (this skill calls it). Do NOT use for buying ads — that is the
@@ -128,12 +138,32 @@ with twenty pages that read like one template.
 | **crawl-log** (what bots actually did) | monthly | `references/workflow-crawl-log.md` |
 | **programmatic** (generated silos) | before shipping, then quarterly | `references/workflow-programmatic.md` |
 | **health** (technical audits → queue) | quarterly | `references/workflow-health.md` |
+| **contract** (did the deploy break it) | **after every deploy** | `references/workflow-contract.md` |
+| **international** (the hreflang mesh) | quarterly + on locale change | `references/workflow-international.md` |
 
-The five below the line were added 2026-08-01 and share one property: they all
+The five above `contract` were added 2026-08-01 and share one property: they all
 **measure what already exists** rather than proposing something new. On a site
 with any history, that is where the return is — and `crawl-log` in particular is
 the only **first-party** measurement in the skill, reading the server's own
 record instead of asking a third party what it thinks.
+
+The last two are **guards on the site's own markup**, not investigations of the
+outside world:
+
+- **contract** is the fastest-paying workflow here. Every regression it catches
+  — a shipped `noindex`, a dropped schema block, a rewritten canonical — is
+  invisible for weeks, because rankings decay slowly and nobody connects the
+  graph to a deploy twenty commits back. Run it after every deploy, before
+  anything slower: if the contract broke, no downstream measurement is measuring
+  what you think it is.
+- **international** only applies to a multi-locale site, where hreflang fails
+  **silently and bidirectionally** — a missing return tag invalidates the
+  annotation for *both* pages, and Search Console has reported nothing about it
+  since the International Targeting report was removed in 2022.
+
+⚠ **`contract` and `drift` are different things.** `drift.py` watches **their**
+page 1; `contract.py` watches **your** markup. They share a word and nothing
+else.
 
 Supporting references:
 
@@ -142,6 +172,17 @@ Supporting references:
   before adding a provider.
 - `references/backlink-playbook.md` — the curated directory list, ordered by
   value, with an explicit do-not-buy section.
+- `references/agent-readiness.md` — the three AI-crawler classes and why
+  conflating them is the expensive mistake, the evidence that Google ignores
+  `llms.txt`, the Lighthouse `agentic-browsing` category, and WebMCP's real
+  status. **Read it before writing anything about GEO, `llms.txt` or AI
+  crawlers into a report** — the confident wrong answers in this area are
+  everywhere.
+- `references/schema-gates.md` — the rich-result types Google has retired, with
+  dates and sources. A page passes structured-data validation cleanly while
+  every type on it is dead; the validator never mentions it.
+- `references/deslop.md` — the AI-writing-tell catalog behind `slop.py`, and how
+  to read a report that deliberately has no score.
 - `references/automation.md` — GitHub Actions templates (daily build, weekly
   research + ranks, auto-merge), cron, and what to check when a scheduled run
   goes quiet.
@@ -174,10 +215,14 @@ All stdlib Python 3, no installs. Every one prints JSON.
 | `decay.py` | two Search Console periods -> pages that LOST RANK, separated from pages whose demand fell. Plus self-cannibalisation. |
 | `drift.py` | whole-page-1 snapshots and their diff: new entrants, AI-Overview changes, site-wide volatility, algorithm-update correlation |
 | `backlinks.py` | **measurement**, not prospecting: real traffic-sending backlinks from your own referrer log, and Common Crawl corpus presence |
+| `contract.py` | **the deploy guard**: baseline a URL set's on-page SEO contract, then diff it. Reads `X-Robots-Tag` from the header as well as the meta tag, never follows redirects, and keys findings `(path, rule)` with an open/auto-resolve lifecycle. Refuses a verdict during a site-wide outage. |
+| `hreflang.py` | **the international mesh**: self-reference, RETURN TAGS, x-default, ISO 639-1/15924/3166-1 validity, canonical alignment, and the HTTP status of every URL advertised as an alternate. Plus `parity` — is the content behind the mesh actually translated. |
+| `agentcheck.py` | **can an AI agent read, understand and act on this site, and is it allowed to**: robots.txt resolved per AI crawler in the ai_search/ai_user/ai_training taxonomy, agent-UX semantics, token budget, JS-dependence, WebMCP, and `llms.txt` well-formedness |
+| `slop.py` | **AI writing tells, detected mechanically** — 20 patterns with per-rule tolerances, located hits and line numbers. Code fences, inline code and link targets excluded. No score, on purpose. |
+| `test_hreflang.py` / `test_contract.py` / `test_agentcheck.py` / `test_slop.py` | the controls for the four above: every rule is fired against synthetic input, so a clean pass on a real site means something |
 
-Also `assets/google-updates.json` — Google's published algorithm-update calendar
-(vendored from [claude-seo](https://github.com/AgriciDaniel/claude-seo), MIT;
-every entry carries a Google-owned source URL). Consumed by `decay.py --updates`
+Also `assets/google-updates.json` — Google's published algorithm-update calendar,
+every entry carrying a Google-owned source URL. Consumed by `decay.py --updates`
 and `drift.py --updates`. **No API exists — it needs manual top-up**, and its
 silence about a window is not evidence that nothing happened.
 
@@ -240,6 +285,23 @@ python3 $SEO/backlinks.py referrers --remote root@<host> --site example.com
 python3 $SEO/backlinks.py footprint --domain example.com
 python3 $SEO/sameness.py tiers --corpus public/seo/maps        # O(n) index-bloat
 python3 $SEO/keywords.py cluster --file kws.txt                # one page or five?
+
+# guards on your OWN markup (run contract after every deploy - see the note above)
+python3 $SEO/contract.py baseline --name prod --sitemap https://example.com/sitemap.xml
+python3 $SEO/contract.py check --name prod        # opened / still_open / resolved
+python3 $SEO/hreflang.py control                  # ALWAYS first - refuses a verdict if it fails
+python3 $SEO/hreflang.py audit --url https://example.com/page   # expands to every alternate
+python3 $SEO/hreflang.py parity https://example.com/page        # read `systematic` FIRST
+python3 $SEO/hreflang.py codes en-uk eng jp be    # no network at all
+
+# AI agents: permitted? readable? (pairs with crawllog.py, which measures who CAME)
+python3 $SEO/agentcheck.py policy https://example.com    # per-crawler, by class
+python3 $SEO/agentcheck.py page https://example.com/page # agent-UX + token budget + JS-dependence
+python3 $SEO/agentcheck.py all https://example.com
+
+# does the draft read as machine-written (advisory, unlike the sameness gate)
+python3 $SEO/slop.py scan draft.md
+python3 $SEO/slop.py diff before.md after.md      # read `introduced`, not just `removed`
 ```
 
 ---
@@ -309,6 +371,21 @@ well as in the quality bar:
   "no competitors on page 1" hands the authority gate a zero and waves through a
   keyword the site cannot win. No usable read means no authority count, and no
   authority count means the candidate does not pass.
+- **A guard that refuses is working, not failing.** `hreflang.py` refuses a
+  verdict when its parser control fails; `contract.py check` refuses one when
+  most of the URL set is down, because a site-wide outage is not an SEO
+  regression and recording it as one opens a critical finding on every page.
+  Report the refusal and its reason. **Never** report a pass from a run that
+  refused, and never widen `--max-fail-share` to make a refusal go away.
+- **`llms.txt` is not a ranking or citation lever.** Google's own docs say
+  Search ignores it, and 0.1% of AI-bot requests touch it. Report it as
+  optionality; never propose building one as a GEO action, and never let
+  Lighthouse's `agentic-browsing` llms.txt check be reported as a Google
+  signal. `references/agent-readiness.md` has the sources.
+- **A retired rich-result type is a reason not to ADD it, and only sometimes a
+  reason to remove it.** The markup stays valid and other consumers may still
+  read it. `pagecheck.py schema` reports these at info severity for that
+  reason — do not escalate them.
 - **Never push to main.** Always a PR, always labeled `seo`.
 - **Never end a run short.** There is no SERP-check budget and no "carries to the
   next run". A run ends when the queue is full or every rung-1 seam is genuinely
@@ -354,12 +431,6 @@ scripts:
 
 ---
 
-## Licence and third-party content
+## Licence
 
 This skill is **MIT** licensed (see `LICENSE`).
-
-`assets/google-updates.json` is vendored from
-[claude-seo](https://github.com/AgriciDaniel/claude-seo) (MIT) — its own header
-carries the licence, the provenance, and what was and was not re-verified here.
-MIT-on-MIT, so nothing further is required beyond keeping that notice intact.
-Everything else in this skill is original.

@@ -64,24 +64,40 @@ class HttpResult(dict):
         return (self.get("body") or b"").decode("utf-8", "replace")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Turn a redirect into a returned response instead of following it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def http(url, *, data=None, headers=None, timeout=25, method=None, ua=TOOL_UA,
-         retries=0, backoff=3.0, retry_on=(429, 500, 502, 503, 504)) -> HttpResult:
+         retries=0, backoff=3.0, retry_on=(429, 500, 502, 503, 504),
+         follow=True) -> HttpResult:
     """One HTTP call, with an optional bounded retry.
 
     `retries` exists because several free sources here are rate-limited at the
     shared-IP level and answer 429 on the first call and 200 on the second -
     measured on GDELT and crt.sh. A single-shot probe of those reports a
     permanent failure that is really a transient one.
+
+    `follow=False` reports the FIRST response instead of the final one, and
+    carries `location`. Every caller that audits what a URL *is* rather than
+    what it eventually serves needs this: with redirects followed, a canonical
+    or an hreflang alternate pointing at a 301 is indistinguishable from one
+    pointing straight at a 200, and that difference is the whole finding.
     """
     h = {"User-Agent": ua, "Accept": "*/*", "Accept-Encoding": "gzip"}
     if headers:
         h.update(headers)
+    opener = urllib.request.build_opener(_NoRedirect) if not follow else None
     last = None
     for attempt in range(retries + 1):
         t0 = time.time()
         req = urllib.request.Request(url, data=data, headers=h, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with (opener.open(req, timeout=timeout) if opener
+                  else urllib.request.urlopen(req, timeout=timeout)) as r:
                 raw = r.read()
                 if r.headers.get("Content-Encoding") == "gzip":
                     try:
@@ -90,6 +106,7 @@ def http(url, *, data=None, headers=None, timeout=25, method=None, ua=TOOL_UA,
                         pass
                 return HttpResult(status=r.status, body=raw, ms=int((time.time() - t0) * 1000),
                                   ctype=r.headers.get("Content-Type", ""), url=r.geturl(),
+                                  headers={k.lower(): v for k, v in r.headers.items()},
                                   attempts=attempt + 1)
         except urllib.error.HTTPError as e:
             body = b""
@@ -104,7 +121,8 @@ def http(url, *, data=None, headers=None, timeout=25, method=None, ua=TOOL_UA,
             except Exception:
                 pass
             last = HttpResult(status=e.code, body=body, ms=int((time.time() - t0) * 1000),
-                              error=f"HTTP {e.code}", attempts=attempt + 1)
+                              error=f"HTTP {e.code}", attempts=attempt + 1,
+                              url=url, location=(e.headers or {}).get("Location"))
             if e.code not in retry_on or attempt >= retries:
                 return last
         except Exception as e:

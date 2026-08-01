@@ -131,6 +131,60 @@ def check_html(url: str) -> dict:
     }
 
 
+# Rich-result types Google has RETIRED. The markup stays valid schema.org and
+# the validator is perfectly happy with it - which is exactly the problem: a
+# page can pass structured-data validation cleanly while every type on it is
+# one Google stopped rendering. Nothing in the validator says so.
+#
+# `effect` is what removal does, and it is the field that stops this becoming
+# cargo-cult advice: a dead rich result is not a reason to rip out markup that
+# other consumers still read. Sourced from Google's own announcements; the
+# table and its citations are in `references/schema-gates.md`.
+DEPRECATED_TYPES = {
+    "FAQPage": ("2026-05-07", "Rich results fully retired for all sites.",
+                "Not a defect. Keep it if non-SERP consumers read it; do not add it "
+                "for search benefit. For genuine user-submitted Q&A use QAPage."),
+    "HowTo": ("2023-09", "Rich result removed from desktop and mobile.",
+              "The vocabulary is still valid; there is no SERP effect. Clear <h2> step "
+              "headings do the comprehension work now."),
+    "ClaimReview": ("2025-06-12", "Fact-check rich result retired; Google ignores the markup.",
+                    "No replacement."),
+    "VehicleListing": ("2025-06-12", "Dealer-inventory rich cards no longer render.",
+                       "Use Product if the vehicle is sold online."),
+    "EstimatedSalary": ("2025-06-12", "Salary rich result retired.",
+                        "JobPosting with baseSalary still works for specific roles."),
+    "OccupationalAggregateRating": ("2025-06-12", "Retired with EstimatedSalary.", "None."),
+    "SpecialAnnouncement": ("2025-07-31", "The COVID-era emergency card was retired.",
+                            "Use Event if time-bounded, else Article/WebPage."),
+    "LearningVideo": ("2025-06-12", "Retired.", "VideoObject still renders."),
+    "PracticeProblem": ("2026-01", "Rich Results Test, Search Console reporting and the "
+                                   "appearance filter dropped support.", "None."),
+}
+
+# Explicitly NOT deprecated, because it is the one people remove by mistake.
+NOT_DEPRECATED_NOTE = {
+    "Dataset": "NOT discontinued - Dataset markup is consumed by Dataset Search (live), "
+               "just not by Google Search rich results. Do not remove it.",
+}
+
+
+def schema_gate(types: dict) -> list[dict]:
+    """Flag retired rich-result types found on a page. Never a hard failure."""
+    out = []
+    for t, n in (types or {}).items():
+        bare = t.split("/")[-1].split("#")[-1]
+        if bare in DEPRECATED_TYPES:
+            since, what, instead = DEPRECATED_TYPES[bare]
+            out.append({"severity": "info", "type": bare, "count": n,
+                        "retired": since, "detail": what, "guidance": instead})
+        elif bare in NOT_DEPRECATED_NOTE:
+            out.append({"severity": "info", "type": bare, "count": n,
+                        "retired": None, "detail": NOT_DEPRECATED_NOTE[bare],
+                        "guidance": "Leave it in place."})
+    out.sort(key=lambda r: (r["retired"] or "", r["type"]))
+    return out
+
+
 def check_schema(url: str) -> dict:
     r = http("https://validator.schema.org/validate?url=" + urllib.parse.quote(url, safe=""),
              method="POST", data=b"", timeout=90, retries=1)
@@ -182,6 +236,12 @@ def check_schema(url: str) -> dict:
         "errors": errors[:20],
         "error_count": j.get("totalNumErrors", len(errors)),
         "warning_count": j.get("totalNumWarnings"),
+        "deprecated": schema_gate(counts),
+        "deprecated_means": "Retired rich-result types are reported as INFO, never as a "
+                            "failure: the markup is still valid schema.org and the "
+                            "validator will never mention it. A dead rich result is a "
+                            "reason not to ADD the type, and only sometimes a reason to "
+                            "remove it - see `guidance` on each row.",
         "empty_means": "zero types is a REAL answer (the page has no structured data), "
                        "not a failed read - the call returned tripleGroups. Verify with a "
                        "page you KNOW has schema before reporting an absence.",
