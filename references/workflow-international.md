@@ -32,6 +32,8 @@ purpose — "this page has no hreflang" and "this parser is broken" are the same
 output, and shipping the first when the second is true is how a whole finding
 gets invented.
 
+**Success criteria**: `hreflang.py control` printed `ok: true`. If it did not, the run STOPS here and reports a broken instrument — never a finding about the site.
+
 ---
 
 ## 1. Audit the mesh
@@ -62,6 +64,8 @@ annotations from a single template line, all of them invisible locally.
 **Sanity-check the locale list in the output** against what the site actually
 publishes. A code appearing that nobody ships, or a shipped locale missing, is
 a template bug worth more than any individual finding.
+
+**Success criteria**: Every seed expanded to its declared alternates and the findings are read in severity order. The locale list in the output has been reconciled against what the site actually publishes, and any `alternate_dead` cluster is traced to the template line that emits it.
 
 ---
 
@@ -94,6 +98,8 @@ The load-bearing checks:
   localisation conventions, *not* measurements, and the tool says so in the
   finding text. Use them as a prompt to look, never as a defect on their own.
 
+**Success criteria**: `systematic` was read before `findings`, and every systematic row is stated as one fact about the template or source page rather than N per-locale defects. `length_ratio_outlier` was treated as advisory, not as a defect.
+
 ---
 
 ## 3. Fix upstream, not per page
@@ -108,6 +114,8 @@ Queue anything that needs real translation work rather than a code change:
 python3 $SEO/seostate.py propose --type fix --title "..." --source international \
   --rationale "..."
 ```
+
+**Success criteria**: Each finding is traced to the template or translation table that produced it, and anything needing real translation work is in the queue as `type: fix`. No per-page patches were proposed for a generated silo.
 
 ---
 
@@ -127,6 +135,8 @@ python3 $SEO/seostate.py log-run --workflow international --summary "<N locales,
 `scripts/test_hreflang.py` fires every rule against synthetic markup, so the
 checker is known to discriminate. If that suite is failing, a pass here means
 nothing.
+
+**Success criteria**: The report names locales declared vs reachable, every critical/high finding by rule name, the systematic rows, and what was `unread`. Unread pages are never reported as "no hreflang". The run is written to the run log.
 
 ---
 

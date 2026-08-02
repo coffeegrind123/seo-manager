@@ -14,7 +14,7 @@ Six parts, in order. **Do all six.**
 ## Part 0 — create the project
 
 ```bash
-python3 scripts/seostate.py init \
+python3 $SEO/seostate.py init \
   --name "<Site name>" --domain example.com \
   --repo owner/repo --mode semi --serp-provider ddg
 ```
@@ -28,11 +28,13 @@ python3 scripts/seostate.py init \
 Then measure the site's authority, because the entire quality bar scales off it:
 
 ```bash
-python3 scripts/authority.py --domain example.com --save
+python3 $SEO/authority.py --domain example.com --save
 ```
 
 Read `references/data-sources.md` if you want a real link-graph number instead of
 the keyless estimate (Open PageRank is free and takes two minutes).
+
+**Success criteria**: `seostate.py init` succeeded and `authority.py --save` recorded a `dr` that is not null. The quality bar scales off that number, so a null one blocks every later gate.
 
 ---
 
@@ -101,6 +103,10 @@ misremember their own repos.
 5. If you scaffolded, downstream workflows can only publish once that PR merges —
    **tell the owner merging it is what makes the site publishable.**
 
+**Success criteria**: A content home exists, is PUBLIC (verified with a cookie-less request returning 200 with the article, not a redirect), and is listed in the sitemap. If it was scaffolded, the detail template carries a ToC rail that stays pinned under a scroll test, and the owner has been told that merging that PR is what makes the site publishable.
+
+**Human checkpoint**: ask the owner whether a content section exists — then treat the answer as a hint and let the repo win.
+
 ---
 
 ## Part 2 — find or create the tools home
@@ -142,6 +148,8 @@ EVERY project, so **every project needs somewhere for them to land.**
    steps to ship one tool. If you scaffolded, tell the owner that PR is what makes
    tools publishable.
 
+**Success criteria**: A PUBLIC tools home exists with an EMPTY registry (no placeholder tool), an index page presentable at zero entries, a detail template rendering the locked funnel, and sitemap coverage — all verified logged-out. No app route was renamed or moved. The base path, registry path, widget directory and ship-one-tool steps are recorded for Part 3.
+
 ---
 
 ## Part 3 — write `.seo/conventions.md`
@@ -154,8 +162,10 @@ once to confirm it. Keep it factual and terse — it is a reference card, not pr
 Write it with:
 
 ```bash
-python3 scripts/seostate.py conventions --write conventions-draft.md
-# or pipe it:  cat draft.md | python3 scripts/seostate.py conventions --write -
+python3 $SEO/seostate.py conventions --write conventions-draft.md
+
+**Success criteria**: All seven sections are written, every claim cites a path actually read, and the build command was RUN once to confirm it. The product surface lists BOTH positioning and capability files — a list of only architecture/source files is a failed Part 3. Facets are 3-6 things the product DOES. The Tools section contains no stand-down line.
+# or pipe it:  cat draft.md | python3 $SEO/seostate.py conventions --write -
 ```
 
 The file must contain these sections:
@@ -270,7 +280,7 @@ submission's prefilled copy uses it.
    listings rejected. Follow the writing rules from Part 3.
 4. Save it:
    ```bash
-   python3 scripts/seostate.py profile --json '{
+   python3 $SEO/seostate.py profile --json '{
      "name":"...","url":"https://...","tagline":"...",
      "short_description":"...","long_description":"...",
      "categories":["Developer Tools","AI"],"tags":["seo","automation"]
@@ -282,6 +292,8 @@ submission's prefilled copy uses it.
    playbook (`references/backlink-playbook.md`) is now personalized — work it top
    to bottom.
 
+**Success criteria**: The profile saved without a length rejection, was drafted from files read fresh in this run, and carries no hype words. The saved profile was shown back to the owner as a table.
+
 ---
 
 ## Part 5 - write `.seo/publish-paths` (needed before any auto-merge)
@@ -291,6 +303,8 @@ allowed to touch. The auto-merge workflow refuses to run without it, and refuses
 to merge any PR that changes a file outside it.
 
 ```
+
+**Success criteria**: The file exists and lists only the directories Parts 1-3 actually found, plus `.seo/`. Anything broader defeats the gate it exists to enforce.
 # .seo/publish-paths - what a content PR may touch
 content/blog/
 public/blog/covers/
@@ -309,8 +323,8 @@ reviewed by a human - which is exactly what the gate enforces.
 ## Finish
 
 ```bash
-python3 scripts/seostate.py overview
-python3 scripts/seostate.py log-run --workflow setup --summary "<what was found/scaffolded>"
+python3 $SEO/seostate.py overview
+python3 $SEO/seostate.py log-run --workflow setup --summary "<what was found/scaffolded>"
 ```
 
 Verify before declaring success:
@@ -321,3 +335,5 @@ Verify before declaring success:
 - the authority score is recorded (`dr` is not null).
 
 Then run `research` so the queue fills day one.
+
+**Success criteria**: `overview` reports the right domain and `conventions: true`; both homes verified public; the profile saved cleanly; `dr` is not null. The run is logged and `research` has been run so the queue fills day one.

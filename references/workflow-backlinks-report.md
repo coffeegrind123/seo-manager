@@ -25,11 +25,13 @@ sees an actual link graph.
 What you CAN do, and what actually finds reachable prospects:
 
 ```bash
+
+**Success criteria**: The curated playbook list was worked first, and the report names WHICH path produced the prospects. "No backlink data source configured" is an acceptable outcome; an invented referring-domain count is not.
 # who writes ABOUT this space and links out
-python3 scripts/serp.py "<keyword> \"tools\" OR \"resources\" OR \"roundup\"" --count 20
-python3 scripts/serp.py "best <category> tools" --count 20
-python3 scripts/serp.py "<competitor> alternatives" --count 20
-python3 scripts/serp.py "\"submit\" OR \"add your\" <category> directory" --count 20
+python3 $SEO/serp.py "<keyword> \"tools\" OR \"resources\" OR \"roundup\"" --count 20
+python3 $SEO/serp.py "best <category> tools" --count 20
+python3 $SEO/serp.py "<competitor> alternatives" --count 20
+python3 $SEO/serp.py "\"submit\" OR \"add your\" <category> directory" --count 20
 ```
 
 Listicles, roundups, resource pages and "alternatives" pages are the reachable
@@ -50,10 +52,12 @@ only to sell link insertions (see the playbook's do-not-buy list — a paid
 insertion is the same purchase whether you find it through a marketplace or a
 "prospect").
 
+**Success criteria**: Every surviving prospect is relevant and plausibly reachable, and everything on the playbook's do-not-buy list is excluded.
+
 ## 3. Queue
 
 ```bash
-python3 scripts/seostate.py prospect-add \
+python3 $SEO/seostate.py prospect-add \
   --domain example.com --url "https://example.com/best-x-tools" \
   --link-type unknown \
   --reason "links to <competitor>'s guide; we have the newer/better page on <topic>" \
@@ -64,15 +68,19 @@ The **reason must be concrete**. "High DR, relevant niche" is not a reason — i
 a restatement of the filter. A reason names the specific page, the specific gap,
 and what you are offering.
 
+**Success criteria**: Every prospect carries a CONCRETE reason naming the specific page, the specific gap and what is being offered — not a restatement of the filter — plus an outreach angle.
+
 ## 4. Output
 
 A prospect table with a suggested outreach angle per row, ordered by how likely
 each is to actually answer. Then:
 
 ```bash
-python3 scripts/seostate.py prospects
-python3 scripts/seostate.py log-run --workflow backlinks --summary "<N prospects queued>"
+python3 $SEO/seostate.py prospects
+python3 $SEO/seostate.py log-run --workflow backlinks --summary "<N prospects queued>"
 ```
+
+**Success criteria**: A prospect table ordered by likelihood of a reply, and the run is logged.
 
 ---
 
@@ -84,14 +92,16 @@ included, no fluff.
 ## 1. Pull
 
 ```bash
-python3 scripts/seostate.py rankings --days 30
-python3 scripts/seostate.py overview
-python3 scripts/seostate.py ai-visibility --days 90
-python3 scripts/seostate.py next-actions
+python3 $SEO/seostate.py rankings --days 30
+python3 $SEO/seostate.py overview
+python3 $SEO/seostate.py ai-visibility --days 90
+python3 $SEO/seostate.py next-actions
 ```
 
 Plus 28 days of Search Console via the `search-console` skill (clicks,
 impressions, CTR, position — by query and by page).
+
+**Success criteria**: Rankings, overview, AI visibility, next-actions and 28 days of Search Console are all in hand before anything is written.
 
 ## 2. Summarize
 
@@ -109,6 +119,8 @@ impressions, CTR, position — by query and by page).
   refresh it with a current-docs pass", "approve the pending tool idea", "the
   guide queue holds 2 of 7 — run research".
 
+**Success criteria**: Every bullet is covered with real numbers, and the depth caveat is honoured — a page-1-only provider's "not found" is never reported as a drop out of the top 100. Striking-distance and CTR-underperformer pages are named individually.
+
 ## 3. Close the loop
 
 Anything the report reveals about *targeting* belongs in the next research run's
@@ -117,5 +129,7 @@ commercial head terms stall, say so plainly — that is the steer the next run
 needs, and stating it here is how it survives the week.
 
 ```bash
-python3 scripts/seostate.py log-run --workflow report --summary "<one line>"
+python3 $SEO/seostate.py log-run --workflow report --summary "<one line>"
 ```
+
+**Success criteria**: Anything the report reveals about TARGETING is stated explicitly as a steer for the next research run's step 0, not left implicit in the numbers. The run is logged.

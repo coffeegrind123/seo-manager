@@ -27,10 +27,10 @@ program needs *work items*, and nothing connected the two.
 including a competitor's, which the audit skills are not aimed at:
 
 ```bash
-python3 scripts/pagecheck.py schema  https://rival.example/page   # Google's own extractor
-python3 scripts/pagecheck.py html    https://oursite.example/page # W3C validity
-python3 scripts/pagecheck.py history https://rival.example/page --since 2026-05-01
-python3 scripts/pagecheck.py vitals  https://oursite.example/page # lab + real-user CWV
+python3 $SEO/pagecheck.py schema  https://rival.example/page   # Google's own extractor
+python3 $SEO/pagecheck.py html    https://oursite.example/page # W3C validity
+python3 $SEO/pagecheck.py history https://rival.example/page --since 2026-05-01
+python3 $SEO/pagecheck.py vitals  https://oursite.example/page # lab + real-user CWV
 ```
 
 `history` is the one with no equivalent elsewhere in this skill: when a page
@@ -58,6 +58,8 @@ The single-dimension audits: `sitemap-audit`, `robots-txt-audit`,
 `seostate.py overview`, the last crawl-log scan, and the last decay run will
 point at two or three. A nineteen-part report is a way of not deciding anything.
 
+**Success criteria**: Two or three audits are selected from evidence already in hand (`seostate.py overview`, the last crawl-log scan, the last decay run) — not all nineteen by reflex. An empty `field_crux` is recorded as unmeasurable, never as a performance finding.
+
 ---
 
 ## 2. Always run these three on a content site
@@ -72,6 +74,8 @@ They are the ones whose failure silently invalidates other work:
 
 Then the one everyone skips and shouldn't: **`internal-link-audit`**, because
 orphan pages are the cheapest fix in SEO and nothing else surfaces them.
+
+**Success criteria**: `canonical-tag-audit`, `sitemap-audit` and `redirect-audit` have all run, plus `internal-link-audit`, and each returned a read result rather than an error.
 
 ---
 
@@ -91,6 +95,8 @@ outcome. Sort every finding into:
 same finding 2,000 times; it is *one* fix in the generator. Queueing 2,000 items
 is how a queue becomes unusable.
 
+**Success criteria**: Every finding is assigned exactly one tier. Structural findings are collapsed to one item per TEMPLATE, so a generated silo produces one row rather than thousands.
+
 ---
 
 ## 4. Queue it
@@ -103,6 +109,8 @@ fix is <the change>"
 ```
 
 Blocking findings do **not** go in the queue. Fix them, then log the run.
+
+**Success criteria**: Structural and cosmetic findings are in the queue with a rationale naming the finding, the page count and the template. Blocking findings are FIXED, not queued.
 
 ---
 
@@ -119,6 +127,8 @@ Worth knowing so the report is honest about its own edges:
   text. Indexation decides → `workflow-programmatic.md`.
 - **Whether a fix worked.** That is `decay` and `drift`, weeks later.
 
+**Success criteria**: The report states which questions the audits could not answer and which workflow or skill owns each.
+
 ---
 
 ## 6. Report
@@ -131,3 +141,5 @@ Name which audits ran, the blocking count (and that they were fixed), the number
 of queue items created, and **what you deliberately did not act on**. A finding
 you consciously declined is a decision worth recording; an unexplained gap
 between the audit and the queue is not.
+
+**Success criteria**: The report names which audits ran, the blocking count and that they were fixed, the queue items created, and what was deliberately not acted on. The run is logged.

@@ -17,7 +17,7 @@ from the repo at research time, so the research evolves with the product.
 ### 0. Read what already happened — the learning step, never skip it
 
 ```bash
-python3 scripts/seostate.py overview
+python3 $SEO/seostate.py overview
 ```
 
 Look at the `guides` and `tools` arrays: every page this pipeline already
@@ -61,6 +61,8 @@ you as `pages_settled` / `outcome_sample_ready`).
 On a site with no settled pages at all, say "no outcome data yet — first runs"
 and move on.
 
+**Success criteria**: The three questions are answered IN WRITING from settled pages, and where observed positions disagree with reported KD the positions win. A site with no settled pages says "no outcome data yet" and moves on.
+
 ---
 
 ### 0.5 Clear the held backlog
@@ -68,7 +70,7 @@ and move on.
 **An Auto project ends this step with ZERO undecided research ideas.**
 
 ```bash
-python3 scripts/seostate.py suggestions --status pending --source research
+python3 $SEO/seostate.py suggestions --status pending --source research
 ```
 
 On a project with `mode: auto`, every one of these is a decision somebody
@@ -99,6 +101,8 @@ On a **Semi** project this step does the opposite: leave pending ideas pending,
 because there the owner's judgment is the feature. Just report what awaits them,
 oldest first.
 
+**Success criteria**: On an `auto` project ZERO research ideas remain undecided — every one is approved or rejected from its recorded authority count, and an unrecorded count was paid for with a SERP check rather than deferred. Owner-rejected and `source: manual` rows were not touched. On `semi`, pending rows are left pending and reported oldest first.
+
 ---
 
 ### 1. Read the product surface
@@ -107,6 +111,8 @@ Skim, do not deep-read: the product-surface files listed in
 `.seo/conventions.md`, plus the existing content inventory — published slugs in
 the guides directory and the tools registry, cross-checked against
 `seostate.py pages` (never propose duplicates).
+
+**Success criteria**: The product-surface files and the existing content inventory have been read this run, cross-checked against `seostate.py pages`, so no duplicate can be proposed.
 
 ---
 
@@ -128,7 +134,7 @@ first). Measure them:
 #### Build MID-TAIL seeds first — free, and this is what makes the measurement worth anything
 
 ```bash
-python3 scripts/keywords.py expand \
+python3 $SEO/keywords.py expand \
   --seed "<facet 1>" --seed "<facet 2>" --seed "<facet 3>" \
   --groups commercial comparison audience --limit 120
 ```
@@ -150,7 +156,7 @@ Pick, per facet, the most product-shaped **MULTI-WORD** phrase it returns —
 **With DataForSEO configured** — one call for the whole measurement:
 
 ```bash
-python3 scripts/keywords.py volume \
+python3 $SEO/keywords.py volume \
   --seed "<midtail facet 1>" --seed "<midtail facet 2>" --seed "<midtail facet 3>"
 ```
 
@@ -202,6 +208,8 @@ published pages ARE that record. They cannot drift from reality.
 Facets decide where to HUNT; the product-is-the-answer test and the authority
 gate decide what may be QUEUED. The failure mode to watch is widening to a
 facet's PARENT topic: "agents that do SEO" is a facet, bare "agents" is not.
+
+**Success criteria**: Every facet was priced from a MULTI-WORD mid-tail phrase, never its head term, and scored on candidates-in-band plus median volume. ONE facet is chosen, and the facet table is PRINTED in the report so the owner can disagree. Free mode says explicitly that the scoring was unpriced.
 
 ---
 
@@ -259,12 +267,14 @@ Guide candidates crowd out tool candidates when both come from one list, and the
 tool queue then sits empty for months. So run a separate, explicit sweep:
 
 ```bash
-python3 scripts/keywords.py expand --seed "<facet>" --tools --limit 60
+python3 $SEO/keywords.py expand --seed "<facet>" --tools --limit 60
 ```
 
 Plus the jobs the product's own users do by hand today (config files,
 boilerplate, sizing decisions, audits). **Aim for 5–10 tool candidates in every
 run**; they carry into the same validation and SERP steps as guides.
+
+**Success criteria**: 40-60 candidates exist across both content types, each tagged with an intent class, with the remit test applied to the whole list BEFORE any validation and the struck count reported. A separate tool sweep produced 5-10 tool candidates.
 
 ---
 
@@ -274,6 +284,8 @@ Volume + KD for the candidates where available (batch where possible — see 1.5
 Apply the quality bar. In free mode the volume floor and KD ceiling are
 inapplicable data gates; the SERP-weakness test and the best-answer test carry
 the decision instead, and **you never invent numbers to fill the gap.**
+
+**Success criteria**: Every candidate is judged against the quality bar. In free mode the volume floor and KD ceiling are recorded as inapplicable data gates — never as gates the candidate failed — and no number was invented to fill the gap.
 
 ---
 
@@ -287,7 +299,7 @@ real Google, and compact verdicts instead of 25 SERPs of prose in your context
 (measured: 25 checks in 37s, 1.4KB out):
 
 ```bash
-python3 scripts/serpd.py --start          # once; idempotent
+python3 $SEO/serpd.py --start          # once; idempotent
 curl -s -X POST localhost:8791/batch -H 'Content-Type: application/json' \
   -d '{"queries":["kw one","kw two","..."],"depth":20,"target":"<your domain>"}'
 ```
@@ -300,7 +312,7 @@ authority count.
 **One-off check:**
 
 ```bash
-python3 scripts/serp.py "<keyword>" --count 10 --target-domain <your domain>
+python3 $SEO/serp.py "<keyword>" --count 10 --target-domain <your domain>
 ```
 
 Read the titles and decide the real authority count. Note the weak spots
@@ -310,21 +322,23 @@ Highest fidelity, when the free provider disagrees with itself or the call is
 close: `--provider browser` and drive the browser MCP — that is real Google,
 including the AI Overview flag and related searches.
 
+**Success criteria**: EVERY survivor has a real authority count from a successful read. There is no cap and no budget: a refused read is retried, and a survivor left unchecked means the run is unfinished. Weak spots are captured for `--serp-notes`.
+
 ---
 
 ### 5. Persist
 
 ```bash
-python3 scripts/seostate.py track --json '[{"keyword":"...","volume":480,"kd":8,"intent":"commercial"}]'
+python3 $SEO/seostate.py track --json '[{"keyword":"...","volume":480,"kd":8,"intent":"commercial"}]'
 
-python3 scripts/seostate.py propose \
+python3 $SEO/seostate.py propose \
   --type guide --title "..." --keyword "..." \
   --volume 480 --kd 8 --authority-count 1 --intent commercial \
   --rationale "remit: we are the answer - <how>. ICP: <the problem at query time>. KD 8 under the DR-0 line; measured authority count 1/10." \
   --serp-notes "authority count 1/10 - two reddit threads, one outdated listicle" \
   --spec '{"angle":"...","outline":["..."],"internal_links":["..."]}'
 
-python3 scripts/seostate.py update <id> --status approved
+python3 $SEO/seostate.py update <id> --status approved
 ```
 
 Follow the queue policies (guides build-first, tools approve-first behind the
@@ -346,6 +360,8 @@ conventions files say tools are "not wired yet" — that describes the repo on t
 day setup ran, not a policy. The build-tool workflow scaffolds the tools home
 inside its first PR. Queue the ideas; note in the report that the first build
 will create the tools section.
+
+**Success criteria**: Every queued idea carries volume/KD where measured, the authority count, its intent class, and a rationale OPENING with the remit verdict. Tool ideas carry a conversion rationale and an `archetype`. A site with no tools page yet still gets tool ideas queued.
 
 ---
 
@@ -422,14 +438,14 @@ authority gate because nobody bothered to target them:
 1. **Queries you already appear for.** The single best free seam. Pull the
    `search-console` skill's search-analytics report, then:
    ```bash
-   python3 scripts/keywords.py gsc gsc-queries.json --band striking-distance page3-5
+   python3 $SEO/keywords.py gsc gsc-queries.json --band striking-distance page3-5
    ```
    Proven relevant, already half-ranked, and free — **mine this FIRST every run.**
 2. **Error strings and failure modes.** Verbatim messages, "X not working",
    "why does X", "X keeps <failing>". Almost always thin SERPs dominated by forum
    threads, and dead-on intent.
    ```bash
-   python3 scripts/keywords.py expand --seed "<product>" --groups problem
+   python3 $SEO/keywords.py expand --seed "<product>" --groups problem
    ```
 3. **Version and release deltas.** Anything the product's ecosystem shipped
    recently: new features, renamed flags, changed defaults, deprecations.
@@ -441,14 +457,14 @@ authority gate because nobody bothered to target them:
    a version, a platform ("X for solo devs", "X without Y", "X on Windows"). The
    qualified variant routinely clears the gate the bare term failed.
    ```bash
-   python3 scripts/keywords.py expand --seed "<head term>" --groups audience constraint
+   python3 $SEO/keywords.py expand --seed "<head term>" --groups audience constraint
    ```
 6. **Trend radar.** `seostate.py trends --status new` — fresh topics have the
    thinnest SERPs on the internet.
 7. **Cross-engine agreement.** The same sweep against six independent suggestion
    corpora instead of one:
    ```bash
-   python3 scripts/keywords.py expand --seed "<facet>" --engines all --sort agreement
+   python3 $SEO/keywords.py expand --seed "<facet>" --engines all --sort agreement
    ```
    A phrase surfaced by Google, Bing AND DuckDuckGo is corroborated by three
    different audiences and three different algorithms — which is a far better
@@ -573,5 +589,5 @@ the KD ceiling this week".
 Finally:
 
 ```bash
-python3 scripts/seostate.py log-run --workflow research --summary "<one line>"
+python3 $SEO/seostate.py log-run --workflow research --summary "<one line>"
 ```

@@ -21,7 +21,7 @@ about is the owner's call and the deep validation costs real SERP checks:
 ## 1. Housekeeping
 
 ```bash
-python3 scripts/seostate.py trends --status new
+python3 $SEO/seostate.py trends --status new
 ```
 
 Any topic older than **14 days is dead hype** (the listing flags them as
@@ -30,10 +30,12 @@ Any topic older than **14 days is dead hype** (the listing flags them as
 Same for stale pending trend-scan suggestions:
 
 ```bash
-python3 scripts/seostate.py suggestions --status pending --source trend-scan
+python3 $SEO/seostate.py suggestions --status pending --source trend-scan
 ```
 
 Reject the ones older than 14 days.
+
+**Success criteria**: Every topic and trend-scan suggestion older than 14 days is dismissed, and the dismissals are noted for the report.
 
 ## 2. Know the niche
 
@@ -41,13 +43,15 @@ Read `.seo/conventions.md` for what the site is and who it serves. Then pull the
 dedupe set:
 
 ```bash
-python3 scripts/seostate.py trends            # ALL statuses - never re-propose
-python3 scripts/seostate.py pages             # never propose a covered subject
+python3 $SEO/seostate.py trends            # ALL statuses - never re-propose
+python3 $SEO/seostate.py pages             # never propose a covered subject
 ```
 
 Never re-propose a subject already on the radar, expanded, or dismissed. Never
 propose a subject the site already covers as its own topic — that is an *update*,
 which stage 2 handles.
+
+**Success criteria**: The conventions file has been read and the full dedupe set (all trend statuses + published pages) is in hand, so nothing already on the radar or already covered can be re-proposed.
 
 ## 3. Sweep for hype
 
@@ -56,13 +60,13 @@ which stage 2 handles.
 - What is exploding on **Reddit** (the niche's subreddits) and **Hacker News** —
   judge from titles, scores, and snippets in search results:
   ```bash
-  python3 scripts/serp.py "site:reddit.com <niche topic>" --count 10
-  python3 scripts/serp.py "<niche topic> hacker news" --count 10
+  python3 $SEO/serp.py "site:reddit.com <niche topic>" --count 10
+  python3 $SEO/serp.py "<niche topic> hacker news" --count 10
   ```
 - **Autocomplete rising phrasings** — new terms show up in autocomplete within
   days, far faster than any volume database:
   ```bash
-  python3 scripts/keywords.py expand --seed "<niche term>" --groups comparison problem
+  python3 $SEO/keywords.py expand --seed "<niche term>" --groups comparison problem
   ```
 - **Google Trends** where you can reach it. From a datacenter IP the Trends API
   answers HTTP 429 (measured, not assumed) — if you need it, drive
@@ -88,6 +92,8 @@ hands the eventual guide real material to quote, credit, and beat. Not every
 subject has one — a launch can trend on many small threads — and **a forced seed
 is worse than none**: only record a piece that genuinely anchors the conversation.
 
+**Success criteria**: Official vendor sources, community discussion and autocomplete have each been swept, and every subject has a `why_now` trigger with a date. No candidate was discarded for missing volume alone, and an unreachable Trends API is recorded as an unavailable signal, not a dry niche. A seed is recorded only where one genuinely anchors the conversation.
+
 ## 4. Shortlist 3–5 subjects
 
 **5 is the hard cap — this is a radar, not a firehose.** A subject earns its slot
@@ -102,10 +108,12 @@ when:
 **Prefer subjects over angles**: "codex vs claude code" is a subject; "is codex
 better than claude code for refactoring" is a take — stage 2's job.
 
+**Success criteria**: At most 5 subjects survive, each genuinely being discussed now, each fitting the site's audience, and each a distinct conversation rather than a re-framing. They are SUBJECTS, not angles.
+
 ## 5. Queue each survivor
 
 ```bash
-python3 scripts/seostate.py trend-add \
+python3 $SEO/seostate.py trend-add \
   --title "<what the niche calls it, not SEO phrasing>" \
   --why-now "<the trigger event and its date, first>" \
   --signals "1.4k points on HN, 3 days ago|two front-page subreddit threads|vendor changelog Jul 28" \
@@ -118,8 +126,10 @@ Duplicates are answered, not errored — if the tool says the subject is already
 the radar, move on.
 
 ```bash
-python3 scripts/seostate.py record-scan
+python3 $SEO/seostate.py record-scan
 ```
+
+**Success criteria**: Every survivor is on the radar with its trigger, dated signals and sources. A `duplicate` answer is treated as success and moved past, not retried.
 
 ## 6. Report
 
@@ -127,11 +137,16 @@ Subjects seen, subjects queued (one evidence line each), what was dismissed as
 stale — and **"nothing hype-worthy this run" honestly** when the sweep comes up
 dry. A quiet sweep is a clean exit, never an invented trend.
 
+**Success criteria**: Subjects seen, subjects queued with one evidence line each, and what was dismissed as stale. "Nothing hype-worthy this run" is reported honestly when the sweep is dry — a quiet sweep is a clean exit.
+
 ---
 
 # Stage 2: trend-expand
 
 **Trigger:** the owner picks a subject off the radar. One run per subject.
+
+**Human checkpoint**: the owner chooses the subject, and the owner approves the
+takes. This stage never approves anything itself.
 
 This run's whole job is that ONE subject: find the 3–5 strongest takes on it,
 validate them, and queue the survivors as **PENDING** suggestions for the owner's
@@ -146,7 +161,7 @@ read as scaled-content spam.
 ## 1. Read the topic
 
 ```bash
-python3 scripts/seostate.py trends
+python3 $SEO/seostate.py trends
 ```
 
 Find the row. If it is missing or dismissed, **fail loudly and exit without
@@ -154,12 +169,16 @@ changes** — never expand a subject the owner didn't pick. Its evidence
 (`why_now`, `signals`, `sources`, and when the scan found one `seed_url` /
 `seed_stats`) is your starting context.
 
+**Success criteria**: The topic row was found on the radar. If it is missing or dismissed the run FAILS LOUDLY and exits without changes — never expand a subject the owner did not pick.
+
 ## 2. Know the ground
 
 Read `.seo/conventions.md`; `seostate.py pages` plus `seostate.py suggestions` for
 what is already covered or queued — never re-propose either. **If the site already
 covers the subject's underlying topic, an update to that page beats a new one**:
 propose `--type update` for it.
+
+**Success criteria**: Pages and suggestions have been checked, and where the site already covers the underlying topic the proposal is `--type update` against that page rather than a new one.
 
 ## 3. Draft 3–5 candidate takes
 
@@ -170,6 +189,8 @@ Each a distinct search intent — not five rewordings. The proven shapes:
 - **How-to / setup** ("how to use X", "X with Y tutorial") for launches.
 - **Analysis / answer** to the exact question the threads are asking.
 - **Update** to an existing page when the news lands on covered ground.
+
+**Success criteria**: 3-5 takes exist, each a DISTINCT search intent rather than a rewording, and at least one is a comparison.
 
 ## 4. Validate each candidate
 
@@ -188,12 +209,14 @@ Survivors can be fewer than drafted — **three strong beats five thin.**
   data is unavailable.**
 - **Fit**: the site's audience must be the one searching this.
 
+**Success criteria**: Every take has a demand read and, where a SERP provider exists, a page-1 read. No numbers were invented — a brand-new term is reported as "too new for volume data" with its hype signals. A missing SERP provider is recorded as a configuration note in each spec and never used as a reason to drop takes.
+
 ## 5. Queue the survivors as PENDING
 
 ```bash
-python3 scripts/seostate.py track --keywords "<the take's query>"
+python3 $SEO/seostate.py track --keywords "<the take's query>"
 
-python3 scripts/seostate.py propose \
+python3 $SEO/seostate.py propose \
   --type guide --title "<take>" --keyword "<query>" \
   --source trend-scan --trend-topic-id <topic id> \
   --rationale "WHY NOW: <trigger + date>. <remit verdict>. <ICP>." \
@@ -213,11 +236,15 @@ generic angle wearing a pasted seed link reads as fake attribution.
 
 **Maximum 5 takes per subject. Do NOT approve anything.**
 
+**Success criteria**: At most 5 takes are queued, all PENDING, each linked by `--trend-topic-id` and carrying a rationale with the trigger and date. The seed is passed through only to takes that genuinely draw on it. Nothing was approved.
+
 ## 6. Close the loop
 
 ```bash
-python3 scripts/seostate.py trend-update <topic id> --status expanded
+python3 $SEO/seostate.py trend-update <topic id> --status expanded
 ```
+
+**Success criteria**: The topic is marked `expanded`.
 
 ## 7. Report
 
@@ -225,3 +252,5 @@ Takes drafted, survivors queued (one evidence line each), what was dropped and
 why. If nothing survives validation, **say so honestly, still mark the topic
 expanded**, and report "no viable takes" — a subject can be hype without being
 winnable.
+
+**Success criteria**: Takes drafted, survivors queued with one evidence line each, and what was dropped and why. If nothing survived, the topic is still marked expanded and "no viable takes" is reported — hype without winnability is a real result.

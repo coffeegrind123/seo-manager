@@ -63,6 +63,8 @@ Read:
 tiers separately** — mixing them flatters the generated one and slanders the
 curated one.
 
+**Success criteria**: `tiers` returned a ratio distribution for the silo, with curated and generated tiers measured SEPARATELY. The histogram shape is read, not just the median.
+
 ---
 
 ## 2. Get the index evidence — mandatory, not optional
@@ -85,6 +87,8 @@ range**, always including the worst.
 
 **Only when the index evidence agrees with the measurement do you act.**
 
+**Success criteria**: 5-10 pages spread across the ratio range — always including the worst — have a URL Inspection verdict, plus crawl-log and impression evidence for the tier. No action is taken until this evidence agrees with the measurement.
+
 ---
 
 ## 3. Act — in this order
@@ -104,6 +108,8 @@ Cheapest and most reversible first.
    permanently. `noindex` first, wait for the re-crawl, block later if ever.
 5. **Delete.** Only for pages with no impressions, no links and no reason to
    exist. 410 beats 404.
+
+**Success criteria**: Actions were taken cheapest-first, and nothing was `Disallow`ed that was meant to be de-indexed. If the index evidence disagreed with the ratio, the correct outcome is NO action.
 
 ---
 
@@ -134,6 +140,8 @@ carries the *other* one's canonical. The result is a page whose canonical points
 at a 404, which cannot be indexed at all, while the sitemap advertises both.
 Fold case-duplicate identities at generation time and log every drop.
 
+**Success criteria**: Every gate in the table has a recorded pass/fail, the standalone-value test is answered in writing, and any release over 100 pages is staged rather than shipped whole. A case-collision fold ran over the generated tree.
+
 ---
 
 ## 5. Structural requirements
@@ -151,6 +159,8 @@ Fold case-duplicate identities at generation time and log every drop.
   `hreflang="xx"` claim is a near-duplicate of the English page on another URL —
   worse than not having the locale. Gate complete-or-absent.
 
+**Success criteria**: Self-canonical on every page, a valid split sitemap with data-time `lastmod` and no `noindex` URLs, sibling links resolved per record, and no locale shipped that falls back to English.
+
 ---
 
 ## 6. Report
@@ -164,3 +174,5 @@ that measures a scary ratio and then finds the pages indexed and re-crawled is a
 **complete, successful run with no action** — that is the most valuable outcome
 this workflow produces, because it is the one that stops expensive unnecessary
 work.
+
+**Success criteria**: The report states the measurement, the index evidence, and WHETHER THEY AGREED. A scary ratio plus indexed, re-crawled pages is reported as a complete successful run with no action. The run is logged.

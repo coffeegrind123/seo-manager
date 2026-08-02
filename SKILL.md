@@ -1,57 +1,24 @@
 ---
 name: seo-manager
 description: >-
-  Run a complete, opinionated SEO program for a git-based website from the terminal —
-  keyword research that starts from what the product IS, a queue the owner approves,
-  content that ships as pull requests, rank tracking, trend radar, AI-visibility (GEO)
-  measurement, and backlink prospecting. Every gate is written down: a dynamic KD
-  ceiling and volume band that scale with the site's authority, a page-1 authority gate
-  that overrules any difficulty score, a product-is-the-answer remit test, an
-  information-gain requirement, and a deterministic corpus sameness gate that catches
-  the template convergence no commercial tool checks for. It also MEASURES what already
-  exists: server access logs for real crawl budget, status codes served to bots, verified
-  Googlebot, and AI-crawler ingestion (training vs search vs live user fetch); Search
-  Console decay that separates a page losing rank from a query losing demand; whole-page-1
-  drift with algorithm-update correlation; index-bloat scoring across generated silos; and
-  real traffic-sending backlinks from referrers. It also GUARDS the site's own markup: a
-  post-deploy contract check that catches a shipped noindex, a dropped schema block, a
-  rewritten canonical or a page that started 404ing; a full hreflang mesh audit (return
-  tags, x-default, code validity, and whether every advertised alternate actually exists)
-  plus a content-parity check that catches a locale still serving English; an
-  agent-readiness audit that resolves robots.txt per AI crawler across the
-  search/user/training split and measures what an agent actually receives; and a
-  deterministic detector for AI writing tells. Runs on 18 free keyless sources by
-  default — six independent suggestion corpora (Google, Bing, DuckDuckGo, YouTube, Yandex,
-  Amazon) that together give a cross-engine agreement signal and observed video/product
-  intent, DuckDuckGo SERPs, real Google via the browser, Tranco authority with rank
-  history, GDELT news-volume timelines, Google News, Wikidata and Wikipedia for entity
-  coverage, OpenAlex and Crossref for citable facts, W3C and Google's own structured-data
-  validators, Wayback change history, Search Console, access logs, Common Crawl, RDAP and
-  sitemaps — and upgrades to SerpApi / Serper / Bing Webmaster / Open PageRank / PageSpeed
-  / DataForSEO when keys exist. Every source is declared once in a registry that
-  live-probes itself, so "what works right now" is measured rather than assumed. State
-  lives in a committed .seo/ directory — no backend, no database, no MCP server.
-when_to_use: >-
-  Use when the user wants to do SEO on a site they control as an ongoing program rather
-  than a one-off check: research keywords, decide what to write next, build a guide or a
-  free tool into a PR, track rankings, fill or review the content queue, scan for
-  trending topics, measure whether AI assistants cite the site, or find backlink
-  targets. Also for measuring what is already published: crawl budget and Googlebot
-  behaviour from server logs, which AI crawlers read the site, content decay, SERP
-  drift, thin/duplicate generated pages, and which backlinks actually send traffic.
-  Examples "research keywords for me", "what should I write next?", "build the
-  next guide", "how are we ranking?", "fill the content queue", "is anything trending in
-  our niche?", "do AI assistants cite us?", "find backlink prospects", "set up the SEO
-  pipeline", "run the daily build", "what is Googlebot crawling?", "is GPTBot reading
-  us?", "check the crawl budget", "which pages are losing traffic?", "did we get hit by
-  an update?", "are our generated pages too thin?", "who links to us?", "did the deploy
-  break anything?", "check the SEO contract", "is our hreflang right?", "are the
-  translations real or still English?", "can ChatGPT read us?", "are we blocking AI
-  crawlers?", "does this draft sound AI-written?". Do NOT use for a
-  one-page technical audit — that is seo-audit / seo-audit-full (the `health` workflow
-  bridges to them). Do NOT use for raw Search Console queries — that is the
-  search-console skill (this skill calls it). Do NOT use for buying ads — that is the
-  Google Ads API.
+  Run an opinionated SEO program for a git-based site you control, as an ongoing
+  program rather than a one-off check: keyword research grounded in what the product
+  IS, an owner-approved queue, content shipped as pull requests, rank tracking, trend
+  radar, AI-visibility (GEO) measurement, backlink prospecting. It also MEASURES what
+  is already published — access-log crawl budget, Googlebot and AI-crawler ingestion,
+  Search Console decay, page-1 drift, index bloat — and GUARDS your markup:
+  post-deploy contract check, hreflang mesh and content parity, agent-readiness,
+  AI-writing tells. Use when the user says: research keywords, what should I write
+  next, build the next guide, how are we ranking, fill the content queue, do AI
+  assistants cite us, find backlink prospects, what is Googlebot crawling, which pages
+  are losing traffic, did we get hit by an update, did the deploy break anything, is
+  our hreflang right. NOT for a one-page audit (use seo-audit), raw Search Console
+  queries (use search-console), or buying ads.
+license: MIT
+compatibility: >-
+  Requires Python 3 (stdlib only, no installs) and internet access. Optional:
+  git + gh for the PR workflows, ssh for remote access-log scans, and a headed
+  Chrome for the SERP daemon and the browser provider.
 allowed-tools: Bash Read Write Edit Glob Grep WebFetch Skill
 ---
 
@@ -76,16 +43,19 @@ python3 $SEO/seodoctor.py                    # SELF-HEAL FIRST - idempotent, ~2s
 python3 $SEO/seostate.py overview
 ```
 
-**`seodoctor.py` is not optional and not a diagnostic you run when something looks
-wrong — it runs FIRST, every time.** It is idempotent: on a healthy setup it is a
-no-op that returns in about two seconds. On a broken one it repairs what it can
-before you have spent a single call on real work — which is the whole point,
-because every failure it covers presents as something else entirely (a "throttled
-provider", an "empty page 1", a daemon that "won't start"). It reaps a wedged
-daemon, clears an orphan Chrome holding the profile, restarts, and reports which
-providers are actually usable. `--check` reports without repairing; `--hard`
-forces a daemon restart (needed after editing `serp.py`, whose scoring `serpd`
-imports at startup).
+⚠ **Re-declare `SEO=` in every Bash call.** Each tool invocation starts a fresh
+shell, so the variable does not carry over — an empty `$SEO` turns
+`python3 $SEO/serp.py` into `python3 /serp.py`. Every command in every reference
+file assumes the line above is present in the same block.
+
+**`seodoctor.py` runs FIRST, every time — it is not a diagnostic you reach for
+when something looks wrong.** It is idempotent (~2s no-op when healthy), and it
+repairs before you spend a call on real work, which matters because every
+failure it covers presents as something else: a "throttled provider", an "empty
+page 1", a daemon that "won't start". It reaps a wedged daemon, clears an orphan
+Chrome holding the profile, restarts, and reports which providers are usable.
+`--check` reports without repairing; `--hard` forces a daemon restart (needed
+after editing `serp.py`, whose scoring `serpd` imports at startup).
 
 **A red preflight is never permission to end a run short.** If `serpd` cannot be
 revived, `ddg` and the `--provider browser` handoff still work and the run
@@ -141,32 +111,30 @@ with twenty pages that read like one template.
 | **contract** (did the deploy break it) | **after every deploy** | `references/workflow-contract.md` |
 | **international** (the hreflang mesh) | quarterly + on locale change | `references/workflow-international.md` |
 
-The five above `contract` were added 2026-08-01 and share one property: they all
-**measure what already exists** rather than proposing something new. On a site
-with any history, that is where the return is — and `crawl-log` in particular is
-the only **first-party** measurement in the skill, reading the server's own
-record instead of asking a third party what it thinks.
+The five above `contract` all **measure what already exists** rather than
+proposing something new — on a site with any history that is where the return
+is, and `crawl-log` is the only **first-party** measurement here, reading the
+server's own record instead of asking a third party what it thinks.
 
-The last two are **guards on the site's own markup**, not investigations of the
-outside world:
+The last two are **guards on your own markup**:
 
-- **contract** is the fastest-paying workflow here. Every regression it catches
-  — a shipped `noindex`, a dropped schema block, a rewritten canonical — is
-  invisible for weeks, because rankings decay slowly and nobody connects the
-  graph to a deploy twenty commits back. Run it after every deploy, before
-  anything slower: if the contract broke, no downstream measurement is measuring
-  what you think it is.
-- **international** only applies to a multi-locale site, where hreflang fails
+- **contract** is the fastest-paying workflow here. A shipped `noindex`, a
+  dropped schema block, a rewritten canonical — each is invisible for weeks,
+  because rankings decay slowly and nobody connects the graph to a deploy twenty
+  commits back. Run it after every deploy, before anything slower: if the
+  contract broke, nothing downstream is measuring what you think it is.
+- **international** applies only to a multi-locale site, where hreflang fails
   **silently and bidirectionally** — a missing return tag invalidates the
   annotation for *both* pages, and Search Console has reported nothing about it
   since the International Targeting report was removed in 2022.
 
 ⚠ **`contract` and `drift` are different things.** `drift.py` watches **their**
-page 1; `contract.py` watches **your** markup. They share a word and nothing
-else.
+page 1; `contract.py` watches **your** markup.
 
 Supporting references:
 
+- `references/scripts.md` — the full script table, the command cookbook, and the
+  per-script traps. **Read it before running any script beyond the preflight.**
 - `references/data-sources.md` — every provider, what it costs, and **what was
   measured to actually work** from a container. Read it when a data call fails or
   before adding a provider.
@@ -191,118 +159,33 @@ Supporting references:
 
 ## The scripts
 
-All stdlib Python 3, no installs. Every one prints JSON.
+25 scripts, all stdlib Python 3, no installs. Every one prints JSON; `--help`
+lists the subcommands.
+
+```bash
+SEO=~/.claude/skills/seo-manager/scripts    # adjust if vendored into the repo
+```
+
+⚠ **`$SEO` does not survive between tool calls** — each Bash invocation starts a
+fresh shell, so re-declare that line at the top of any block you run separately.
+Every command in every reference file assumes it.
+
+The five you touch in almost every run:
 
 | Script | Job |
 |---|---|
-| `seostate.py` | **all state**: queue, keywords, ranks, pages, trends, prospects, profile, conventions, pacing, overview, next-actions, run log |
+| `seodoctor.py` | self-healing preflight — run it first, every run |
+| `seostate.py` | all state: queue, keywords, ranks, pages, trends, profile, pacing, overview, next-actions, run log |
 | `serp.py` | live SERPs through the provider ladder, plus the weakness/authority scoring the gate needs |
-| `keywords.py` | expansion across **six independent suggestion corpora** (Google, Bing, DuckDuckGo, YouTube, Yandex, Amazon) with a cross-engine agreement signal and observed video/product intent, plus tool-intent sweeps, DataForSEO volume/KD, and Search Console → candidates |
+| `keywords.py` | expansion across six independent suggestion corpora, with a cross-engine agreement signal |
 | `sameness.py` | the corpus sameness gate + a pairwise drift audit |
-| `authority.py` | DR-equivalent, and the KD zones / volume band that follow from it. Also `--bulk` competitor scoring, free referring-domain counts, a 12-month authority trend, and two independent popularity reads (Cloudflare Radar + **Tranco**, which is keyless and carries 40 days of rank history) |
-| `bing.py` | **the only free source of real search volume AND backlinks** — Bing Webmaster Tools for a site you own. Impressions per query, related-keyword expansion with numbers, inbound links, query stats |
-| `trendfeeds.py` | **keyless demand signals**: Google Trends' RSS feed (works where the 429-ing JSON API does not), Wikimedia pageviews as absolute topic demand, HN + StackExchange chatter, **GDELT's per-topic news-volume timeline**, and Google News (who is covering the topic now) |
-| `rankcheck.py` | batch rank checks for every tracked keyword |
-| `serpd.py` | **the fast path for SERP-heavy runs**: a long-lived headed Chrome behind `localhost:8791`. One curl per check, real Google, no DOM in your context. 25 checks in ~37s and 1.4KB of verdicts. |
-| `indexnow.py` | get published pages crawled: IndexNow ping (free, keyless, Bing/Yandex) + the batched Google "Request indexing" follow-up |
-| `test_guards.py` | regression tests for the SERP guards, against real captured responses |
-| `test_providers.py` | regression tests for the free-provider integrations — chiefly that Open PageRank's `found: false` can never become a DR of 0 |
-| `seodoctor.py` | **self-healing preflight** - idempotent check+repair of the daemon, its Chrome, deps and project state. Run it first, every run. `--providers` adds a live sweep of every data source |
-| `providers.py` | **the provider registry**: every data source declared once, each with a live probe and its own control. `providers.py status` answers "what can I use right now?" by measuring, not by reading a table |
-| `factcheck.py` | **information gain, sourced**: OpenAlex + Crossref papers with citation counts and DOIs, Wikidata entities, the Wikipedia neighbourhood of a topic, and a draft-vs-neighbourhood coverage gap |
-| `pagecheck.py` | keyless technical checks for ANY url: W3C HTML validity, Google's own structured-data extractor, Wayback change history (yours or a competitor's), and Core Web Vitals |
-| `crawllog.py` | **the access log**: crawl budget by silo, status codes served to bots, AI-crawler ingestion, and reverse+forward DNS bot verification. `--remote` runs the aggregation on the server so the log never crosses the wire. |
-| `decay.py` | two Search Console periods -> pages that LOST RANK, separated from pages whose demand fell. Plus self-cannibalisation. |
-| `drift.py` | whole-page-1 snapshots and their diff: new entrants, AI-Overview changes, site-wide volatility, algorithm-update correlation |
-| `backlinks.py` | **measurement**, not prospecting: real traffic-sending backlinks from your own referrer log, and Common Crawl corpus presence |
-| `contract.py` | **the deploy guard**: baseline a URL set's on-page SEO contract, then diff it. Reads `X-Robots-Tag` from the header as well as the meta tag, never follows redirects, and keys findings `(path, rule)` with an open/auto-resolve lifecycle. Refuses a verdict during a site-wide outage. |
-| `hreflang.py` | **the international mesh**: self-reference, RETURN TAGS, x-default, ISO 639-1/15924/3166-1 validity, canonical alignment, and the HTTP status of every URL advertised as an alternate. Plus `parity` — is the content behind the mesh actually translated. |
-| `agentcheck.py` | **can an AI agent read, understand and act on this site, and is it allowed to**: robots.txt resolved per AI crawler in the ai_search/ai_user/ai_training taxonomy, agent-UX semantics, token budget, JS-dependence, WebMCP, and `llms.txt` well-formedness |
-| `slop.py` | **AI writing tells, detected mechanically** — 20 patterns with per-rule tolerances, located hits and line numbers. Code fences, inline code and link targets excluded. No score, on purpose. |
-| `test_hreflang.py` / `test_contract.py` / `test_agentcheck.py` / `test_slop.py` | the controls for the four above: every rule is fired against synthetic input, so a clean pass on a real site means something |
 
-Also `assets/google-updates.json` — Google's published algorithm-update calendar,
-every entry carrying a Google-owned source URL. Consumed by `decay.py --updates`
-and `drift.py --updates`. **No API exists — it needs manual top-up**, and its
-silence about a window is not evidence that nothing happened.
-
-`--help` on any of them lists the subcommands. Common ones:
-
-```bash
-python3 $SEO/seostate.py suggestions --status approved --type guide   # the build queue, in order
-python3 $SEO/seostate.py pacing                                       # can a guide ship today?
-python3 $SEO/serp.py "keyword" --count 10 --target-domain example.com
-python3 $SEO/keywords.py expand --seed "<facet>" --groups commercial comparison
-python3 $SEO/keywords.py expand --seed "<facet>" --engines all --sort agreement  # 6 corpora
-python3 $SEO/sameness.py check --draft new.md --corpus content/blog --keyword "kw" --pages .seo/pages.json
-python3 $SEO/authority.py --domain example.com --save
-python3 $SEO/authority.py --domain example.com --bulk rival1.com,rival2.com   # who actually outranks you
-python3 $SEO/rankcheck.py --all --depth 20
-
-# keyless demand signals (no key, no browser - see data-sources.md)
-python3 $SEO/trendfeeds.py trending --geo US            # Trends RSS: the API 429s, this does not
-python3 $SEO/trendfeeds.py wiki --topic "<topic>"       # resolve the article title FIRST
-python3 $SEO/trendfeeds.py pageviews --article "<Title>" --days 90
-python3 $SEO/trendfeeds.py discussions --query "<problem>" --site webmasters
-
-# per-topic trend + who is covering it (keyless)
-python3 $SEO/trendfeeds.py newsvolume --query "<phrase>" --months 3   # COVERAGE, not demand
-python3 $SEO/trendfeeds.py news --query "<phrase>"                    # + the publishers
-
-# information gain, with real sources behind it (keyless)
-python3 $SEO/factcheck.py sources --query "<topic>" --since-year 2020  # papers, citations, DOIs
-python3 $SEO/factcheck.py related --topic "<Article Title>"            # the topic neighbourhood
-python3 $SEO/factcheck.py coverage --draft new.md --topic "<Article Title>"
-
-# any-URL technical checks, incl. a COMPETITOR's change history (keyless)
-python3 $SEO/pagecheck.py schema https://rival.example/page
-python3 $SEO/pagecheck.py history https://rival.example/page --since 2026-05-01
-python3 $SEO/pagecheck.py vitals https://oursite.example/page         # lab + real-user CWV
-
-# what data sources actually work right now (measured, not assumed)
-python3 $SEO/providers.py status
-
-# real numbers (Bing Webmaster - needs a verified property)
-python3 $SEO/bing.py sites                          # auth control; run first if anything looks odd
-python3 $SEO/bing.py keyword --q "<kw>" --days 90   # impressions, NOT Google volume
-python3 $SEO/bing.py expand  --seed "<kw>" --limit 25
-python3 $SEO/bing.py backlinks
-
-# SERP-heavy run (research): start the daemon once, then one call for the lot
-# NEVER append `&` - --start already detaches, and the `&` only kills the poller
-# that tells you whether it came up. Run it in the foreground and read the JSON.
-python3 $SEO/serpd.py --start
-curl -s -X POST localhost:8791/batch -H 'Content-Type: application/json' \
-  -d '{"queries":["kw one","kw two"],"depth":20}'      # compact verdicts
-
-# measurement of what already exists
-python3 $SEO/crawllog.py scan --remote root@<host> --ssh-key ~/.ssh/<k> \
-  --glob '/var/log/caddy/access*.log*'                 # QUOTE the glob
-python3 $SEO/crawllog.py verify --scan scan.json --bot googlebot
-python3 $SEO/decay.py compare --previous prev.json --current cur.json --pages .seo/pages.json
-python3 $SEO/drift.py snapshot --keywords-from .seo/keywords.json --out .seo/drift/$(date -u +%F).json
-python3 $SEO/backlinks.py referrers --remote root@<host> --site example.com
-python3 $SEO/backlinks.py footprint --domain example.com
-python3 $SEO/sameness.py tiers --corpus public/seo/maps        # O(n) index-bloat
-python3 $SEO/keywords.py cluster --file kws.txt                # one page or five?
-
-# guards on your OWN markup (run contract after every deploy - see the note above)
-python3 $SEO/contract.py baseline --name prod --sitemap https://example.com/sitemap.xml
-python3 $SEO/contract.py check --name prod        # opened / still_open / resolved
-python3 $SEO/hreflang.py control                  # ALWAYS first - refuses a verdict if it fails
-python3 $SEO/hreflang.py audit --url https://example.com/page   # expands to every alternate
-python3 $SEO/hreflang.py parity https://example.com/page        # read `systematic` FIRST
-python3 $SEO/hreflang.py codes en-uk eng jp be    # no network at all
-
-# AI agents: permitted? readable? (pairs with crawllog.py, which measures who CAME)
-python3 $SEO/agentcheck.py policy https://example.com    # per-crawler, by class
-python3 $SEO/agentcheck.py page https://example.com/page # agent-UX + token budget + JS-dependence
-python3 $SEO/agentcheck.py all https://example.com
-
-# does the draft read as machine-written (advisory, unlike the sameness gate)
-python3 $SEO/slop.py scan draft.md
-python3 $SEO/slop.py diff before.md after.md      # read `introduced`, not just `removed`
-```
+**Read `references/scripts.md` before running anything else** — it carries the
+full table (research, measurement, guards, tests), the command cookbook, and the
+per-script traps that are not guessable: `serpd.py --start` must never take a
+trailing `&`, `crawllog.py --glob` must be quoted, `hreflang.py control` runs
+before any audit, and `bing.py sites` is the auth control to run first when
+anything looks odd.
 
 ---
 
@@ -364,6 +247,30 @@ well as in the quality bar:
   key and so reported every page as having no structured data, and a crt.sh
   probe aimed at a domain with no certificates. Both would have shipped as
   confident findings about the web rather than bugs in the reader.
+- **Every position claim names its ENGINE and its EXIT COUNTRY.** "We rank #2" is
+  not a finding; "#2 on DuckDuckGo from a US exit" is. A read through a residential
+  proxy on an unpinned session came from *one* exit country nobody chose, and
+  reporting it bare silently promotes a local observation into a global fact.
+  Measured 2026-08-02: a position reported unqualified later held at #2 across five
+  pinned exits — the claim survived, but only because it was re-measured. Pin it
+  (`serp.py --proxy-country`), name it, name the engine. Where a country cannot be
+  pinned, that is **unmeasured**, never confirmed.
+- **A verified-country list is a measurement with a date on it.** `serp.py`'s had
+  gone stale and refused `us` with a confident reason that had stopped being true.
+  Re-measure with `serp.py --verify-countries` before reading an absence as
+  evidence. The dangerous case is not a country that fails but one that silently
+  returns **a different country's SERP** (measured: `fr` → a GB exit).
+- **Verify a product claim in the SOURCE before building a page on it.** The remit
+  test reads positioning copy, which is exactly where an aspirational claim hides.
+  A queued idea asserted the product could do something the code showed it could
+  not; the page would have shipped a false capability claim under the owner's name.
+  See `workflow-build-guide.md` §3.5.
+- **When the information-gain asset is your OWN data, the arithmetic is the risk.**
+  Aggregating a per-poll table without deduplicating overstated a headline figure
+  by **11.7×**, and unioning a capped snapshot measured the cap rather than the
+  world. Ask what one row IS before summing it, and sanity-check the magnitude
+  against an independent number. Details and the two shapes:
+  `workflow-build-guide.md` §5.
 - **A refused SERP read is a failed read, never an empty page 1.** `serp.py`
   rejects two shapes that both look like success: an HTTP 200 with nothing
   parseable, and — measured on real Bing responses — a full page of well-formed
@@ -431,6 +338,38 @@ scripts:
 
 ---
 
+## Why `allowed-tools` grants bare `Bash`
+
+Deliberate. A narrow pattern cannot cover this skill: the build workflows run
+**the site's own build command** — whatever the conventions file says — and
+`crawl-log`/`backlinks` shell out over `ssh` to a host named at runtime. The
+allowlist would need rewriting per project, and a miss presents as a permission
+prompt mid-run. The real constraints are the Non-negotiables above, not the tool
+grant.
+
+---
+
+## Frontmatter is spec-exact — do not add `when_to_use`
+
+The agentskills spec allows exactly six keys: `name`, `description`, `license`,
+`compatibility`, `metadata`, `allowed-tools`. **`when_to_use` is not one of
+them**, and Anthropic's own `skill-creator/scripts/quick_validate.py` rejects it
+outright ("Unexpected key(s) in SKILL.md frontmatter") rather than ignoring it.
+This skill carried one until 2026-08-02; its trigger phrases and its do-NOT-use
+boundaries now live in `description`, which is the field every client reads.
+
+So `description` is doing two jobs and sits near its 1024-char ceiling. When
+editing it, keep the trigger list and the three `NOT for…` boundaries — those
+are what stop this skill firing on work that belongs to `seo-audit`,
+`search-console`, or an ads task. Re-check with:
+
+```bash
+python3 ~/.claude/skills/skill-refiner/skills/anthropic-skills/skills/skill-creator/scripts/quick_validate.py \
+  ~/.claude/skills/seo-manager     # must print: Skill is valid!
+```
+
+---
+
 ## Licence
 
-This skill is **MIT** licensed (see `LICENSE`).
+**MIT** — see `LICENSE`, and the `license:` field above.

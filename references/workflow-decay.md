@@ -40,8 +40,10 @@ default. Avoid straddling a seasonal edge, and remember GSC data settles for
 ~3 days, so end the recent window there, not today.
 
 ```bash
+
+**Success criteria**: Two equal-length, recent, non-overlapping GSC exports carrying the `page` dimension, with the recent window ending ~3 days back so the data has settled. Unequal windows invalidate everything downstream.
 # two exports, previous then current
-decay.py compare --previous prev.json --current cur.json \
+python3 $SEO/decay.py compare --previous prev.json --current cur.json \
   --previous-start 2026-06-01 --current-start 2026-06-29 --current-end 2026-07-26 \
   --pages .seo/pages.json \
   --updates ~/.claude/skills/seo-manager/assets/google-updates.json
@@ -50,7 +52,7 @@ decay.py compare --previous prev.json --current cur.json \
 One export carrying the `date` dimension splits here instead:
 
 ```bash
-decay.py split --file rows.json --on 2026-06-29
+python3 $SEO/decay.py split --file rows.json --on 2026-06-29
 ```
 
 ---
@@ -71,6 +73,8 @@ cause no rewrite touches. Check, in order:
 3. Did anything ship? A deploy outage, a template change, a robots.txt edit.
 
 Only when the site-wide explanations are excluded do you work the list.
+
+**Success criteria**: `sitewide_signal` was read and the site-wide explanations (algorithm overlap, crawl collapse, a deploy) were each checked and excluded before any page was worked individually.
 
 ---
 
@@ -102,6 +106,8 @@ winner covers <X> which we do not" --serp-notes "..."
 An update still has to clear **information gain** and the **sameness gate**. A
 refresh that only re-words is not a refresh.
 
+**Success criteria**: Every candidate had its SERP re-read and was judged against the page-1 authority count, not its old position. Only candidates at authority 0-2 are queued, each with a rationale naming the position and impression delta and what the winner covers.
+
 ---
 
 ## 4. `demand_drop` — the honest empty result
@@ -111,6 +117,8 @@ demand drops manufactures work and buries the real decay list under it.
 
 The one legitimate follow-up: if a whole cluster's demand fell, the *topic* may
 be fading, which is a research-workflow input, not a rewrite.
+
+**Success criteria**: Zero queue items were created from demand drops, and the report says so explicitly.
 
 ---
 
@@ -128,12 +136,14 @@ this order, before assuming anything:
 A technical cause is far more common here than a quality one, and it is cheaper
 to fix.
 
+**Success criteria**: Every `lost` page has been checked for status code, sitemap presence, internal links, `noindex`/canonical, and recent crawl BEFORE any quality explanation was offered.
+
 ---
 
 ## 6. Cannibalisation
 
 ```bash
-decay.py cannibal --current gsc-page-query.json
+python3 $SEO/decay.py cannibal --current gsc-page-query.json
 ```
 
 Two of your own URLs ranking for one query splits click-through and link signal,
@@ -143,6 +153,8 @@ both.
 
 If the weaker URL is generated/programmatic and the stronger is curated, the
 generated one canonicalises to the curated one, never the reverse.
+
+**Success criteria**: Each cannibalised query has one page named as the winner and a consolidation action for the other. Generated pages canonicalise to curated ones, never the reverse.
 
 ---
 
@@ -155,6 +167,8 @@ python3 $SEO/seostate.py log-run --workflow decay --ok --summary "..."
 Name the counts in all four categories and the queue outcome. **A run that
 queues nothing because everything was a demand drop is a clean, complete run** —
 report it as one.
+
+**Success criteria**: Counts named in all four categories (decay / demand drop / cannibalisation / settling) plus the queue outcome, and the run is logged. A run that queues nothing because everything was a demand drop is reported as a complete run.
 
 ---
 

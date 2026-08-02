@@ -26,7 +26,7 @@ not a shortcut.**
 ## Owner content preferences — read them FIRST
 
 ```bash
-python3 scripts/seostate.py prefs
+python3 $SEO/seostate.py prefs
 ```
 
 The `tool_note` it returns is a set of instructions this workflow **OBEYS**:
@@ -46,7 +46,7 @@ unchanged.
 ## 1. PICK
 
 ```bash
-python3 scripts/seostate.py suggestions --status approved --type tool
+python3 $SEO/seostate.py suggestions --status approved --type tool
 ```
 
 The list comes back in BUILD ORDER, so **take the FIRST item**. None → say "queue
@@ -57,8 +57,10 @@ derive the search intent and functionality from the keyword and the PLAN step as
 usual; a thin brief is not a reason to skip.
 
 ```bash
-python3 scripts/seostate.py update <id> --status in_progress
+python3 $SEO/seostate.py update <id> --status in_progress
 ```
+
+**Success criteria**: Exactly one idea — the FIRST in build order — is claimed as `in_progress`, or the run reported "queue empty" and stopped cleanly. A thin `source: manual` brief is built, not skipped.
 
 ---
 
@@ -91,6 +93,8 @@ commits of THIS PR, then build the tool into it:
 
 Say plainly in the run report and PR body that this PR also created the site's
 tools section. Every later build skips this step.
+
+**Success criteria**: A PUBLIC tools surface exists, verified logged-out (200 with the widget rendered, no cookies). If it was scaffolded here, `.seo/conventions.md`'s Tools section is updated IN THE SAME PR with the real base path, wiring steps and this tool as the reference — leaving the stale "not wired" text makes the next build scaffold a second tools system. No app route was moved or renamed.
 
 ---
 
@@ -129,12 +133,14 @@ reference. If a tool genuinely fits no archetype, pick the nearest pattern and
 **STATE THE DEVIATION and why in the PR body** — a mismatch must be visible, never
 silent.
 
+**Success criteria**: The reference tool's registry entry, widget and page template have been read completely, and the archetype from the spec is CONFIRMED rather than trusted. Any deviation from an archetype's locked pattern is stated in the PR body — never left silent.
+
 ---
 
 ## 4. THIN-CONTENT GATE
 
 ```bash
-python3 scripts/serp.py "<primary keyword>" --count 10
+python3 $SEO/serp.py "<primary keyword>" --count 10
 ```
 
 The planned tool must be the definitive **INTERACTIVE** answer on page 1 — if a
@@ -146,6 +152,8 @@ completeness, presets, zero-login). If it cannot clearly win, **DO NOT BUILD**:
 > winnability from the tool idea itself and product knowledge, and write "SERP
 > gate: skipped (free mode — no SERP source)" in the run report AND the PR body.
 > **Never fabricate SERP claims you did not fetch.**
+
+**Success criteria**: The tool can be the definitive INTERACTIVE answer on page 1, with a concrete list of what it does better than any existing competitor tool. If it cannot clearly win, the row goes back to `pending` and nothing is built. Free mode records the skipped gate in both the report and the PR body, and fabricates no SERP claims.
 
 ---
 
@@ -168,6 +176,8 @@ Write a short **THEME BRIEF** (5–8 lines: tokens, type scale, card and button
 idiom, label style, anything unusual) and keep every visual decision in the widget
 traceable to it. Nothing from another site's palette or idiom ever leaks across
 sites.
+
+**Success criteria**: The theme-token source was read FRESH this build, and the widget uses only those tokens — no colour, font or radius from memory or from another site.
 
 ---
 
@@ -214,6 +224,8 @@ keyword honestly cannot support a real tool, do not fake one: `update <id>
 - a "checker" that trivially pattern-matches and calls it analysis;
 - static content wearing an input box as decoration.
 
+**Success criteria**: A written plan exists covering search intent, core transformation, a SOURCED and TESTED domain-logic inventory, interaction design, states/edge cases and a win statement — before any code. All four value-bar conditions hold. Failing the bar triggers a redesign loop, never a build; if the keyword cannot support a real tool the row goes back to `pending`.
+
 ---
 
 ## 7. BUILD
@@ -232,6 +244,8 @@ googling, AND a power user still sees exactly what gets written.
 
 Analytics only for real interactive milestones, following the conventions file's
 event-naming rule.
+
+**Success criteria**: The widget is purely client-side, no interaction path throws, the primary action is obvious, and every option label leads with what it does for the user.
 
 ---
 
@@ -252,6 +266,8 @@ sibling tool, one related guide) with natural keyword-bearing anchors,
 root-relative only — and **never inside FAQ answers if those mirror into
 structured data as plain text.**
 
+**Success criteria**: All registry copy has had the humanizer pass, and the description and FAQ carry at least one concrete tool-specific fact or worked example — never generic filler that would fit any tool. Internal links are root-relative and stay out of FAQ answers that mirror into structured data.
+
 ---
 
 ## 9. VERIFY
@@ -262,6 +278,8 @@ code once more** — a broken interaction blocks the merge.
 Then check the composed page against the locked funnel: large centered title,
 value line, widget, CTA, description, FAQ, all present **in that order**, and no
 class or colour in the widget outside the THEME brief.
+
+**Success criteria**: The build passes, every widget interaction path was traced in code, and the composed page matches the locked funnel in ORDER with no class or colour outside the theme brief.
 
 ---
 
@@ -282,20 +300,24 @@ and same usual cause as the guide builder: revert the suggestion to `approved`,
 print the exact error plus the *"Allow GitHub Actions to create and approve pull
 requests"* setting name, and exit non-zero.
 
+**Success criteria**: A PR exists with both `seo` and `seo-tool` labels and a body carrying the keyword, volume/KD, conversion rationale, gate verdict, the execution plan and what a validator should exercise. **A failed `gh pr create` is a FAILED run**: revert to `approved`, print the error and the repo setting, exit NON-ZERO.
+
 ---
 
 ## 11. RECORD
 
 ```bash
-python3 scripts/seostate.py update <id> --status done --pr-url <pr url>
-python3 scripts/seostate.py log-page --url "https://<domain>/<path>" \
+python3 $SEO/seostate.py update <id> --status done --pr-url <pr url>
+python3 $SEO/seostate.py log-page --url "https://<domain>/<path>" \
   --title "..." --type tool --keyword "<primary keyword>" --pr-url <pr url>
-python3 scripts/seostate.py log-run --workflow build-tool --summary "<one line>"
+python3 $SEO/seostate.py log-run --workflow build-tool --summary "<one line>"
 ```
+
+**Success criteria**: The suggestion is `done` with its PR url, the page is logged as `type: tool`, and the run is logged.
 
 ---
 
-## 12. VALIDATION — why tool PRs are never auto-merged
+## 12. VALIDATION — why tool PRs are never auto-merged [human]
 
 A tool PR ships **LLM-authored interactive code that will run in your visitors'
 browsers**. Guides are prose; a widget is a program. So:
@@ -312,9 +334,13 @@ If you want this automated, run the validation in a job that holds **no
 secrets**: it executes PR-authored code, so a token in its environment is a
 token handed to whatever that code decides to do.
 
+**Success criteria**: The `seo-tool` label is present so auto-merge skips the PR, and the body names the flows a human must exercise. Any automated validation runs in a job holding NO secrets — it executes PR-authored code.
+
 ---
 
 ## 13. REPORT
 
 What was built, the PR link, the gate verdict, the one-line core transformation,
 and what to check on the preview.
+
+**Success criteria**: The report names what was built, the PR link, the gate verdict, the one-line core transformation, and what to check on the preview.

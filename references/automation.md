@@ -80,7 +80,7 @@ unmerged PR stops the whole pipeline**. `seo-auto-merge.yml` closes that loop,
 and it is off unless you turn it on:
 
 ```bash
-python3 scripts/seostate.py config --set auto_merge=true
+python3 $SEO/seostate.py config --set auto_merge=true
 ```
 
 Two hard safety properties, both worth keeping:
@@ -160,8 +160,8 @@ In order of how often it is actually the cause:
    `next-actions` flags any that has sat there over a day — reset it to `approved`.
 
 ```bash
-python3 scripts/seostate.py runs --limit 20     # the run log
-python3 scripts/seostate.py next-actions        # ranked, with the fix
+python3 $SEO/seostate.py runs --limit 20     # the run log
+python3 $SEO/seostate.py next-actions        # ranked, with the fix
 ```
 
 ---

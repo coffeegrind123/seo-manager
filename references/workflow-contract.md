@@ -33,6 +33,8 @@ python3 $SEO/contract.py baseline --name prod \
   --url https://example.com/ \
   --url https://example.com/guides/some-guide \
   --url https://example.com/tools/some-tool
+
+**Success criteria**: `.seo/contract/<name>.json` exists and covers one URL per template, and the file is staged for commit. A baseline that lives on one machine is not a baseline.
 # or seed from the sitemap:
 python3 $SEO/contract.py baseline --name prod --sitemap https://example.com/sitemap.xml --max-urls 40
 ```
@@ -60,6 +62,8 @@ mid-deploy or down — a different problem with a different response. Tune with
 `--max-fail-share`. A refusal is the correct outcome, not an error to work
 around.
 
+**Success criteria**: `check` returned a verdict other than `site_wide_failure`. If it refused, the deploy had not settled — wait and re-run; never widen `--max-fail-share` to force a verdict.
+
 ---
 
 ## 3. Read the lifecycle, not the diff
@@ -80,6 +84,8 @@ Severity is fixed, not advisory:
 |---|---|
 | `page_now_unavailable`, `page_now_redirects`, `noindex_added`, `canonical_removed`, `canonical_changed` (pointing away), `title_removed`, `h1_removed`, `schema_removed`, `hreflang_removed` | `title_changed`, `h1_changed`, `content_shrank`, `og_tag_removed`, `internal_links_dropped`, `description_removed`, `hreflang_count_changed` |
 
+**Success criteria**: Every `opened` finding is classified as intentional or a regression, and every `opened` critical has a named cause. `still_open` counts are known, not newly discovered.
+
 ---
 
 ## 4. When the change was intentional
@@ -95,6 +101,8 @@ changed, the new title is the contract — record it. A manual `resolve` closes
 the finding but does **not** re-baseline, so the next check re-opens it; that
 is deliberate.
 
+**Success criteria**: The baseline was re-recorded, and a re-run of `check` reports the previously-opened finding as `resolved` rather than `still_open`.
+
 ---
 
 ## 5. Report
@@ -107,6 +115,8 @@ is deliberate.
 ```bash
 python3 $SEO/seostate.py log-run --workflow contract --summary "<N urls, M opened>"
 ```
+
+**Success criteria**: The report states the verdict, the counts by severity, every `opened` critical with path and rule, and what resolved. A refused run is reported as refused — never as a pass. The run is written to the run log.
 
 ---
 

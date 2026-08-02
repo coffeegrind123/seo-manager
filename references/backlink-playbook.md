@@ -21,11 +21,11 @@ workflow writes it, and every field below maps onto a real form field.
 Track each one:
 
 ```bash
-python3 scripts/seostate.py prospect-add --domain uneed.best \
+python3 $SEO/seostate.py prospect-add --domain uneed.best \
   --url https://www.uneed.best/submit-a-tool --link-type dofollow \
   --reason "free dofollow from DR 75, real founder audience" \
   --angle "submit with the free queue, no payment"
-python3 scripts/seostate.py prospect-update <id> --status contacted
+python3 $SEO/seostate.py prospect-update <id> --status contacted
 ```
 
 ---

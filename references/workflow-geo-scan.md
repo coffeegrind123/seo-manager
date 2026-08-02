@@ -63,14 +63,16 @@ Then interpret the scan below against it:
 > of the domain. The near-zero citation result that this workflow had been
 > reporting was explained entirely by ingestion, not by the answers.
 
+**Success criteria**: `by_category` ingestion numbers and Common Crawl presence are in hand BEFORE any answer is sampled, and the three AI-crawler classes are kept distinct. If no `ai_search` crawler reaches the site, that is reported as the finding and the citation result is NOT read as a content verdict.
+
 ---
 
 ## 1. Build the question set — ~15, hard cap 20
 
 ```bash
-python3 scripts/seostate.py keywords          # what is tracked
-python3 scripts/seostate.py conventions       # what the site is and who it serves
-python3 scripts/seostate.py ai-visibility     # prior_queries - reuse them
+python3 $SEO/seostate.py keywords          # what is tracked
+python3 $SEO/seostate.py conventions       # what the site is and who it serves
+python3 $SEO/seostate.py ai-visibility     # prior_queries - reuse them
 ```
 
 Convert keywords into **the questions a real customer would ask an assistant** —
@@ -87,6 +89,8 @@ definitional ones.
 `ai-visibility` returns `prior_queries`; keep them unless one was retired for a
 reason.
 
+**Success criteria**: 15-20 customer-shaped questions exist, weighted to commercial/comparison intent, and `prior_queries` were reused so the trend line stays comparable. A fresh project with no tracked keywords derives the set from conventions and says so.
+
 ---
 
 ## 2. Sample each question
@@ -101,19 +105,21 @@ appeared somewhere in search results.
 Sources you can use for the search leg:
 
 ```bash
-python3 scripts/serp.py "<the question>" --count 10
+python3 $SEO/serp.py "<the question>" --count 10
 ```
 
 …or the agent's own web search, or the browser MCP for a real Google read
 including the AI Overview block. Any of them is fine; what matters is that the
 answer is composed from results fetched **in this run**.
 
+**Success criteria**: Every question has an answer composed from results FETCHED IN THIS RUN. Nothing came from memory. Citation is counted only where a page on the site actually supports the answer.
+
 ---
 
 ## 3. Record everything in one call
 
 ```bash
-python3 scripts/seostate.py record-ai --json '[
+python3 $SEO/seostate.py record-ai --json '[
   {
     "engine": "claude",
     "query": "best rank tracker for a solo founder",
@@ -136,12 +142,14 @@ python3 scripts/seostate.py record-ai --json '[
   it.** A citation rate with no verbatim evidence behind it is a number nobody can
   audit, including you next week.
 
+**Success criteria**: Every sampled question is recorded with a VERBATIM `answer_excerpt` and its citation list. A record without an excerpt is not acceptable.
+
 ---
 
 ## 4. Read the gap
 
 ```bash
-python3 scripts/seostate.py ai-visibility --days 90
+python3 $SEO/seostate.py ai-visibility --days 90
 ```
 
 `gap_domains` is the list of sites getting cited on questions where this site is
@@ -152,11 +160,13 @@ For each gap that maps to a content opportunity the site could plausibly win, no
 it in the report. If one is a clear, queue-worthy idea:
 
 ```bash
-python3 scripts/seostate.py propose --type guide --title "..." --keyword "..." \
+python3 $SEO/seostate.py propose --type guide --title "..." --keyword "..." \
   --source geo-scan --rationale "..." 
 ```
 
 **Pending, never auto-approved from this workflow.**
+
+**Success criteria**: `gap_domains` is read and each gap is judged for whether the site could plausibly win it. Anything queued is recorded as `pending` — never auto-approved from this workflow.
 
 ---
 
@@ -172,8 +182,10 @@ of measuring. The number only means something as a trend, and the trend needs a
 first point.
 
 ```bash
-python3 scripts/seostate.py log-run --workflow geo-scan --summary "<N questions, M cited>"
+python3 $SEO/seostate.py log-run --workflow geo-scan --summary "<N questions, M cited>"
 ```
+
+**Success criteria**: The report gives questions asked, citation count and rate per engine, 2-3 verbatim answers, the gap domains, and anything queued. A zero-citation baseline is stated plainly as the first point of a trend. The run is logged.
 
 ---
 
