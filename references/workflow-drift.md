@@ -28,6 +28,8 @@ refused read is a failed read, not an empty page 1 — storing it as one makes t
 next diff report a total page-1 wipeout followed by a full recovery. Re-run the
 unread ones (`seodoctor.py --hard` if they persist) before moving on.
 
+**Success criteria**: A dated snapshot exists under `.seo/drift/` and every `unread` keyword was re-run until it read or was excluded. No keyword is stored with an empty page 1. On a first run, zero findings is the correct outcome.
+
 ---
 
 ## 2. Compare
@@ -39,6 +41,8 @@ python3 $SEO/drift.py compare \
   --updates ~/.claude/skills/seo-manager/assets/google-updates.json \
   --target <your-domain>
 ```
+
+**Success criteria**: Two dated snapshots were diffed with `--target` set to your own domain and the update calendar supplied.
 
 ---
 
@@ -54,6 +58,8 @@ This is the distinction a single keyword's history cannot give you: **did my
 page move, or did everything move?** They look identical from one rank chart and
 demand opposite responses.
 
+**Success criteria**: The verdict is read and drives the response. Under SITE-WIDE VOLATILITY no rewrite is proposed at all — the run ends with "re-measure in two weeks".
+
 ---
 
 ## 4. `recurring_entrants` — the competitive early warning
@@ -68,6 +74,8 @@ depth, or concede it and hunt narrower.
 `recurring_exits` matters too — a domain leaving several page 1s at once has
 usually been hit by something, and whatever it is may apply to you.
 
+**Success criteria**: Every domain entering 3+ of your page 1s is named, with what they published, and a stated decision to defend or concede. `recurring_exits` is checked for a cause that may apply to you.
+
 ---
 
 ## 5. `ai_overview_changes` — the trap this catches
@@ -79,6 +87,8 @@ Read that against `decay`: a page whose position held and whose clicks fell, on
 a query that just gained an AI Overview, is **not decaying**. Rewriting it fixes
 nothing. The honest responses are to target the overview itself (concise,
 extractable, well-structured answers) or to accept the query is worth less now.
+
+**Success criteria**: Every query that GAINED an AI Overview is excluded from the decay path, and the response is restructuring or acceptance — never a rewrite.
 
 ---
 
@@ -93,8 +103,11 @@ to stop forty rewrites over a week Google had already announced.
 
 The calendar (`assets/google-updates.json`) carries a Google-owned source URL on
 every entry. It has **no API and needs manual top-up** —
-`_vendored.how_to_top_up` says how. It is not authoritative about anything it
+`_provenance.how_to_top_up` says how, and `_provenance.entries_complete_through`
+says where its coverage stops. It is not authoritative about anything it
 does not list; absence of an update in the window is not evidence there was none.
+
+**Success criteria**: An overlap is reported as raising the bar for a content explanation, never as a cause. The absence of a listed update is explicitly not reported as evidence that nothing happened.
 
 ---
 
@@ -108,6 +121,8 @@ does not list; absence of an update in the window is not evidence there was none
 | Your own position slipped on a stable SERP | A real, isolated loss. Straight into the `decay` path. |
 | A keyword whose page 1 turned over completely | Intent may have shifted. Re-run the remit test before defending it. |
 
+**Success criteria**: Every signal in the table has a stated response, and queue items exist only for the rows the table sends to the queue.
+
 ---
 
 ## 8. Report
@@ -120,3 +135,5 @@ Give the window, the mean churn, the verdict, and any recurring entrant by name.
 **A STABLE verdict is a real finding** — it means position changes in the same
 window were genuinely about your pages, which is what makes the decay workflow's
 conclusions trustworthy.
+
+**Success criteria**: The report gives the window, mean churn, the verdict, and any recurring entrant by name. A STABLE verdict is reported as a real finding, not as "nothing to say". The run is logged.

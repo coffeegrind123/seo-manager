@@ -1,8 +1,10 @@
 {
-  "_vendored": {
+  "_provenance": {
+    "what_this_is": "Google's published algorithm-update and feature calendar, compiled by hand from Google-owned sources. Every entry carries its own source URL - that URL, not this file, is the citable fact.",
     "verification_done_here": "5 of 32 source URLs were fetched and returned 200 on 2026-08-01, alongside a deliberately fake developers.google.com URL that returned 404 - so the probe discriminates and the sample is meaningful. The remaining 27 were NOT re-fetched. Every entry carries a Google-owned source; check it before citing an entry as fact.",
-    "how_to_top_up": "There is no API. Google announces on developers.google.com/search/blog and logs rollouts on status.search.google.com/products/rGHU1u87FJnkP6W2GwMi/history. Add entries by hand, newest last, and only with a Google-owned source URL.",
-    "last_verified": "2026-07-02"
+    "entries_complete_through": "2026-07-02",
+    "coverage_caveat": "entries_complete_through is the horizon this calendar was swept to - NOT the date of the spot-check above. Silence about a window after it is absence of coverage, never evidence that nothing happened.",
+    "how_to_top_up": "There is no API. Google announces on developers.google.com/search/blog and logs rollouts on status.search.google.com/products/rGHU1u87FJnkP6W2GwMi/history. Add entries by hand, newest last, and only with a Google-owned source URL."
   },
   "source_of_truth": "https://status.search.google.com/products/rGHU1u87FJnkP6W2GwMi/history",
   "secondary_sources": [

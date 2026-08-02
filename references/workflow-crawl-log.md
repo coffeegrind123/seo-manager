@@ -30,6 +30,8 @@ You need read access to the web server's access log. It is usually on the
 server, not here — `--remote` ships the script over ssh and aggregates **there**,
 so a gigabyte of decompressed log never crosses the wire.
 
+**Success criteria**: The preflight is green and the domain in `overview` is confirmed to be the site you mean to measure. Read access to the access log is established.
+
 ---
 
 ## 1. Scan
@@ -52,6 +54,8 @@ correctly on its side, but your shell must not expand it locally first.)
 
 **Check `unparsed_share` before reading anything else.** Above ~0.02 the format
 guess is wrong and every number below it is drawn from a subset.
+
+**Success criteria**: A scan completed with `unparsed_share` below ~0.02. Above that the format guess is wrong and every downstream number is drawn from a subset — fix the format before reading anything.
 
 ---
 
@@ -93,6 +97,8 @@ A crawl rate falling steadily while page count is flat means Google is losing
 interest. This leads impressions by weeks, which is exactly why it is worth
 reading.
 
+**Success criteria**: `by_category`, Googlebot's `top_silos`, `status`/`top_errors` and `daily` have each been read, with the three AI-crawler classes kept distinct. A 404 spike is checked against deploy times before being called a content problem.
+
 ---
 
 ## 3. Verify before you conclude
@@ -128,6 +134,54 @@ Three distinct verdicts, and they are not the same thing:
 **`null` is never evidence of spoofing.** Subtract only `spoofed_hits` from a
 crawl total.
 
+### 3b. `ua_spoofing` — forged identities, with no network call
+
+`scan` now returns a `ua_spoofing` block automatically. It looks for one thing:
+an IP presenting as crawlers belonging to **two or more different companies**.
+No address is legitimately Anthropic's crawler *and* OpenAI's *and* Perplexity's.
+
+**Read it BEFORE the `by_category` totals**, because that is precisely what it
+corrupts. Measured on a live site 2026-08-01:
+
+```
+2a09:bac5:…::3e3:e   12 operators   190 hits
+31.59.x.x            10 operators   454 hits
+34.85.x.x            11 operators    84 hits
+```
+
+(Host portions masked on purpose. Addresses get reassigned, and a permanent
+public note calling a specific one a scanner outlives the tenancy that earned
+it. The shape — a handful of addresses each claiming ten-plus operators — is
+the whole finding; the exact octets add nothing.)
+
+Those three accounted for **100%** of the traffic attributed to Claude-SearchBot,
+anthropic-ai, cohere-ai, Google-Extended, Perplexity-User, MistralAI-User,
+Diffbot and Applebot-Extended — every one of them a vulnerability scanner, ~100%
+404s against `/.env`, `/.ssh/*`, `/secrets.json`. The raw log said "assistants
+are reading us". Stripped of the forgery, genuine `ai_search` and `ai_user`
+crawling was **zero**, and the whole GEO conclusion inverted.
+
+It complements `verify` rather than duplicating it, and covers its blind spot:
+
+| | catches | blind to |
+|---|---|---|
+| `verify` | a forged IP for an operator that publishes **rDNS** (Google, Bing) | operators that publish IP RANGES — returns `null`, no verdict |
+| `ua_spoofing` | a forged **UA**, for any operator, with no DNS at all | a scanner disciplined enough to forge only ONE identity |
+
+**The control is built in**: Googlebot + GoogleOther + Googlebot-Image from a
+single Google address collapse to one operator and are never flagged. An empty
+result therefore says "no IP claimed two operators" — a **ceiling on honesty,
+not a clean bill of health**, and the tool's own `reading` says so.
+
+⚠ Check whether a flagged address is **yours**. A live run flagged the
+operator's own workstation IP, because a session of manual `curl`/browser
+testing had presented several different agent strings. That is a true positive
+about the log and a false alarm about the internet.
+
+**Success criteria**: `resolver_control` passed. Every bot verdict is one of the THREE states, and `null` is never counted as spoofed — only `spoofed_hits` is subtracted from a total.
+
+**Success criteria**: `ua_spoofing` was read BEFORE the `by_category` totals were believed, any flagged address was checked against the operator's own IPs, and an empty result is reported as a ceiling on honesty rather than a clean bill of health.
+
 ---
 
 ## 4. Crawl gap — the sitemap versus reality
@@ -146,6 +200,8 @@ python3 $SEO/crawllog.py gap --crawled /tmp/crawled.txt \
   sitemap do.
 - **`crawled_but_not_in_sitemap`** — budget spent on URLs you never advertised.
   Check they should be indexable at all.
+
+**Success criteria**: `never_crawled` and `crawled_but_not_in_sitemap` are both read, and a large `never_crawled` set is treated as a crawl-budget problem rather than something "request indexing" fixes.
 
 ---
 
@@ -190,6 +246,8 @@ Scrapy uses, implements Google's semantics) or Google's own open-source
 a UA you expect to be allowed, checked in the same run. A robots test that only
 checks blocks passes trivially on a file that blocks everything.
 
+**Success criteria**: Findings are queued against the same bar as any other work, nothing meant for de-indexing was `Disallow`ed, and no conclusion rests on a SINGLE window — crawl rate swings wildly without the site changing.
+
 ---
 
 ## 6. Report
@@ -204,6 +262,8 @@ State the window, the parse rate, the verified-bot position, and the finding.
 "Googlebot crawled 3,666 URLs in 19 days, 33% of its budget on one non-indexed
 section, daily rate swinging 39–782 with a ~3% error rate" is a report.
 "Crawling looks healthy" is not.
+
+**Success criteria**: The report states the window, the parse rate, the verified-bot position and the finding, with numbers. "Crawling looks healthy" is not a report. The run is logged.
 
 ---
 
