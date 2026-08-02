@@ -124,6 +124,28 @@ def cmd_snapshot(a):
             "people_also_ask": (r.get("people_also_ask") or [])[:6],
         }
 
+    # A snapshot that captured NOTHING is a failed read, not an empty page 1 - and
+    # it must not be written, because the file is the baseline every later diff is
+    # measured against. Measured 2026-08-02: with the daemon down, every keyword
+    # came back ConnectionRefused and this still printed `ok: true` with
+    # keywords_captured: 0. A caller that checks `ok` (the obvious thing to check)
+    # would have overwritten a good 5-keyword baseline with an empty one, and the
+    # next comparison would have read as a total page-1 wipeout followed by a full
+    # recovery - which is exactly the failure the note below warns about, arriving
+    # through the one path the note does not cover.
+    if not snap["keywords"]:
+        print(json.dumps({
+            "ok": False,
+            "error": "no keyword was read - refusing to write an empty snapshot",
+            "out": str(a.out),
+            "written": False,
+            "requested": len(snap["keywords"]) + len(snap["unread"]),
+            "unread": len(snap["unread"]), "unread_detail": snap["unread"][:10],
+            "fix": "the SERP daemon is usually the cause: python3 seodoctor.py --hard, "
+                   "then re-run. An existing baseline at this path is left untouched.",
+        }, indent=2, ensure_ascii=False))
+        sys.exit(2)
+
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(snap, indent=2, ensure_ascii=False), encoding="utf-8")

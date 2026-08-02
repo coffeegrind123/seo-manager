@@ -173,6 +173,20 @@ def cmd_referrers(a):
         cmd += [a.remote, "python3 - " + " ".join(shlex.quote(x) for x in args)]
         p = subprocess.run(cmd, input=combined, capture_output=True, text=True, timeout=a.timeout)
         if p.returncode != 0:
+            # A STRUCTURED refusal from the remote half (no input, nothing parsed)
+            # arrives on stdout as JSON and is the actually-useful diagnosis. Passing
+            # it through beats reporting `stderr: "", returncode: 2`, which tells the
+            # reader nothing and invites them to guess at the cause - which is exactly
+            # what happened when this was first hit (the missing --glob was misread as
+            # a --format problem).
+            try:
+                remote_err = json.loads(p.stdout)
+            except Exception:
+                remote_err = None
+            if isinstance(remote_err, dict) and remote_err.get("ok") is False:
+                remote_err["remote"] = a.remote
+                print(json.dumps(remote_err, indent=2))
+                sys.exit(2)
             die("remote referrer scan failed", stderr=p.stderr[-2000:], returncode=p.returncode)
         sys.stdout.write(p.stdout)
         return
@@ -191,11 +205,23 @@ def cmd_referrers(a):
     local = 0
     direct = 0
     total = 0
+    lines_read = 0
+    parsed_records = 0
 
     class _Args:
         file = a.file
         glob = a.glob
-    for path in crawllog.expand_inputs(_Args):
+        remote = getattr(a, "remote", None)
+    _inputs = crawllog.expand_inputs(_Args)
+    # REFUSE rather than report zeros. Without this, `referrers --remote host`
+    # with no --glob read nothing and returned human_requests: 0 /
+    # referring_domains: 0 - which reads as "this site has no backlinks", the
+    # single most damaging false negative this script can produce. Measured
+    # 2026-08-01: the same host with --glob gave 1,060,154 and 27.
+    if not _inputs:
+        print(json.dumps(crawllog.no_input_error(_Args), indent=2))
+        sys.exit(2)
+    for path in _inputs:
         try:
             fh = crawllog._open(path)
         except Exception as exc:
@@ -203,9 +229,11 @@ def cmd_referrers(a):
         for line in fh:
             if not line.strip():
                 continue
+            lines_read += 1
             rec = parser(line)
             if rec is None:
                 continue
+            parsed_records += 1
             if cutoff and rec["ts"] and rec["ts"].timestamp() < cutoff:
                 continue
             # Bots do not follow links the way people do, and their referrer is
@@ -258,8 +286,37 @@ def cmd_referrers(a):
             "last_seen": crawllog._iso(d["last"]),
         })
 
+    # Files resolved but nothing came out of them: an empty log, a wrong --format,
+    # or a rotated-away window. Same rule as above - that is a fact about the
+    # INPUT, and reporting it as zero backlinks would be a fact about the site.
+    if parsed_records == 0:
+        print(json.dumps({
+            "ok": False,
+            "error": "input read but nothing parsed - no verdict available",
+            "files_scanned": _inputs,
+            "lines_read": lines_read,
+            "parsed_records": 0,
+            "format": a.format,
+            # Two very different causes, and naming the wrong one sends the reader
+            # off to debug --format when the real answer is a missing --glob. On a
+            # --remote run the script itself arrives on stdin, so expand_inputs sees
+            # a pipe and returns ["-"] - already consumed, hence 0 lines.
+            "fix": (
+                ("no --glob/--file was given, so this fell back to stdin and read nothing. "
+                 "Pass --glob '/var/log/caddy/access*.log*' (QUOTE it, so your local shell "
+                 "does not expand it before it reaches the remote host).")
+                if _inputs == ["-"] else
+                ("the files matched but nothing parsed: the log is empty, or --format does "
+                 "not match it. Caddy writes JSON (one object per line); apache/nginx "
+                 "default to combined. Try --format caddy or --format combined, and check "
+                 "the files are not all rotated out of --days.")
+            ),
+        }, indent=2))
+        sys.exit(2)
+
     print(json.dumps({
         "ok": True,
+        "lines_read": lines_read,
         "human_requests": total,
         "direct_or_no_referrer": direct,
         "internal_referrals": internal,

@@ -198,6 +198,28 @@ check("hidden/submit inputs are not counted as unlabelled",
 r = page_from(BODY.replace("<h1>H</h1>", '<h1>H</h1><img src=a.png><img src=b.png alt="b">'))
 check("img_without_alt fires", "img_without_alt" in rules_of(r))
 
+# Structural checks must read MARKUP, not raw HTML. Measured on a real site
+# 2026-08-01: the only "<img>" on the page was the literal string inside a comment
+# explaining why the decorative art deliberately uses no <img>, and it was reported
+# as an image with no alt. Both directions are tested, because the false NEGATIVE
+# is the dangerous one - a comment that merely mentions <main> must not satisfy the
+# landmark check on a page that has none.
+r = page_from(BODY.replace("<h1>H</h1>",
+                           '<h1>H</h1><!-- decorative art, deliberately no <img> here -->'))
+check("an <img> inside a COMMENT is not counted",
+      "img_without_alt" not in rules_of(r), str(r["structure"]))
+check("...and the image count itself stays 0", r["structure"]["images"] == 0, str(r["structure"]))
+
+r = page_from(BODY.replace("<main>", "<div>").replace("</main>", "</div>")
+                  .replace("<h1>H</h1>", '<h1>H</h1><!-- there is no <main> on this page -->'))
+check("a COMMENT mentioning <main> does not satisfy the landmark check",
+      "no_main_landmark" in rules_of(r), str(rules_of(r)))
+
+r = page_from(BODY.replace("<h1>H</h1>",
+                           '<h1>H</h1><script>var t = \'<input type="text" name="q">\';</script>'))
+check("an <input> inside a <script> is not a phantom form field",
+      "unlabelled_input" not in rules_of(r), str(r["structure"]))
+
 r = page_from(BODY.replace("<h1>H</h1>", '<h1>H</h1><form toolname="search" '
                                          'tooldescription="Search the catalogue"></form>'))
 check("WebMCP tool forms are detected", r["webmcp"]["forms_with_tools"] == 1, str(r["webmcp"]))

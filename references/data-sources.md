@@ -83,12 +83,12 @@ the quality bar reads. Ask for `"view":"full"` only when you actually need
 titles and snippets.
 
 ```bash
-python3 scripts/serpd.py --start                      # idempotent
+python3 $SEO/serpd.py --start                      # idempotent
 curl -s 'http://127.0.0.1:8791/serp?q=rank+tracker&depth=20&view=verdict'
 curl -s -X POST localhost:8791/batch -d '{"queries":["a","b"],"depth":20}'
 curl -s -X POST localhost:8791/reset                  # unwedge (see below)
-python3 scripts/serpd.py --status | --stop            # --status now reports orphan chrome
-python3 scripts/serpd.py --stop --force               # also SIGKILL chrome + clear the portfile
+python3 $SEO/serpd.py --status | --stop            # --status now reports orphan chrome
+python3 $SEO/serpd.py --stop --force               # also SIGKILL chrome + clear the portfile
 ```
 
 `serp.py --provider serpd` uses it too, and `--fallback` prefers it over every
@@ -262,6 +262,77 @@ before `serpd.py --start`.
 reused when a proxy is now configured — it is relaunched. Silently adopting it
 would mean believing you were on a residential exit while every request went out
 on the datacenter IP.
+
+**`serpd` mints a session selector if your URL has none, and this is what makes a
+restart a real remedy.** A bare `http://user:pass@host:8080` leaves the exit
+entirely to the provider, and in practice that behaves as one stable address.
+Measured 2026-08-01: a research run was Google-rate-limited after ~8 queries and
+stayed limited across repeated retries, while rotating the session token cleared
+**7 refused queries on the first fresh exit**.
+
+So `resolve_proxy_url()` appends `_session-<6char>_lifetime-10` when the URL does
+not already carry one. The session is **sticky for the life of the daemon** (an
+engine's redirect + cookie hop must land on one exit — see `serp.Proxy`) and
+**fresh on every restart**. That is what turns the quality bar's prescribed
+response to a refused read — `seodoctor.py --hard` — into an actual fix rather
+than a restart that comes back on the same blocked IP. A URL you selectored
+yourself is passed through untouched.
+
+⚠ **A rate-limited `serpd` looks EXACTLY like a dead one, and the difference is
+your client timeout.** When Google is throttling the exit, `/batch` retries with
+backoff before returning its verdict — measured 2026-08-02 at **71 seconds for a
+single query**. A `curl -m 60` against that returns nothing at all, which reads as
+"the daemon is not serving" and sends you off restarting a process that is fine.
+
+Tell them apart before touching anything:
+
+```bash
+curl -s -m 30 localhost:8791/health     # instant when the daemon is up, whatever Google is doing
+ss -ltnp | grep 8791                    # is anything actually listening
+curl -s -m 180 -X POST localhost:8791/batch -d '{"queries":["x"],"depth":10}' \
+     -H 'Content-Type: application/json'   # generous timeout - this is the real test
+```
+
+`/health` answering while `/batch` hangs means **throttling, not death** — and
+`seodoctor` reporting `already_healthy` is correct in that state, not a false pass.
+The fix is a fresh exit (restart mints a new proxy session) or the browser route,
+never a longer restart loop.
+
+**The verified-country list is re-measurable, and you should re-measure it.**
+
+```bash
+python3 $SEO/serp.py --verify-countries                 # the whole list + fr as a control
+python3 $SEO/serp.py --verify-countries --country us    # just one
+```
+
+It asks the pool for an exit in each country on several FRESH sessions and reports
+where each one actually landed, via a geo-IP lookup. A country passes only if
+**every** session lands in it.
+
+This exists because the list went stale and nothing could tell. It was EU-only and
+excluded `us` on the recorded grounds that the pool "silently returns a random
+non-US exit" — a measured-sounding reason that had stopped being true. Re-measured
+2026-08-02: `us` landed in the US 4 of 4, `tr` likewise, with `de`/`pl` as passing
+controls. The guard had been refusing good countries on the authority of an old
+measurement, and quoting that measurement back as fact.
+
+Two failure modes, and only one is dangerous:
+
+| shape | example | verdict |
+|---|---|---|
+| returns the WRONG country | `fr` → a GB exit, 3/3 | **a silent lie** — the caller believes the SERP is local. This is why the whitelist exists |
+| intermittent timeouts | `jp`, `kr`, `in`, `id`, `ir` | merely unreliable; safe to retry and re-verify |
+
+The default sweep includes `fr` deliberately, as a control: a run where `fr` comes
+back honoured means the **instrument** changed, not the pool.
+
+⚠ **Rotation is not unlimited.** In the same run, ~40 Google queries in quick
+succession got the whole pool flagged, and six consecutive fresh sessions all
+still refused. At that point rotation is exhausted and the escalation is
+`--provider browser` (drive the browser MCP), which cleared every remaining
+query. Point that browser at serpd's **local forwarder**
+(`--proxy-server=127.0.0.1:<port>`, read it off the running Chrome's argv) rather
+than pasting the credentialled URL into a tool call.
 
 ### Setup
 
@@ -733,7 +804,7 @@ breaks everything using the old one.
 
 Everything in this section was probed from this container on 2026-08-01 and is
 registered in **`scripts/providers.py`**, which is now the single place a data
-source is declared. `python3 scripts/providers.py status` probes the whole
+source is declared. `python3 $SEO/providers.py status` probes the whole
 ladder for real and prints what is usable *right now* — measurement, not a
 table that went stale. `seodoctor.py` reports credential presence cheaply and
 `seodoctor.py --providers` runs the live sweep.

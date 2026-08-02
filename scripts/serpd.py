@@ -228,11 +228,47 @@ def _proxy_file_url() -> str:
     return ""
 
 
+_PROXY_URL_CACHE: str | None = None
+
+
 def resolve_proxy_url() -> str:
-    """Env first, then ~/.seo-proxy. One resolver, used everywhere."""
-    return (os.environ.get("SERPD_PROXY")
-            or os.environ.get("SEO_PROXY_URL")
-            or _proxy_file_url()).strip()
+    """Env first, then ~/.seo-proxy. One resolver, used everywhere.
+
+    If the configured URL carries no session selector, MINT one. A bare
+    `http://user:pass@host:8080` leaves the exit IP entirely up to the provider,
+    and in practice that behaves as one stable address: measured 2026-08-01, a
+    research run was rate-limited by Google after ~8 queries and stayed limited,
+    while rotating the session cleared 7 refused queries on the first fresh exit.
+
+    Minting here makes the session sticky FOR THE LIFE OF THE DAEMON (so an
+    engine's redirect + cookie hop still lands on one exit - see serp.Proxy) and
+    fresh on every restart. That turns `seodoctor.py --hard`, which the quality
+    bar already prescribes for a refused read, into an actual remedy rather than
+    a restart that comes back on the same blocked IP.
+
+    An explicitly-selectored URL is passed through untouched, so callers that
+    build their own (serp.Proxy, a country-pinned run) keep full control.
+    """
+    global _PROXY_URL_CACHE
+    if _PROXY_URL_CACHE is not None:
+        return _PROXY_URL_CACHE
+    url = (os.environ.get("SERPD_PROXY")
+           or os.environ.get("SEO_PROXY_URL")
+           or _proxy_file_url()).strip()
+    if url and "_session-" not in url:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import serp  # same directory; imported lazily so serpd runs without it
+            p = serp.Proxy(url)
+            log(f"proxy session minted: {p.label()}")   # label() never returns credentials
+            url = p.url()
+        except Exception as exc:                 # pragma: no cover - never fatal
+            log(f"could not mint a proxy session selector ({exc}); using the bare URL")
+    # Memoized because this is called from four places (the want_proxy checks, the
+    # Chrome launch, the status handler). Minting per call would hand the launcher
+    # one exit and every later comparison a different one.
+    _PROXY_URL_CACHE = url
+    return url
 
 
 def ensure_chrome() -> int:

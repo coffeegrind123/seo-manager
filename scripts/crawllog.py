@@ -196,6 +196,103 @@ ASSET_RE = re.compile(
 )
 
 
+# Which COMPANY operates each crawler. Used only by detect_ua_spoofing() below.
+# Substring-matched against the bot key, longest first, so "googlebot-image" and
+# "google-extended" both land on Google.
+OPERATORS = [
+    ("oai-searchbot", "OpenAI"), ("chatgpt-user", "OpenAI"), ("gptbot", "OpenAI"),
+    ("claude-searchbot", "Anthropic"), ("claude-user", "Anthropic"),
+    ("claudebot", "Anthropic"), ("anthropic-ai", "Anthropic"),
+    ("perplexity-user", "Perplexity"), ("perplexitybot", "Perplexity"),
+    ("applebot-extended", "Apple"), ("applebot", "Apple"),
+    ("google-extended", "Google"), ("googlebot", "Google"), ("googleother", "Google"),
+    ("adsbot-google", "Google"), ("apis-google", "Google"), ("feedfetcher-google", "Google"),
+    ("storebot-google", "Google"), ("google-inspectiontool", "Google"),
+    ("bingbot", "Microsoft"), ("bingpreview", "Microsoft"), ("msnbot", "Microsoft"),
+    ("meta-externalagent", "Meta"), ("facebookexternalhit", "Meta"),
+    ("amazonbot", "Amazon"), ("bytespider", "ByteDance"), ("ccbot", "CommonCrawl"),
+    ("cohere-ai", "Cohere"), ("mistralai-user", "MistralAI"), ("diffbot", "Diffbot"),
+    ("yandexbot", "Yandex"), ("baiduspider", "Baidu"),
+    ("duckduckbot", "DuckDuckGo"), ("duckassistbot", "DuckDuckGo"),
+    ("ahrefsbot", "Ahrefs"), ("semrushbot", "Semrush"), ("mj12bot", "Majestic"),
+    ("dotbot", "Moz"), ("dataforseobot", "DataForSEO"), ("youbot", "You.com"),
+]
+
+
+def operator_of(bot_key: str) -> str | None:
+    for frag, owner in OPERATORS:
+        if frag in bot_key:
+            return owner
+    return None
+
+
+def detect_ua_spoofing(bots: list[dict], min_operators: int = 2) -> dict:
+    """Find IPs presenting as crawlers from MORE THAN ONE company.
+
+    A single address cannot legitimately be Anthropic's crawler and OpenAI's and
+    Perplexity's. When it claims to be all three, the user-agent is forged, and
+    every per-bot number that address contributed to is fiction.
+
+    Why this is worth detecting automatically: it inflates exactly the metric
+    people most want to read right now. Measured on a live site 2026-08-01, three
+    addresses presented as 10-13 different operators each and accounted for 100%
+    of the traffic attributed to Claude-SearchBot, anthropic-ai, cohere-ai,
+    Google-Extended, Perplexity-User, MistralAI-User, Diffbot and
+    Applebot-Extended - so the raw log said "assistants are reading us" when the
+    real answer was "nothing is". They were vulnerability scanners: ~100% 404
+    rates against /.env, /.ssh/*, /secrets.json.
+
+    Deliberately NOT a DNS check - it needs no network, and it catches operators
+    like OpenAI and Anthropic that publish IP RANGES rather than rDNS, where
+    `verify` can return no verdict at all. Use both: this says the UA is forged,
+    `verify` says whether a claimed IP is really the operator's.
+
+    The CONTROL is built in: legitimate multi-bot operators (Googlebot +
+    GoogleOther + Googlebot-Image from one Google address) collapse to ONE
+    operator and are never flagged. If this returns nothing on a log that
+    definitely has Googlebot in it, the detector is working, not idle.
+    """
+    per_ip: dict[str, dict] = defaultdict(lambda: {"operators": {}, "hits": 0, "uas": set()})
+    for b in bots:
+        owner = operator_of(b["key"])
+        if not owner:
+            continue                       # unknown/generic UA proves nothing
+        for ip, hits in (b.get("_all_ips") or {}).items():
+            e = per_ip[ip]
+            e["operators"].setdefault(owner, 0)
+            e["operators"][owner] += hits
+            e["hits"] += hits
+            e["uas"].add(b["bot"])
+
+    flagged = []
+    for ip, e in per_ip.items():
+        if len(e["operators"]) >= min_operators:
+            flagged.append({
+                "ip": ip,
+                "operators_claimed": sorted(e["operators"]),
+                "operator_count": len(e["operators"]),
+                "hits": e["hits"],
+                "user_agents": sorted(e["uas"]),
+            })
+    flagged.sort(key=lambda x: (-x["operator_count"], -x["hits"]))
+    return {
+        "flagged_ips": flagged[:25],
+        "flagged_ip_count": len(flagged),
+        "spoofed_hits": sum(f["hits"] for f in flagged),
+        "reading": (
+            "Each listed IP presented as crawlers belonging to two or more DIFFERENT "
+            "companies, which no genuine crawler does. Treat every hit from these "
+            "addresses as forged and subtract it before reading any per-bot or "
+            "per-category total - especially the ai_search / ai_user ones, which are "
+            "small enough that a scanner can dominate them."
+            if flagged else
+            "No IP claimed more than one operator's crawler. Note this is a CEILING on "
+            "honesty, not a clean bill of health: a scanner that forges only ONE "
+            "identity is invisible here - pair it with `verify`."
+        ),
+    }
+
+
 def classify_ua(ua: str):
     """Return (bot_key, bot_label, category) for a user-agent string.
 
@@ -414,14 +511,60 @@ def silo_of(uri: str, depth: int) -> str:
 # --------------------------------------------------------------------------
 
 def expand_inputs(a) -> list[str]:
+    """Resolve --file/--glob to real paths.
+
+    The stdin fallback is deliberately CONDITIONAL on stdin actually being a
+    pipe. It used to be unconditional (`if not files: files = ["-"]`), and that
+    made a run with no --glob indistinguishable from a run that scanned real
+    logs and found nothing: on a --remote scan stdin is empty, so the scan read
+    zero lines and reported `human_requests: 0` / `referring_domains: 0` as if
+    that were a measurement. A reader sees "this site has no backlinks".
+
+    Measured 2026-08-01 on a live site: with --glob it read 1,060,154 human
+    requests and 27 referring domains; without it, 0 and 0, same exit code.
+
+    Returning [] here lets the callers refuse a verdict, which is the same rule
+    `verify` and `footprint` already follow - "cannot ask" and "the answer is
+    no" must never share a code path.
+    """
     files: list[str] = []
     for f in a.file or []:
         files.append(f)
     for pat in a.glob or []:
         files.extend(sorted(globmod.glob(pat)))
-    if not files:
-        files = ["-"]
-    return files
+    if files:
+        return files
+    # Stdin is a fallback for `cat access.log | crawllog.py scan`, so it applies
+    # ONLY when no input was requested at all. A --glob that matched nothing is an
+    # ERROR, not an invitation to read stdin: honouring it there is how an explicit
+    # request for /var/log/caddy/*.log silently became "read the empty pipe and
+    # report zero", which is the exact false negative this guard exists to stop.
+    asked_for_files = bool(a.file or a.glob)
+    if not asked_for_files and not sys.stdin.isatty():
+        return ["-"]
+    return []
+
+
+def no_input_error(a) -> dict:
+    """The refusal payload shared by every log-reading subcommand."""
+    return {
+        "ok": False,
+        "error": "no input read - nothing to measure, so no verdict is available",
+        "detail": (
+            "No --file matched and no --glob matched any path"
+            if (a.file or a.glob) else
+            "Neither --file nor --glob was given, and stdin is not a pipe"
+        ),
+        "file": list(a.file or []),
+        "glob": list(a.glob or []),
+        "remote": getattr(a, "remote", None),
+        "fix": "pass --glob '/var/log/caddy/access*.log*' (QUOTE it, so the shell does not "
+               "expand it locally before it reaches the remote host), or --file <path>. "
+               "Confirm the path exists on the host you are scanning.",
+        "why_not_zero": "Reporting 0 here would be indistinguishable from a real scan that "
+                        "found no bots and no referrers, which is a conclusion about the "
+                        "SITE rather than about the input.",
+    }
 
 
 def cmd_scan(a):
@@ -440,6 +583,9 @@ def cmd_scan(a):
     total_bot_hits = 0
     human_hits = 0
     files = expand_inputs(a)
+    if not files:
+        print(json.dumps(no_input_error(a), indent=2))
+        sys.exit(2)
     seen_files = []
 
     only = set(x.lower() for x in (a.bot or []))
@@ -531,6 +677,10 @@ def cmd_scan(a):
             "top_errors": dict(b["errors"].most_common(5)),
             "distinct_ips": len(b["ips"]),
             "top_ips": dict(b["ips"].most_common(5)),
+            # Full counter for detect_ua_spoofing(), which must see EVERY address:
+            # a scanner rotating many IPs would hide under a top-5 truncation.
+            # Stripped from the payload before printing.
+            "_all_ips": dict(b["ips"]),
             "user_agents": dict(b["uas"].most_common(3)),
             "first_seen": _iso(b["first"]),
             "last_seen": _iso(b["last"]),
@@ -552,11 +702,16 @@ def cmd_scan(a):
                 "bots": by_cat[c]["bots"],
             }
 
+    spoofing = detect_ua_spoofing(out_bots)
+    for b in out_bots:
+        b.pop("_all_ips", None)     # internal only - never part of the payload
+
     print(json.dumps({
         "ok": True,
         "files": seen_files,
         "lines_read": total_lines,
         "unparsed_lines": unparsed,
+        "ua_spoofing": spoofing,
         "unparsed_share": round(unparsed / total_lines, 4) if total_lines else 0,
         "window_days": a.days,
         "silo_depth": depth,
@@ -915,7 +1070,11 @@ def cmd_urls(a):
             elif part:
                 status_filter.add(int(part))
     counts: Counter = Counter()
-    for path in expand_inputs(a):
+    _inputs = expand_inputs(a)
+    if not _inputs:
+        print(json.dumps(no_input_error(a), indent=2))
+        sys.exit(2)
+    for path in _inputs:
         fh = _open(path)
         for line in fh:
             if not line.strip():

@@ -329,6 +329,26 @@ def check_page(url: str) -> dict:
                 "error": r.get("error") or f"HTTP {r.get('status')}",
                 "detail": "failed read - not an agent-readiness verdict"}
     doc = r.text()
+    # MARKUP = the document with comments, <script> and <style> removed. Every
+    # STRUCTURAL check below must run on this, never on the raw `doc`.
+    #
+    # Measured on a real site 2026-08-01: a page whose only "<img>" was the literal
+    # string inside an HTML comment explaining why the decorative art deliberately
+    # uses NO <img> was reported as "1 of 1 <img> have no alt attribute". There was
+    # no image element on the page at all.
+    #
+    # The false POSITIVE is the harmless half. The same bug runs the other way and
+    # that is the dangerous one: `no_main_landmark` is a `re.search(r"<main\b")`, so
+    # a comment or a JS template string merely MENTIONING <main> makes the check
+    # pass on a page that has no <main> at all - a guard that silently stops
+    # guarding. Same for <input> inside a script template (phantom unlabelled
+    # fields) and <a> in a comment.
+    #
+    # token_budget deliberately keeps using the RAW doc: html_bytes is the transfer
+    # cost an agent actually pays, comments and scripts included.
+    markup = re.sub(r"<!--.*?-->", " ", doc, flags=re.S)
+    markup = re.sub(r"<script\b.*?</script\s*>", " ", markup, flags=re.S | re.I)
+    markup = re.sub(r"<style\b.*?</style\s*>", " ", markup, flags=re.S | re.I)
     findings = []
 
     text = re.sub(r"\s+", " ", TAG_RE.sub(" ", SCRIPT_RE.sub(" ", doc))).strip()
@@ -365,7 +385,7 @@ def check_page(url: str) -> dict:
     # --- agent-UX semantics, all statically decidable
     fake_buttons = re.findall(
         r"<(div|span)\b(?![^>]*\brole=)(?![^>]*\btabindex=)[^>]*\bon(?:click|mousedown)\s*=",
-        doc, re.I)
+        markup, re.I)
     if fake_buttons:
         findings.append(_finding(
             "high", "div_onclick_without_role",
@@ -374,17 +394,17 @@ def check_page(url: str) -> dict:
             "handlers. These are invisible in the accessibility tree, which is the "
             "cleanest signal an agent has."))
 
-    anchors_nohref = re.findall(r"<a\b(?![^>]*\bhref=)[^>]*>", doc, re.I)
+    anchors_nohref = re.findall(r"<a\b(?![^>]*\bhref=)[^>]*>", markup, re.I)
     if len(anchors_nohref) > 2:
         findings.append(_finding(
             "medium", "anchor_without_href",
             f"{len(anchors_nohref)} <a> elements with no href",
             "An anchor without href is not a link to any agent or crawler."))
 
-    inputs = re.findall(r"<(input|select|textarea)\b[^>]*>", doc, re.I)
-    labelled_ids = set(re.findall(r'<label\b[^>]*\bfor\s*=\s*"([^"]+)"', doc, re.I))
+    inputs = re.findall(r"<(input|select|textarea)\b[^>]*>", markup, re.I)
+    labelled_ids = set(re.findall(r'<label\b[^>]*\bfor\s*=\s*"([^"]+)"', markup, re.I))
     unlabelled = 0
-    for tag in re.findall(r"<(?:input|select|textarea)\b[^>]*>", doc, re.I):
+    for tag in re.findall(r"<(?:input|select|textarea)\b[^>]*>", markup, re.I):
         if re.search(r'\btype\s*=\s*"(hidden|submit|button|image)"', tag, re.I):
             continue
         has_aria = re.search(r"\baria-label(?:ledby)?\s*=", tag, re.I)
@@ -398,7 +418,7 @@ def check_page(url: str) -> dict:
             "An agent reading the accessibility tree gets the field's purpose from its "
             "label. Without one the field is a void it cannot fill correctly."))
 
-    landmarks = {t: bool(re.search(rf"<{t}\b", doc, re.I)) for t in ("main", "nav", "header", "footer")}
+    landmarks = {t: bool(re.search(rf"<{t}\b", markup, re.I)) for t in ("main", "nav", "header", "footer")}
     if not landmarks["main"]:
         findings.append(_finding(
             "medium", "no_main_landmark",
@@ -406,7 +426,7 @@ def check_page(url: str) -> dict:
             "<main> is how an agent finds the primary content instead of guessing "
             "between nav, sidebar and footer."))
 
-    imgs = re.findall(r"<img\b[^>]*>", doc, re.I)
+    imgs = re.findall(r"<img\b[^>]*>", markup, re.I)
     noalt = [t for t in imgs if not re.search(r"\balt\s*=", t, re.I)]
     if noalt:
         findings.append(_finding(

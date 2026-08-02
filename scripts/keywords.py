@@ -402,7 +402,21 @@ def cmd_gsc(a):
     """
     text = sys.stdin.read() if a.file == "-" else open(a.file, encoding="utf-8").read()
     data = json.loads(text)
-    rows = data.get("rows", data if isinstance(data, list) else [])
+    # Both shapes are supported ON PURPOSE: the Search Console API returns
+    # {"rows": [...]}, but every natural way to save it - jq '.rows', a paged
+    # fetch that concatenates, the search-console skill's own examples - hands
+    # you the bare LIST. The isinstance test has to come FIRST: the old form
+    # `data.get("rows", data if isinstance(data, list) else [])` evaluated
+    # .get() on the list before the default could ever be used, so a bare list
+    # raised AttributeError instead of taking the branch written for it.
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = data.get("rows") or []
+    else:
+        print(json.dumps({"ok": False, "error":
+              f"expected a JSON object with a 'rows' key or a bare list of rows, got {type(data).__name__}"}))
+        return
     out = []
     for r in rows:
         keys = r.get("keys") or []

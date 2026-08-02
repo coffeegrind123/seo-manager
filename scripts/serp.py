@@ -125,11 +125,91 @@ results_meta: dict = {}
 # ------------------------------------------------------------------- proxy
 
 
-# Exit countries verified against one commercial residential pool.
-# "us" is deliberately absent:
-# asking for it silently returns a random non-US exit, which is worse than
-# refusing because the caller believes it got a US SERP.
-EU_COUNTRIES = ["gr", "se", "nl", "it", "de", "es", "pl", "ro", "pt", "be", "at", "cz", "dk", "ie", "ch"]
+# Exit countries verified against one commercial residential pool, by asking for
+# each one on several FRESH sessions and checking where the exit actually landed
+# (`serp.py verify-countries` re-runs exactly that).
+#
+# ⚠ THIS LIST GOES STALE. It was previously EU-only and excluded "us" on the
+# grounds that the pool silently returned a random non-US exit. Re-measured
+# 2026-08-02: "us" now lands in the US on 4 of 4 fresh sessions, as does "tr" —
+# so the list was refusing two perfectly good countries and, worse, telling the
+# caller a measured-sounding reason that was no longer true. Re-verify before
+# trusting an absence here; do not treat this list as a fact about the internet.
+#
+# Two DIFFERENT failure modes, and only one of them is dangerous:
+#   fr  -> returns a GB exit, 3 of 3. A SILENT LIE: the caller believes it has a
+#          French SERP. This is the reason the whitelist exists at all.
+#   jp, kr, in, id, ir -> intermittent timeouts, never a wrong country. Merely
+#          unreliable, not lying. Excluded so a run cannot half-succeed, but they
+#          may work on a retry and are safe to re-verify.
+VERIFIED_COUNTRIES = [
+    # EU (original set, still passing)
+    "at", "be", "ch", "cz", "de", "dk", "es", "gr", "ie", "it", "nl", "pl", "pt", "ro", "se",
+    # verified 2026-08-02
+    "au", "bd", "br", "ca", "cn", "gb", "mx", "pk", "ru", "sa", "th", "tr", "ua", "us", "vn",
+]
+# Back-compat: older callers imported EU_COUNTRIES.
+EU_COUNTRIES = VERIFIED_COUNTRIES
+
+# Countries measured as returning the WRONG country rather than failing. Named so
+# the refusal can say why, instead of the generic "unverified".
+LYING_COUNTRIES = {"fr": "gb"}
+
+
+def verify_exit_countries(codes, tries=3, timeout=35):
+    """Ask the pool for an exit in each country on FRESH sessions and report where
+    it actually landed.
+
+    This exists because the verified list above went stale and nobody could tell:
+    the refusal message quoted a measured-sounding reason ("us is not honoured")
+    that had stopped being true, so two good countries were being refused on the
+    authority of an old measurement. A list you cannot re-measure is a belief.
+
+    A country passes only if EVERY session lands in it - one wrong exit is the
+    whole failure mode, since a caller pinning a country believes the SERP is
+    local to it. Uses curl because urllib cannot tunnel HTTPS through this proxy
+    (see provider_ddg), and a fresh Proxy() per try so sticky sessions cannot
+    make one lucky exit look like N.
+    """
+    import subprocess
+    base = _read_proxy_file().get("SEO_PROXY_URL", "")
+    if not base:
+        return {"ok": False, "error": "no proxy configured - nothing to verify",
+                "fix": "set SEO_PROXY_URL or ~/.seo-proxy"}
+    out = {}
+    for cc in codes:
+        seen = []
+        for _ in range(tries):
+            try:
+                pr = Proxy(base, country=cc)
+                r = subprocess.run(
+                    ["curl", "-s", "--max-time", str(timeout), "--proxy", pr.url(),
+                     "http://ip-api.com/json/?fields=status,countryCode"],
+                    capture_output=True, text=True, timeout=timeout + 15)
+                d = json.loads(r.stdout)
+                seen.append(d.get("countryCode") if d.get("status") == "success" else "ERR")
+            except Exception:
+                seen.append("ERR")
+        want = cc.upper()
+        wrong = sorted({x for x in seen if x not in (want, "ERR")})
+        out[cc] = {
+            "requested": want, "observed": seen,
+            "honoured": all(x == want for x in seen),
+            "verdict": ("honoured" if all(x == want for x in seen)
+                        else "LIES - returns " + ",".join(wrong) if wrong
+                        else "unreliable (timeouts, never a wrong country)"),
+        }
+    passed = [c for c, v in out.items() if v["honoured"]]
+    return {
+        "ok": True, "checked": len(codes), "tries_each": tries,
+        "honoured": passed,
+        "not_honoured": [c for c in out if c not in passed],
+        "detail": out,
+        "reading": ("A country is honoured only if EVERY fresh session landed in it. "
+                    "'LIES' is the dangerous class - the caller gets a SERP from the "
+                    "wrong country and cannot tell. 'unreliable' only times out and is "
+                    "safe to retry. Update VERIFIED_COUNTRIES from `honoured`."),
+    }
 
 
 def _read_proxy_file() -> dict:
@@ -923,14 +1003,35 @@ def main():
     p.add_argument("--query-for-scoring", help="the query --score-json results were fetched for, "
                                                "when the payload does not carry it")
     p.add_argument("--raw", action="store_true", help="omit the scoring block")
+    p.add_argument("--verify-countries", nargs="*", metavar="CC",
+                   help="measure which exit countries the pool actually honours (no args = the "
+                        "verified list + the known-lying ones as a control). Fetches nothing else.")
+    p.add_argument("--country", action="append", default=[],
+                   help="extra country code to include in --verify-countries")
     a = p.parse_args()
 
-    if a.proxy_country and a.proxy_country.lower() not in EU_COUNTRIES:
+    if a.verify_countries is not None:
+        codes = [c.lower() for c in (a.verify_countries or [])] + [c.lower() for c in a.country]
+        # Default sweep includes the known liar as a CONTROL: a run where `fr`
+        # comes back honoured means the instrument, not the pool, has changed.
+        if not codes:
+            codes = VERIFIED_COUNTRIES + list(LYING_COUNTRIES)
+        print(json.dumps(verify_exit_countries(sorted(set(codes))), indent=2))
+        return
+
+    if a.proxy_country and a.proxy_country.lower() not in VERIFIED_COUNTRIES:
         cc = a.proxy_country.lower()
-        extra = (" 'us' in particular is NOT honoured - the pool silently returns a random non-US "
-                 "exit, so a US-pinned request would quietly lie about its geo." if cc == "us" else "")
+        if cc in LYING_COUNTRIES:
+            extra = (f" {cc!r} is measured as returning a {LYING_COUNTRIES[cc].upper()} exit instead - "
+                     "a silent geo lie, which is worse than a failure because the caller believes the "
+                     "SERP is local.")
+        else:
+            extra = (" Not on the verified list. That may mean it was never checked rather than that "
+                     "it does not work - run `serp.py verify-countries --country " + cc + "` to measure it.")
         print(json.dumps({"ok": False, "error": f"unverified proxy country {cc!r}.{extra}",
-                          "verified_pool": EU_COUNTRIES}, indent=2))
+                          "verified_pool": VERIFIED_COUNTRIES,
+                          "known_lying": LYING_COUNTRIES,
+                          "reverify": f"python3 serp.py verify-countries --country {cc}"}, indent=2))
         sys.exit(2)
 
     # -- score an externally-produced payload (the browser path) -------------
