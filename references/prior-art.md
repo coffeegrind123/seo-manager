@@ -117,7 +117,37 @@ to skim the list. Furniture targets are now split into `nav_hub_urls` with their
 true inbound count, leaving 21 genuine findings. Controlled in `test_sitegraph.py`
 case 7.
 
-### #2 — AI answer sampling (the GEO blind spot)
+### #2 — AI answer sampling — **DEPRIORITISED 2026-09-01, on measurement**
+
+Measured before building, the same way #4 was, and with the same outcome. Two
+halves, and neither survived contact:
+
+- **The sampling half needs API keys this install does not have.** Built today it
+  would fail closed on every engine — a tool that cannot run. Fail-closed is the
+  right behaviour, but a tool whose only reachable state is "cannot ask" is not a
+  capability, it is a stub.
+- **The extractability half — the part that IS keyless — measured clean.** The
+  geolook thesis says the unit is an extractable fact block, so the audit is
+  whether a page states its answer in one self-contained, liftable sentence.
+  Across 2,694 pages: **zero** with no lead, and the apparent failures were a
+  probe artefact — the weapons pages open with a deliberate one-line tagline
+  ("The T-side rifle. One-shot headshot, brutal recoil.") and the very next
+  paragraph is a proper definition naming the entity.
+
+⚠ **A negative result on the way there, worth keeping.** The first probe was a
+cross-page numeric-contradiction detector, aimed at a REAL near-miss in the site's
+own history: a mode page reading "15 servers" one paragraph from a table saying
+321. It reported zero conflicts across the silo — and then **failed its control**,
+unable to find the known instance when handed it directly. Greedy noun-phrase
+capture had keyed `active servers worldwide` against `active servers`. The clean
+"zero conflicts" reading was worth nothing, and would have shipped as a finding
+without the control. Generic numeric-contradiction detection needs entity context
+that is site-specific; it is not a stdlib-shaped problem.
+
+**Revisit when** an install has engine keys, or on a site whose prose is
+hand-written rather than generated from a template.
+
+### #2b — the ORIGINAL framing, kept because it is still right
 
 `geo-scan` measures who CRAWLED (OAI-SearchBot: 27 verified hits) and who
 REFERRED (chatgpt.com: 18 clicks). It never asks the actual question: **do
@@ -132,7 +162,42 @@ Must fail closed — "could not query the engine" is not "we are not cited",
 exactly the `providers.py` rule. Costs real API calls, so it needs a budget knob
 and a cache.
 
-### #3 — Schema generation, not just validation
+### ✅ #2c — Bing's PAGE dimension — **BUILT 2026-09-01 (`bing.py pages`)**
+
+Not on the original list, and it turned out to be the item that actually mattered.
+`queries` could say the best-converting terms on combatskirmish.net were Chinese
+and could not say WHICH PAGE earned them — and "our Chinese locale is working" and
+"the English homepage is ranking for Chinese queries" have opposite fixes. Bing
+exposes `GetPageStats`/`GetPageQueryStats`; nothing here called them.
+
+One call settled it and reframed the whole account: **`/zh/` takes 8,522
+impressions and 2,298 clicks at position 4 — a 27% CTR, three times the
+homepage's clicks from a quarter of its impressions, and 68% of every click the
+site gets.** The homepage carries 33,403 impressions at 2.1%.
+
+Two traps, both controlled, because each returns confident nonsense rather than an
+error: `GetPageStats` puts the page URL in a field named **`Query`**, and sorting
+by impressions **inverts** the real ranking — the page earning most of the clicks
+comes second.
+
+**The general lesson: measure the DIMENSION you are missing before building the
+capability you assumed you needed.** Three roadmap items were measured and found
+not to be this site's problem; the thing that was, was a missing column in a
+source already wired up.
+
+### #3 — Schema generation — **DEPRIORITISED 2026-09-01, on measurement**
+
+Measured across 2,696 generated pages: **100% JSON-LD coverage, zero invalid
+JSON**, every page carrying `BreadcrumbList` + `VideoGame`, guides carrying
+`Article`. There is nothing on this site to generate.
+
+The two retired types present (`FAQPage`, `HowTo`, both on `/how-to-play`) were
+checked against `references/schema-gates.md` and are **correct to keep** — the
+table's own ruling is "not a defect; keep it if non-SERP consumers read it, do not
+add it for search benefit". That is the gate working as designed: it answered the
+question without a guess and without a build.
+
+### #3b — the ORIGINAL framing
 
 `pagecheck.py schema` reads Google's extractor. `claude-seo/seo-schema`
 generates. On combatskirmish.net the `/ring` and `/leaderboard` JSON-LD was
