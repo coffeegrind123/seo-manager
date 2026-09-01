@@ -91,6 +91,10 @@ SEARCH_HOSTS = (
     # engine is never a backlink - it is the absence of one.
     "search.yahoo.com", "yahoo.co", "so.com", "sogou.com", "360.cn", "mail.ru",
     "ask.com", "aol.com", "petalsearch.com", "onesearch.com", "lycos.com",
+    # Same reason, 2026-09-01: both landed in the genuine-backlink table on a live
+    # run. `ya.ru` is Yandex's SHORT domain and the `yandex.` prefix above does not
+    # match it - the kind of gap that only a real log surfaces.
+    "ya.ru", "kagi.com",
 )
 
 # Not backlinks either: the developer's own machine. A local client hitting the
@@ -107,6 +111,72 @@ AI_HOSTS = (
     "chatgpt.com", "chat.openai.com", "perplexity.ai", "claude.ai", "gemini.google.com",
     "copilot.microsoft.com", "you.com", "phind.com", "poe.com", "mistral.ai",
 )
+
+
+# A referring domain is NOT automatically a backlink, and treating it as one is
+# how this report ends up dominated by things nobody linked. Measured on
+# combatskirmish.net 2026-09-01: of 40 referring domains, 34 survived the naive
+# filter and only about 5 were real - the rest were the site's OWN second domain,
+# Cloudflare IPs on cPanel ports, throwaway *.workers.dev hosts, and attack probes
+# whose forged Referer header made `wordpress.org -> /wp-login.php` look like an
+# editorial link from wordpress.org.
+#
+# These four buckets are all "not a person following a link to your content", and
+# each is a different fact about the log, so they are reported separately rather
+# than merged into one "spam" pile.
+
+# Paths that are attacks, not visits. A Referer on one of these is forged or
+# incidental; the request was never a referral in the first place.
+PROBE_PATHS = (
+    "/wp-login.php", "/wp-admin", "/xmlrpc.php", "/wp-content/", "/wp-includes/",
+    "/.env", "/.git/", "/.ssh", "/administrator", "/phpmyadmin", "/vendor/",
+    "/config.json", "/.aws", "/.s3cfg", "/@fs/", "/actuator", "/solr/",
+)
+
+# Landing paths that are an embed or a hotlink rather than a page visit.
+ASSET_PREFIXES = (
+    "/frontend/", "/api/", "/mi/", "/g/", "/gr/", "/e/", "/sounds/", "/dl/",
+    "/game/", "/map-images/", "/sm/", "/m/",
+)
+
+# Ports that appear on shared-hosting/cPanel referrer spam. A referrer arriving
+# on one of these is a spam bot advertising itself in the log, not a link.
+SPAM_PORTS = {"2052", "2053", "2082", "2083", "2086", "2087", "2095", "2096",
+              "8080", "8443", "8880"}
+
+# Free throwaway hosts used for referrer spam and scraping.
+THROWAWAY_SUFFIXES = (".workers.dev", ".pages.dev", ".herokuapp.com", ".vercel.app")
+
+
+def _registrable(host: str) -> str:
+    """Good-enough eTLD+1 for same-owner matching. Deliberately NOT a public-suffix
+    list: this only decides whether to LABEL a row as self-referral, and the rows
+    are all still reported, so a wrong answer costs a label rather than data."""
+    bare = host.split(":", 1)[0]
+    parts = [x for x in bare.split(".") if x]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else bare
+
+
+def classify_referrer(host: str, landing: str, own: set[str]) -> str:
+    """self | probe | asset | spam | genuine - in that order of precedence.
+
+    Probe beats everything after self because an attack with a forged Referer is
+    not a referral at all, whatever the landing path looks like."""
+    bare = host.split(":", 1)[0]
+    port = host.split(":", 1)[1] if ":" in host else ""
+    if _registrable(bare) in own or bare in own:
+        return "self"
+    if any(landing.startswith(x) or landing.rstrip("/").endswith(x) for x in PROBE_PATHS):
+        return "probe"
+    # A bare IP is never an editorial link; with a cPanel-ish port it is textbook
+    # referrer spam.
+    if bare.replace(".", "").isdigit() or port in SPAM_PORTS:
+        return "spam"
+    if bare.endswith(THROWAWAY_SUFFIXES):
+        return "spam"
+    if landing.startswith(ASSET_PREFIXES):
+        return "asset"
+    return "genuine"
 
 
 def is_local(host: str) -> bool:
@@ -148,7 +218,15 @@ def cmd_referrers(a):
             args += ["--days", str(a.days)]
         if a.site:
             args += ["--site", a.site]
+        for o in a.own or []:
+            args += ["--own", o]
         args += ["--format", a.format, "--top", str(a.top)]
+        # ⚠ EVERY referrers flag must be reconstructed here. A flag added to the
+        # parser and forgotten in this list does not error - it is silently
+        # dropped, and only on --remote runs, which is how this command is
+        # normally used. --own shipped that way on 2026-09-01 and the report
+        # went on counting the site's own second domain as its top backlink.
+        # test_backlinks.py asserts this list against the parser.
         import shlex
         cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
         if a.ssh_key:
@@ -274,17 +352,26 @@ def cmd_referrers(a):
                 d["first"] = t if d["first"] is None else min(d["first"], t)
                 d["last"] = t if d["last"] is None else max(d["last"], t)
 
-    rows = []
+    own = {_registrable(a.site)} if a.site else set()
+    own |= {_registrable(x) for x in (a.own or [])}
+    rows, excluded = [], []
     for h, d in sorted(domains.items(), key=lambda kv: -kv[1]["hits"]):
-        rows.append({
+        top_landing = d["landing"].most_common(3)
+        row = {
             "domain": h,
             "visits": d["hits"],
             "distinct_source_urls": len(d["sources"]),
             "top_source": d["sources"].most_common(1)[0][0] if d["sources"] else None,
-            "top_landing": d["landing"].most_common(3),
+            "top_landing": top_landing,
             "first_seen": crawllog._iso(d["first"]),
             "last_seen": crawllog._iso(d["last"]),
-        })
+        }
+        kind = classify_referrer(h, top_landing[0][0] if top_landing else "", own)
+        if kind == "genuine":
+            rows.append(row)
+        else:
+            row["excluded_as"] = kind
+            excluded.append(row)
 
     # Files resolved but nothing came out of them: an empty log, a wrong --format,
     # or a rotated-away window. Same rule as above - that is a fact about the
@@ -323,12 +410,27 @@ def cmd_referrers(a):
         "local_dev_referrals": local,
         "referring_domains": len(rows),
         "referral_visits": sum(r["visits"] for r in rows),
+        "excluded_domains": len(excluded),
+        "excluded_by_reason": dict(Counter(r["excluded_as"] for r in excluded)),
         "search_referrals": dict(search_hits.most_common(10)),
         "ai_assistant_referrals": dict(ai_hits.most_common(10)),
         "backlinks": rows[: a.top],
+        # Kept, not hidden: a misclassification has to be VISIBLE to be fixable,
+        # and one person's referrer spam is another's small niche forum.
+        "excluded": excluded[: a.top],
         "reading": {
             "backlinks": "Every row is a link a real person followed. These are PROVEN live and "
-                         "proven to send traffic - stronger evidence than any index entry.",
+                         "proven to send traffic - stronger evidence than any index entry. "
+                         "`excluded` holds the rows that did NOT qualify, with the reason: a "
+                         "second domain you own, an attack probe whose forged Referer made it "
+                         "look like a link, a hotlinked asset, or referrer spam. Read those "
+                         "before trusting the count - the classifier is heuristic, and it is "
+                         "better to relabel a row than to have the real links buried.",
+            "excluded_by_reason": "self = your own registrable domain (pass --own for a second "
+                                  "one). probe = the landing path is an exploit path, so the "
+                                  "Referer is forged and no referral happened. asset = a "
+                                  "hotlinked image/API, not a page visit. spam = a bare IP, a "
+                                  "cPanel-style port, or a throwaway host.",
             "ai_assistant_referrals": "A visit whose referrer is an assistant means you were CITED "
                                       "and the citation was clicked. This is the hardest possible "
                                       "GEO evidence, and it is the downstream half of what "
@@ -473,6 +575,9 @@ def main():
     s.add_argument("--format", default="auto",
                    choices=["auto", "caddy", "json", "combined", "common"])
     s.add_argument("--site", help="your own domain, so internal referrals are excluded")
+    s.add_argument("--own", action="append",
+                   help="ANOTHER domain you own, so its referrals are labelled self "
+                        "rather than counted as a backlink. Repeatable.")
     s.add_argument("--days", type=int)
     s.add_argument("--top", type=int, default=40)
     s.add_argument("--remote", help="user@host - runs the scan there")
