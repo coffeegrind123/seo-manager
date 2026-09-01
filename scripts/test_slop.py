@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -152,6 +153,105 @@ check("reported line number is correct", hit["hits"][0]["line"] == 4,
 print("\nno score is emitted (a score gets optimised instead of the prose)")
 check("no numeric score field", not any(
     k in slop.scan_text(CLEAN) for k in ("score", "grade", "density")))
+
+print("\n" + "=" * 60)
+print("HTML mode - a generated site has no draft, only built pages")
+
+HTML_PAGE = """<!doctype html>
+<html><head>
+  <title>AWP \u2014 CS 1.6 Weapon Guide</title>
+  <meta name="description" content="The AWP \u2014 price, damage and how to play it.">
+  <script type="application/ld+json">{"headline":"AWP \u2014 Counter-Strike 1.6"}</script>
+  <style>.cta{color:red} /* the button \u2014 orange on hover */</style>
+</head><body>
+  <!-- the did-you-mean redirect \u2014 only on variant pages -->
+  <main>
+    <p>It costs $4750 and it is bolt-action, so a miss leaves you helpless.</p>
+    <pre><code>./run.sh --leverage 3 --delve deep</code></pre>
+  </main>
+</body></html>
+"""
+
+r_html = slop.scan_text(HTML_PAGE)
+r_raw = slop.scan_text(HTML_PAGE, html=False)
+check("html is auto-detected", r_html["html_mode"] is True)
+check("--no-html is honoured", r_raw["html_mode"] is False)
+
+em_html = sum(v["count"] for v in slop._fire(*slop._prepare(HTML_PAGE)[:2]).values()
+              if v["rule"] == "em_dash")
+em_raw = sum(v["count"] for v in
+             slop._fire(HTML_PAGE, slop._mask(HTML_PAGE, html=False)).values()
+             if v["rule"] == "em_dash")
+check("head, script, style and comments are not counted as prose", em_html == 0,
+      f"html={em_html} raw={em_raw}")
+check("CONTROL the same input DOES count them without html masking", em_raw >= 4,
+      f"raw={em_raw}")
+check("CONTROL so the masking, not the input, changed the answer", em_raw > em_html)
+
+check("word count drops to the visible prose", r_html["words"] < r_raw["words"] / 2,
+      f"{r_html['words']} vs {r_raw['words']}")
+check("html mode says a single-page verdict is partly the template",
+      "corpus" in r_html.get("html_note", ""))
+check("plain markdown gets no html_note", "html_note" not in slop.scan_text(CLEAN))
+
+# REGRESSION. The markdown STRIP rule "4-space indent = code block" matches almost
+# every line of generated HTML. Running it after the html mask deleted two thirds of
+# the prose (252 words measured as 128), silently, while still looking like a result.
+INDENTED = ("<!doctype html><html><body>\n"
+            "        <p>The economy rewards a team that saves together, and it "
+            "punishes the one that half-buys after a loss.</p>\n</body></html>")
+check("indented HTML prose survives the markdown code-block rule",
+      slop.scan_text(INDENTED)["words"] > 15,
+      f"words={slop.scan_text(INDENTED)['words']}")
+check("CONTROL <pre>/<code> is still excluded, as the contract promises",
+      "leverage" not in slop._prepare(HTML_PAGE)[1])
+
+print("\ncorpus - separating one authoring decision from many pages")
+
+def _tmp_corpus(pages):
+    d = tempfile.mkdtemp()
+    paths = []
+    for i, body in enumerate(pages):
+        f = Path(d) / f"p{i}.html"
+        f.write_text("<!doctype html><html><body>" + body + "</body></html>",
+                     encoding="utf-8")
+        paths.append(str(f))
+    return paths
+
+FOOTER = "<footer><p>Combat Skirmish \u2014 play CS 1.6 free in your browser.</p></footer>"
+# five pages sharing a footer; one of them ALSO has three em dashes of its own.
+shared_only = [f"<p>Page {i} says something ordinary about maps.</p>{FOOTER}" for i in range(4)]
+noisy = ("<p>It costs $4750 \u2014 most of a buy \u2014 and it is slow, "
+         "so a miss \u2014 any miss \u2014 leaves you helpless.</p>" + FOOTER)
+res = slop.corpus(_tmp_corpus(shared_only + [noisy]))
+check("corpus runs over the tier", res["ok"] and res["files"] == 5)
+tmpl = [t for t in res["template"] if "Combat Skirmish" in t["match"]]
+check("the shared footer is reported ONCE as template", len(tmpl) == 1, str(res["template"]))
+check("and is attributed to every file", tmpl and tmpl[0]["files"] == 5)
+check("pages carrying ONLY template chrome come back clean",
+      res["pages_clean"] == 4, f"clean={res['pages_clean']}")
+check("CONTROL the page with its own em dashes is still flagged",
+      res["pages_over_tolerance"] == 1 and "p4" in res["worst"][0]["file"],
+      str([w["file"] for w in res["worst"]]))
+
+# REGRESSION. em_dash's match string is the bare character, so keying template
+# identity on `match` collapsed the whole rule into one shared row and reported
+# every page clean - the mirror image of the bug this command exists to fix.
+check("template identity keys on context, not the bare match",
+      all(t["rule"] != "em_dash" or "Combat Skirmish" in t["match"]
+          for t in res["template"]),
+      str(res["template"]))
+check("hits carry context so a '-' hit is readable at all",
+      all("context" in h and len(h["context"]) > 5
+          for w in res["worst"] for hs in w["hits"].values() for h in hs))
+
+per_rule = {r["rule"]: r for r in res["per_rule"]}
+check("a rule firing on every file is reported as such",
+      per_rule["em_dash"]["every_file"] is True and per_rule["em_dash"]["of"] == 5)
+check("corpus refuses an empty file set rather than inventing a verdict",
+      slop.corpus([])["ok"] is False)
+check("an unreadable file is data, not a crash",
+      slop.corpus(_tmp_corpus(["<p>ok</p>"]) + ["/nonexistent/zzz.html"])["errors"])
 
 print()
 if FAILS:

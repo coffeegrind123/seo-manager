@@ -8,8 +8,19 @@ model cannot self-assess, because the patterns below are exactly the ones it
 reaches for without noticing.
 
   scan     count every tell in a draft, with line numbers and the fix
+  corpus   scan a TIER of generated pages and separate the TEMPLATE from the
+           prose. On a generated site this is the one to reach for: `scan` run
+           page by page returned `warn` on 44 of 44 pages, because a generated
+           page is mostly template and counting it per page multiplies one
+           authoring decision by the page count
   diff     compare two drafts (did the rewrite actually remove them)
   rules    print the catalog
+
+HTML IS DETECTED AND MASKED. The prose on a generated site exists only inside
+built pages, and scanning those raw counts <title>, meta descriptions, JSON-LD,
+<style> and comments as writing - 861 "words" against 252 of real copy on one
+measured page. `--no-html` turns that off, and is mostly useful as the control
+proving the masking is what changed the answer.
 
 WHY A SCRIPT AND NOT A CHECKLIST. Every other SEO tool ships these as prose for
 the model to bear in mind while writing. A model bearing its own tells in mind
@@ -33,7 +44,9 @@ Stdlib only.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -191,9 +204,50 @@ STRIP = [
 ]
 
 
-def _mask(text: str) -> str:
+# A GENERATED SITE HAS NO DRAFT TO SCAN - the prose exists only inside built HTML,
+# and scanning that raw counts text no reader ever sees: HTML and CSS comments,
+# <script> (JSON-LD schema included), <style>, and the entire <head> with its
+# <title>, meta description and schema headline.
+#
+# Measured on combatskirmish.net's weapon pages 2026-09-01: awp.html reports 861
+# "words" raw against 252 of actual prose, and 44 of 44 pages came back `warn`.
+# A uniform verdict across every sample is the signature of an instrument reading
+# the wrong text, not of a corpus-wide defect - the same 44 split 12 pass / 32
+# warn once the markup is masked. So HTML is detected and masked by default.
+HTML_STRIP = [
+    re.compile(r"(?s)<!--.*?-->"),
+    re.compile(r"(?is)<script\b.*?</script\s*>"),
+    re.compile(r"(?is)<style\b.*?</style\s*>"),
+    # the HTML spelling of the markdown code-fence exclusion below: a shell flag
+    # inside a <pre> sample is not a writing tell.
+    re.compile(r"(?is)<pre\b.*?</pre\s*>"),
+    re.compile(r"(?is)<code\b.*?</code\s*>"),
+    re.compile(r"(?is)\A.*?<body\b[^>]*>"),   # the whole <head>
+    re.compile(r"(?is)</body\s*>.*\Z"),
+    re.compile(r"(?s)<[^>]+>"),
+    re.compile(r"&[a-zA-Z#0-9]{1,8};"),
+]
+
+_HTML_HINT = re.compile(r"(?i)<!doctype\s+html|<(?:html|head|body|div|section|h[1-6]|p)\b")
+
+
+def looks_like_html(text: str) -> bool:
+    """Cheap sniff on the head of the input. Override with --html/--no-html."""
+    return bool(_HTML_HINT.search(text[:4000]))
+
+
+def _mask(text: str, *, html: bool = False) -> str:
     """Blank non-prose while preserving offsets, so line numbers stay true."""
     out = text
+    if html:
+        # HTML only. The markdown STRIP below must NOT run on it: its
+        # "4-space indent = code block" rule matches almost every line of
+        # generated HTML, which silently deleted two thirds of the prose
+        # (awp.html measured 128 words instead of 252). <pre>/<code> above are
+        # the HTML spelling of the same exclusion.
+        for rx in HTML_STRIP:
+            out = rx.sub(lambda m: re.sub(r"\S", " ", m.group(0)), out)
+        return out
     for rx, _ in STRIP:
         out = rx.sub(lambda m: re.sub(r"\S", " ", m.group(0)), out)
     return out
@@ -204,13 +258,13 @@ def _front_matter_end(text: str) -> int:
     return m.end() if m else 0
 
 
-def scan_text(text: str, *, skip_front_matter: bool = True) -> dict:
-    start = _front_matter_end(text) if skip_front_matter else 0
-    body = text[start:]
-    masked = _mask(body)
-    lines = body.splitlines()
+TOLERANCE = {r[0]: r[2] for r in RULES}
+
+
+def _fire(body: str, masked: str) -> dict:
+    """rule -> record with EVERY hit, uncapped. The shared core of scan and corpus."""
     line_starts, pos = [], 0
-    for ln in lines:
+    for ln in body.splitlines():
         line_starts.append(pos)
         pos += len(ln) + 1
 
@@ -224,20 +278,56 @@ def scan_text(text: str, *, skip_front_matter: bool = True) -> dict:
                 hi = mid - 1
         return lo + 1
 
-    hits, by_rule = [], {}
+    by_rule = {}
     for rule, sev, tol, rx, why, fix in COMPILED:
         found = []
         for m in rx.finditer(masked):
             frag = body[m.start():m.end()]
+            # Context, not just the match. Several rules match a SINGLE character
+            # (em_dash "-", unicode_arrow), so a bare match string is identical on
+            # every page and every occurrence - which makes it useless both as a
+            # report ({"match": "-"} tells the reader nothing) and as the identity
+            # `corpus` groups on, where it collapsed an entire rule into one
+            # "template" row and reported 0 pages over tolerance.
+            # The ENCLOSING SENTENCE, sliced from MASKED. Two reasons it is not a
+            # fixed character window. It reads as the prose the scanner actually
+            # saw rather than as a soup of tags; and it is stable, which is what
+            # `corpus` groups on - a +/-45 char window around a shared footer
+            # bleeds into whatever page-specific sentence precedes it, so the
+            # SAME template line keys differently on different pages and stops
+            # being recognised as template.
+            left = masked[max(0, m.start() - 120):m.start()]
+            right = masked[m.end():m.end() + 120]
+            cut = max(left.rfind("."), left.rfind("!"), left.rfind("?"), left.rfind("\n"))
+            if cut >= 0:
+                left = left[cut + 1:]
+            ends = [i for i in (right.find("."), right.find("!"),
+                                right.find("?"), right.find("\n")) if i >= 0]
+            if ends:
+                right = right[:min(ends) + 1]
             found.append({"line": line_of(m.start()),
-                          "match": re.sub(r"\s+", " ", frag).strip()[:90]})
+                          "match": re.sub(r"\s+", " ", frag).strip()[:90],
+                          "context": re.sub(r"\s+", " ", left + frag + right).strip()[:160]})
         if found:
             by_rule[rule] = {"rule": rule, "severity": sev, "count": len(found),
                              "tolerance": tol, "over_tolerance": len(found) > tol,
-                             "why": why, "fix": fix, "hits": found[:12]}
-            hits.extend(found)
+                             "why": why, "fix": fix, "hits": found}
+    return by_rule
 
-    flagged = [v for v in by_rule.values() if v["over_tolerance"]]
+
+def _prepare(text: str, *, skip_front_matter: bool = True, html=None):
+    if html is None:
+        html = looks_like_html(text)
+    start = _front_matter_end(text) if (skip_front_matter and not html) else 0
+    body = text[start:]
+    return body, _mask(body, html=html), html
+
+
+def scan_text(text: str, *, skip_front_matter: bool = True, html=None) -> dict:
+    body, masked, html = _prepare(text, skip_front_matter=skip_front_matter, html=html)
+    by_rule = _fire(body, masked)
+
+    flagged = [dict(v, hits=v["hits"][:12]) for v in by_rule.values() if v["over_tolerance"]]
     flagged.sort(key=lambda v: (SEVERITY_ORDER.get(v["severity"], 9), -v["count"]))
     within = [{"rule": v["rule"], "count": v["count"], "tolerance": v["tolerance"]}
               for v in by_rule.values() if not v["over_tolerance"]]
@@ -251,20 +341,129 @@ def scan_text(text: str, *, skip_front_matter: bool = True) -> dict:
         "rules_over_tolerance": len(flagged),
         "flagged": flagged,
         "within_tolerance": within,
+        "html_mode": html,
         "note": ("No score is emitted on purpose - a slop score gets optimised instead "
                  "of the prose. `flagged` is the work list; `within_tolerance` is shown "
                  "so a rule that fired once is visible without being treated as a "
                  "defect. Code blocks, inline code and link targets are excluded."),
+        **({"html_note": (
+            "HTML detected: comments, <script>, <style> and the whole <head> are masked, "
+            "so this counts prose rather than markup. It still counts VISIBLE CHROME - "
+            "the h1, CTA labels, nav links and the footer are prose-shaped and repeat on "
+            "every page of a generated site, so a single-page verdict here is partly a "
+            "verdict on the template. Use `corpus` over the whole tier to separate the "
+            "two."
+        )} if html else {}),
     }
 
 
-def scan_file(path: str) -> dict:
+def corpus(paths, *, share_ratio: float = 0.6) -> dict:
+    """Scan a TIER of generated pages and separate the template from the prose.
+
+    WHY THIS EXISTS. Run `scan` over 44 generated pages and all 44 come back
+    `warn`, because a generated page is mostly template: the same h1 shape, the
+    same "Play now - free, no download" CTA, the same `All weapons ->` nav labels
+    and the same footer on every page. Counting those per page multiplies ONE
+    authoring decision by the page count, and a verdict that is identical for
+    every page cannot rank anything - it is the corpus telling you about its
+    layout, not about its writing.
+
+    So: a match string that appears in at least `share_ratio` of the files is
+    reported ONCE as `template` (fix it in the generator and it is fixed
+    everywhere), and each page's verdict is recomputed on only the hits that are
+    unique to it.
+
+    Measured on combatskirmish.net 2026-09-01, 44 pages: every `unicode_arrow`
+    hit on the site was a navigation label, and on awp.html only 3 of 9
+    body-text hits were prose - the rest were the h1, a CTA, three nav links and
+    the footer tagline.
+
+    LIMIT, stated because it is invisible otherwise: template detection is by
+    IDENTICAL string, so a templated line carrying an interpolated value
+    ("AWP - Counter-Strike 1.6") is not recognised as shared even though its
+    shape is. `files_hit` is reported per rule for exactly that reason - a rule
+    firing on 18 of 18 files is templated whether or not the strings match.
+    """
+    scans, errors = [], []
+    for path in paths:
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except Exception as e:  # unreadable file is data, not a crash
+            errors.append({"file": path, "error": str(e)})
+            continue
+        body, masked, html = _prepare(text)
+        scans.append({"file": path, "html": html, "by_rule": _fire(body, masked),
+                      "words": len([w for w in re.split(r"\s+", masked) if w.strip()])})
+    n = len(scans)
+    if not n:
+        return {"ok": False, "check": "slop-corpus",
+                "error": "no readable files", "errors": errors}
+
+    match_files = collections.defaultdict(set)
+    files_hit = collections.Counter()
+    for sc in scans:
+        for rule, v in sc["by_rule"].items():
+            files_hit[rule] += 1
+            for h in v["hits"]:
+                match_files[(rule, h["context"])].add(sc["file"])
+
+    threshold = max(2, math.ceil(share_ratio * n))
+    shared = {k: len(v) for k, v in match_files.items() if len(v) >= threshold}
+
+    pages = []
+    for sc in scans:
+        uniq = {}
+        for rule, v in sc["by_rule"].items():
+            keep = [h for h in v["hits"] if (rule, h["context"]) not in shared]
+            if keep:
+                uniq[rule] = keep
+        over = sorted(r for r, hs in uniq.items() if len(hs) > TOLERANCE[r])
+        pages.append({"file": sc["file"], "words": sc["words"],
+                      "page_hits": sum(len(h) for h in uniq.values()),
+                      "rules_over_tolerance": over,
+                      "verdict": "warn" if over else "pass",
+                      "hits": {r: hs[:6] for r, hs in uniq.items() if r in over}})
+
+    flagged_pages = [p for p in pages if p["rules_over_tolerance"]]
+    flagged_pages.sort(key=lambda p: -(p["page_hits"] / max(p["words"], 1)))
+
+    template = sorted(({"rule": r, "match": m, "files": c}
+                       for (r, m), c in shared.items()),
+                      key=lambda d: (-d["files"], d["rule"], d["match"]))
+
+    return {
+        "ok": True, "check": "slop-corpus", "files": n,
+        "shared_in_at_least": threshold,
+        "template": template,
+        "per_rule": [{"rule": r, "files_hit": c, "of": n,
+                      "every_file": c == n,
+                      "shared_matches": sum(1 for (rr, _m) in shared if rr == r)}
+                     for r, c in files_hit.most_common()],
+        "pages_over_tolerance": len(flagged_pages),
+        "pages_clean": n - len(flagged_pages),
+        "worst": flagged_pages[:15],
+        "errors": errors,
+        "reading": (
+            "RUN THIS PER TIER, not across the whole site: the threshold is a "
+            "fraction of the files given, so mixing 17 weapon pages into a 44-file "
+            "corpus pushes their shared nav below it and hands them back as if they "
+            "were per-page prose. "
+            "`template` is one authoring decision repeated - fix it in the generator, "
+            "not page by page, and it does not belong in any per-page count. `worst` is "
+            "ranked on hits UNIQUE to each page. A rule with every_file true is "
+            "templated even when its `shared_matches` is 0, because an interpolated "
+            "value defeats identical-string matching - read that as layout, not prose."
+        ),
+    }
+
+
+def scan_file(path: str, *, html=None) -> dict:
     p = Path(path)
     try:
         text = sys.stdin.read() if path == "-" else p.read_text(encoding="utf-8")
     except Exception as e:
         return {"ok": False, "check": "slop-scan", "file": path, "error": str(e)}
-    out = scan_text(text)
+    out = scan_text(text, html=html)
     out["file"] = path
     return out
 
@@ -276,16 +475,27 @@ def main():
 
     s = sub.add_parser("scan", help="find AI writing tells in a draft")
     s.add_argument("file", help="path, or '-' for stdin")
+    s.add_argument("--html", dest="html", action="store_true", default=None,
+                   help="force HTML mode (mask markup, head, script, style)")
+    s.add_argument("--no-html", dest="html", action="store_false",
+                   help="force plain-text mode; scans markup as if it were prose")
 
     d = sub.add_parser("diff", help="did a rewrite actually remove them")
     d.add_argument("before")
     d.add_argument("after")
 
+    c = sub.add_parser("corpus", help="scan a TIER: separate template hits from page hits")
+    c.add_argument("files", nargs="+", help="paths (a shell glob is fine)")
+    c.add_argument("--share-ratio", type=float, default=0.6,
+                   help="a match in >= this fraction of files is template (default 0.6)")
+
     sub.add_parser("rules", help="print the catalog")
 
     a = ap.parse_args()
     if a.cmd == "scan":
-        out = scan_file(a.file)
+        out = scan_file(a.file, html=a.html)
+    elif a.cmd == "corpus":
+        out = corpus(a.files, share_ratio=a.share_ratio)
     elif a.cmd == "rules":
         out = {"ok": True, "check": "slop-rules",
                "rules": [{"rule": r, "severity": sv, "tolerance": t, "why": w, "fix": f}
