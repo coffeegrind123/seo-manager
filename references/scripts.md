@@ -34,6 +34,7 @@ separately, or write the path out in full.
 | `providers.py` | **the provider registry**: every data source declared once, each with a live probe and its own control. `providers.py status` answers "what can I use right now?" by measuring, not by reading a table |
 | `factcheck.py` | **information gain, sourced**: OpenAlex + Crossref papers with citation counts and DOIs, Wikidata entities, the Wikipedia neighbourhood of a topic, and a draft-vs-neighbourhood coverage gap |
 | `pagecheck.py` | keyless technical checks for ANY url: W3C HTML validity, Google's own structured-data extractor, Wayback change history (yours or a competitor's), and Core Web Vitals |
+| `vitals.py` | **whole-site Core Web Vitals, by TEMPLATE rather than by URL**. `pagecheck.py vitals` is the right tool for one page and the wrong shape for a site: PSI takes ~20s per URL and is quota-limited, so a 5,388-URL sitemap is not a sweep you can run. This groups URLs by path shape, samples within each, and reports per template - the level at which a fix is applied. Keyless by default (TTFB, transfer size, compression, render-blocking head resources, image dimension/lazy hygiene, DOM size, third-party origins); `--psi N` spends the quota on the N worst. ⚠ It reports PROXIES, never LCP/CLS/INP - those need a browser, and the ranking-relevant versions need real users, which is what `vitals.py origin` reads from CrUX |
 | `crawllog.py` | **the access log**: crawl budget by silo, status codes served to bots, AI-crawler ingestion, and reverse+forward DNS bot verification. `--remote` runs the aggregation on the server so the log never crosses the wire. |
 | `decay.py` | two Search Console periods -> pages that LOST RANK, separated from pages whose demand fell. Plus self-cannibalisation. |
 | `drift.py` | whole-page-1 snapshots and their diff: new entrants, AI-Overview changes, site-wide volatility, algorithm-update correlation |
@@ -47,6 +48,7 @@ separately, or write the path out in full.
 | `test_backlinks.py` | the controls for referrer classification: attack probes vs real links from the same host (`wordpress.org` → `/wp-login.php` vs → `/`), a second owned domain at any subdomain/port, bare-IP and cPanel-port referrer spam, hotlinked assets, and a structural check that **every `referrers` flag survives the `--remote` argv reconstruction** — a flag added to the parser and forgotten there is silently dropped, and only on remote runs |
 | `test_bing.py` | the controls for the Bing page dimension: `GetPageStats` returning the page URL in a field literally named `Query`, per-date rows that only total after aggregation, click-sorting vs impression-sorting (which invert on real data), CTR on a zero-impression page, and an empty result that must name BOTH "no data yet" and "you typed the URL wrong" rather than implying the page is dead. Also the `urlinfo` decoder — .NET `DateTime.MinValue` (`/Date(-62135568000000-0800)/`) is "never", not year 0001 — and the refusal of `--days` on the four subcommands whose endpoints have no date range, with controls that `keyword`/`expand` still accept it |
 | `test_sitegraph.py` | the controls for the link graph: the `<p class="silonav">` case that defeats tag-based boilerplate detection, self-referential hreflang counted as an inbound link, the island silo whose inlink counts look healthy, a `--start` that was never crawled reporting mass unreachability, a zero-edge graph refusing a verdict instead of calling every page an orphan, a global-nav hub being kept out of the orphan count while staying visible for review, section-scoped furniture (a locale nav on 100% of its locale and 1.5% of the site) being caught WITHOUT swallowing the island silo whose share is almost identical, and a canonical naming a URL the tree does not serve being told apart from one naming a different real page |
+| `test_vitals.py` | the controls for the sweep: the commented-out `<img>`/`<script>` that a regex counts (the same bug found twice before in this skill), `media=print` and `defer`/`async` not being render-blocking, template grouping that is neither so coarse the site is one row nor so fine it degenerates into the per-URL run it replaces, and that a sweep reading NOTHING refuses rather than reporting a fast site |
 | `test_controls.py` | the controls for the control audit itself: that it recognises BOTH invocation shapes, and - fired at a real fixture tree containing one controlled and one uncontrolled script - that an uncontrolled instrument makes the verdict not-ok and is NAMED rather than merely counted. An audit whose only failure mode is untestable is the instrument it exists to catch |
 | `test_hreflang.py` / `test_contract.py` / `test_agentcheck.py` / `test_slop.py` / `test_crawllog.py` / `test_competitors.py` | the controls for the above: every rule is fired against synthetic input, so a clean pass on a real site means something. `test_crawllog` covers the UA-spoofing detector (including the control that a single operator's many crawlers are NOT flagged) and the no-input refusal. `test_competitors` fires every guarantee of the page-1 profiler against synthetic input - robots.txt obedience by the HTTP fetcher, injection-shape defanging, that every unread result is offered for browser escalation WITH its reason, and that platform chrome never becomes a 'subtopic page 1 covers' |
 
@@ -87,6 +89,24 @@ python3 $SEO/factcheck.py coverage --draft new.md --topic "<Article Title>"
 python3 $SEO/pagecheck.py schema https://rival.example/page
 python3 $SEO/pagecheck.py history https://rival.example/page --since 2026-05-01
 python3 $SEO/pagecheck.py vitals https://oursite.example/page         # lab + real-user CWV
+
+# whole-site Core Web Vitals, sampled per template (keyless, no browser)
+python3 $SEO/vitals.py sweep --sitemap https://example.com/sitemap.xml --per-template 4
+python3 $SEO/vitals.py page https://example.com/some-page     # one URL
+python3 $SEO/vitals.py origin https://example.com             # CrUX field data (credential)
+# ⚠ READ `network_baseline` IN THE OUTPUT FIRST. It times a known-fast third-party host
+# from THIS machine, because the first version of this tool timed a plain urlopen and
+# reported 5,940ms TTFB for a server that answers in 119ms - the rest was the container's
+# DNS (1,446ms) and TLS. It flagged `slow_ttfb`, severity high, "server/CDN work", and
+# pointed at entirely the wrong system. connect_ms is now measured and EXCLUDED.
+# ⚠ TTFB is sampled TWICE and the finding uses the FASTER run. One sample cannot tell a
+# cold cache from a slow page: /leaderboard measured 12,065ms once and 70-94ms on three
+# repeats (a 5-minute server cache the sweep happened to miss), while /servers/de_dust2
+# measured 4,188 / 4,186 / 4,307ms - reproducible, and a real finding on 1,404 URLs.
+# `ttfb_cold_ms` keeps the cold number, reported as its own `cold_cache_cost` finding.
+# ⚠ A row carries `ttfb_spread` when its slowest sample fired the rule, because a median
+# next to a `fail` reads as a tool bug. /servers/* came back [65, 66, 4071, 4157] - a
+# bimodal template, which a median would have hidden either way.
 
 # is every instrument still able to tell a finding from a reader bug?
 # Run this BEFORE trusting any zero. 24 instruments, 301 checks, no network.
