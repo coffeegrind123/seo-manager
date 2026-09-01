@@ -70,6 +70,8 @@ def main() -> int:
           str({r.get("invoked_as") for r in a["rows"]}))
 
     check("a clean sweep is reported as ok", a["ok"] is True, a.get("absent"))
+    check("and it does not claim the controls ran",
+          a["summary"]["proven"] == 0 and a["mode"] == "static", a["summary"])
 
     print("\nthe audit cannot report a clean sweep while something is uncontrolled:")
     # The failure mode that matters, exercised against a REAL fixture tree
@@ -88,7 +90,12 @@ def main() -> int:
         f = audit(run=False, directory=d)
         check("an uncontrolled instrument makes the verdict not-ok", f["ok"] is False, f["summary"])
         check("it is named, not just counted", f["absent"] == ["bad.py"], str(f["absent"]))
-        check("the controlled one is still credited", f["summary"]["controlled"] == 1, f["summary"])
+        check("the declared one is still credited", f["summary"]["declared"] == 1, f["summary"])
+        # A static run matched a regex; it ran nothing. Crediting that as
+        # `proven` is the audit making the claim it exists to police.
+        check("a static run proves nothing", f["summary"]["proven"] == 0, f["summary"])
+        check("a static run says so in its verdict",
+              f["mode"] == "static" and f["controls_executed"] is False, f.get("mode"))
         (d / "bad.py").unlink()
         f2 = audit(run=False, directory=d)
         check("removing it restores the clean verdict", f2["ok"] is True, f2["summary"])

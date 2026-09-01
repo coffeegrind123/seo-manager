@@ -245,7 +245,14 @@ def audit(run: bool = True, timeout: int = 120, directory: Path | None = None) -
     by = {}
     for r in rows:
         by.setdefault(r["state"], []).append(r["script"])
-    controlled = by.get("pass", []) + by.get("declared", [])
+    # PROVEN and DECLARED are different claims and must never share a number.
+    # `--static` matches a regex against the source; it cannot tell a working
+    # control from one that raises on import or returns garbage. Reporting both
+    # under one `controlled` key made a static run's verdict byte-identical in
+    # shape to an executed one - the audit committing the error it exists to find.
+    proven = by.get("pass", [])
+    declared_only = by.get("declared", [])
+    declared = proven + declared_only
     broken = by.get("fail", []) + by.get("unreadable", []) + by.get("timeout", [])
     uncontrolled = by.get("absent", [])
 
@@ -264,11 +271,22 @@ def audit(run: bool = True, timeout: int = 120, directory: Path | None = None) -
     return {
         "ok": detector_ok and not broken and not absent,
         "check": "controls-audit",
+        "mode": "executed" if run else "static",
+        "controls_executed": bool(run),
+        "proves": (
+            "every declared control was RUN on this machine; `proven` is how many "
+            "passed" if run else
+            "NOTHING WAS RUN. `declared` counts instruments whose SOURCE declares a "
+            "`control` entry point - a control that raises on import, returns "
+            "garbage or agrees with the code by construction is counted here. This "
+            "verdict cannot tell a working control from a broken one; drop --static "
+            "for that"),
         "control_ok": detector_ok,
         "control": {"known_controlled": known_good, "detector_found_them": detector_ok,
                     "note": "if this is false the audit itself is the broken reader"},
-        "summary": {"controlled": len(controlled), "broken": len(broken),
-                    "uncontrolled": len(uncontrolled), "total": len(rows)},
+        "summary": {"proven": len(proven), "declared": len(declared),
+                    "broken": len(broken), "uncontrolled": len(uncontrolled),
+                    "total": len(rows)},
         "uncontrolled": uncontrolled,
         "absent": absent,
         "broken": broken,
@@ -328,6 +346,39 @@ def self_control() -> dict:
     if (HERE / "sitegraph.py").exists():
         c.check("detector_finds_a_subcommand_control",
                 declares_control(HERE / "sitegraph.py")[1] == "control")
+    # A STATIC audit must not be mistakable for an executed one. Both return
+    # ok:true on a healthy tree, so the distinction has to be carried in the
+    # verdict itself rather than left to the reader of `rows`.
+    with tempfile.TemporaryDirectory() as ts:
+        d = Path(ts)
+        (d / "good.py").write_text(
+            "import argparse, json, sys\n"
+            "ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest='cmd')\n"
+            "sub.add_parser('control')\n"
+            "a = ap.parse_args()\n"
+            "print(json.dumps({'ok': True, 'check': 'x', 'checks': {'a': True}}))\n")
+        st, ex = audit(run=False, directory=d), audit(run=True, directory=d)
+        c.check("static_run_proves_nothing", st["summary"]["proven"] == 0, str(st["summary"]))
+        c.check("static_run_still_counts_the_declaration", st["summary"]["declared"] == 1)
+        c.check("executed_run_proves_it", ex["summary"]["proven"] == 1, str(ex["summary"]))
+        c.check("the_two_modes_are_distinguishable",
+                st["mode"] == "static" and ex["mode"] == "executed"
+                and st["controls_executed"] is False and ex["controls_executed"] is True)
+
+    # ...and a control that DECLARES itself but blows up must survive --static
+    # and fail the executed run. That asymmetry is the whole reason for the split.
+    with tempfile.TemporaryDirectory() as tb:
+        d = Path(tb)
+        (d / "broken.py").write_text(
+            "import argparse\n"
+            "ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest='cmd')\n"
+            "sub.add_parser('control')\n"
+            "raise SystemExit('this control is broken')\n")
+        st2, ex2 = audit(run=False, directory=d), audit(run=True, directory=d)
+        c.check("static_cannot_see_a_broken_control", st2["ok"] is True, str(st2["summary"]))
+        c.check("executed_catches_the_broken_control", ex2["ok"] is False, str(ex2["summary"]))
+        c.check("broken_control_is_named", ex2["broken"] == ["broken.py"], str(ex2["broken"]))
+
     with tempfile.TemporaryDirectory() as td:
         blank = Path(td) / "blank.py"
         blank.write_text("import argparse\n"

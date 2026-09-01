@@ -178,6 +178,10 @@ python3 $SEO/run_tests.py control        # prove the runner can fail
 # Run this BEFORE trusting any zero. 29 instruments, 436 checks, no network.
 python3 $SEO/controls.py audit          # ok:false names the ones that cannot
 python3 $SEO/controls.py audit --static # detect declarations only, run nothing
+# ⚠ `--static` matches a REGEX against each source. It cannot tell a working control
+# from one that raises on import or returns garbage, so it reports `proven: 0` and
+# `mode: static`. Read `summary.proven`, never `summary.declared`, as the count of
+# instruments that can currently prove they discriminate.
 python3 $SEO/<any>.py control           # one instrument (serp/serpd/seodoctor/
 python3 $SEO/serp.py --control          # rankcheck/authority take --control)
 # ⚠ Two invocation shapes, because two argument styles exist. Scripts with
