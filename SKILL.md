@@ -167,7 +167,7 @@ Supporting references:
 
 ## The scripts
 
-26 scripts, all stdlib Python 3, no installs. Every one prints JSON; `--help`
+30 scripts, all stdlib Python 3, no installs. Every one prints JSON; `--help`
 lists the subcommands.
 
 ```bash
@@ -264,9 +264,9 @@ well as in the quality bar:
 
   **This is now structural rather than a habit.** `controls.py` provides the
   primitive (`Controls`, `refuse()`, `guard_zero()`, `uniform_verdict()`) and
-  **every one of the 24 instruments carries a control you can run** — `control`
+  **every one of the 29 instruments carries a control you can run** — `control`
   as a subcommand, or `--control` on the five flag-style ones. `controls.py
-  audit` runs the lot (301 checks, no network) and reports `ok: false` naming
+  audit` runs the lot (436 checks, no network) and reports `ok: false` naming
   any instrument that cannot currently prove itself. It was built after seven
   instruments failed their controls in a single run on 2026-09-01; each would
   have shipped as a confident finding about the site.

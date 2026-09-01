@@ -108,8 +108,8 @@ caught by a human noticing; nothing in the code required a control to exist.
 
 `controls.py` makes it structural: `Controls` / `refuse()` / `guard_zero()` /
 `uniform_verdict()`, plus `controls.py audit`, which runs every instrument's own
-control and reports `ok: false` naming any that cannot prove itself. **24 of 24
-instruments, 301 checks, no network, 0 broken.**
+control and reports `ok: false` naming any that cannot prove itself. **29 of 29
+instruments, 436 checks, no network, 0 broken.**
 
 Three findings came out of the retrofit itself, which is the argument for it:
 

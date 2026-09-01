@@ -56,6 +56,7 @@ separately, or write the path out in full.
 | `test_brief.py` | the controls for the assembler: that no readable page 1 REFUSES rather than emitting a brief with the competitive sections quietly missing, that a 2-page contract withholds its subtopics while keeping them visible, and that the cannibalisation metric discriminates in both directions - jaccard scored a real hit and a nonsense query BOTH at zero, and a 'clear' from a metric that cannot fire green-lights a duplicate page for a query we already own |
 | `test_vitals.py` | the controls for the sweep: the commented-out `<img>`/`<script>` that a regex counts (the same bug found twice before in this skill), `media=print` and `defer`/`async` not being render-blocking, template grouping that is neither so coarse the site is one row nor so fine it degenerates into the per-URL run it replaces, and that a sweep reading NOTHING refuses rather than reporting a fast site |
 | `test_controls.py` | the controls for the control audit itself: that it recognises BOTH invocation shapes, and - fired at a real fixture tree containing one controlled and one uncontrolled script - that an uncontrolled instrument makes the verdict not-ok and is NAMED rather than merely counted. An audit whose only failure mode is untestable is the instrument it exists to catch |
+| `run_tests.py` | **the suite gate** - runs every `test_*.py` in its own process and reads its EXIT CODE, which is the signal these suites actually emit. 17 of the 18 define no `def test_` function, so `python3 -m pytest -q` collected 6 tests from ONE file and printed "6 passed" - a clean green over an eighteenth of the suite, with nothing skipped and no warning. It reports `invisible_to_pytest` on every run so that number is measured rather than remembered, and an empty discovery REFUSES rather than reading as a clean sweep. `test_all_suites.py` is a two-function shim so that `pytest` cannot lie either |
 | `test_hreflang.py` / `test_contract.py` / `test_agentcheck.py` / `test_slop.py` / `test_crawllog.py` / `test_competitors.py` | the controls for the above: every rule is fired against synthetic input, so a clean pass on a real site means something. `test_crawllog` covers the UA-spoofing detector (including the control that a single operator's many crawlers are NOT flagged) and the no-input refusal. `test_competitors` fires every guarantee of the page-1 profiler against synthetic input - robots.txt obedience by the HTTP fetcher, injection-shape defanging, that every unread result is offered for browser escalation WITH its reason, and that platform chrome never becomes a 'subtopic page 1 covers' |
 
 Also `assets/google-updates.json` — Google's published algorithm-update calendar,
@@ -165,8 +166,16 @@ python3 $SEO/vitals.py origin https://example.com             # CrUX field data 
 # next to a `fail` reads as a tool bug. /servers/* came back [65, 66, 4071, 4157] - a
 # bimodal template, which a median would have hidden either way.
 
+# run the test suites - NOT `pytest`, which collects from 1 of 18 files and exits 0
+python3 $SEO/run_tests.py                # 18 suites, JSON verdict, exit 1 on any failure
+python3 $SEO/run_tests.py --list         # what would run + what pytest would collect
+python3 $SEO/run_tests.py -k sitegraph   # one suite by substring
+python3 $SEO/run_tests.py control        # prove the runner can fail
+# ⚠ `pytest` is honest ONLY because `test_all_suites.py` shims it. Delete that file
+# and `pytest -q` goes back to reporting a green it did not earn.
+
 # is every instrument still able to tell a finding from a reader bug?
-# Run this BEFORE trusting any zero. 24 instruments, 301 checks, no network.
+# Run this BEFORE trusting any zero. 29 instruments, 436 checks, no network.
 python3 $SEO/controls.py audit          # ok:false names the ones that cannot
 python3 $SEO/controls.py audit --static # detect declarations only, run nothing
 python3 $SEO/<any>.py control           # one instrument (serp/serpd/seodoctor/
