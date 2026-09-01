@@ -130,6 +130,22 @@ ok("all-ugc/blames the READ, not the SERP",
 # Weakness detection still counts UGC pages even though they cannot vote.
 ok("weak/ugc pages still reported as weak", len(r["weak_results"]) >= 2, str(r["weak_results"]))
 
+# A bot-challenge interstitial looks exactly like a thin page - a few words, one
+# heading - and calling it weak INVERTS the finding: it says a competitor is
+# beatable when all you learned is that they block you. Measured 2026-09-01:
+# play-cs.com (DR 35, ranking ABOVE the audited site) profiled as "thin (5 words),
+# no heading structure" from a page whose only heading was the word "Verification".
+ch = lambda w, h, t="": C._is_challenge({"words": w, "headings": h, "title": t})
+ok("challenge/5-word 'Verification' page", ch(5, ["Verification"]), "not detected")
+ok("challenge/Cloudflare just-a-moment", ch(12, [], "Just a moment..."), "not detected")
+ok("challenge/checking-your-browser", ch(30, ["Checking your browser"]), "not detected")
+ok("challenge/Chinese interstitial", ch(8, ["\u5b89\u5168\u68c0\u67e5"]), "not detected")
+# The opposite error HIDES a genuinely thin competitor, so both halves are required.
+ok("challenge/a real thin page is not one", not ch(90, ["Maps", "Modes"]), "false positive")
+ok("challenge/long article naming verification is not one",
+   not ch(1800, ["Email verification explained"]), "false positive")
+ok("challenge/short page with no marker is not one", not ch(5, ["Home"]), "false positive")
+
 if fails:
     print("FAILED:")
     for f in fails:

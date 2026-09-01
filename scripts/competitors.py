@@ -174,6 +174,29 @@ def profile_page(url: str, timeout: int = 25) -> dict:
     return out
 
 
+
+# Markers that mean "we served you an interstitial", not "we have little content".
+# Kept deliberately short and high-precision: a false positive here HIDES a genuinely
+# thin competitor, which is the opposite error and just as costly.
+CHALLENGE_MARKERS = (
+    "verification", "just a moment", "attention required", "checking your browser",
+    "please enable javascript", "enable cookies", "access denied", "captcha",
+    "are you human", "ddos protection", "security check", "one more step",
+    "cf-browser-verification", "请稍候", "安全检查",
+)
+
+
+def _is_challenge(p: dict) -> bool:
+    """A short page whose only structure is a challenge marker was not read.
+
+    Requires BOTH a challenge marker and near-zero body text, so a real article
+    that happens to contain the word "verification" in a heading is not discarded."""
+    if p.get("words", 0) > 120:
+        return False
+    blob = " ".join([p.get("title") or ""] + list(p.get("headings") or [])).lower()
+    return any(m in blob for m in CHALLENGE_MARKERS)
+
+
 def build_contract(profiles: list, query: str) -> dict:
     live = [p for p in profiles if p.get("ok")]
     if not live:
@@ -212,6 +235,20 @@ def build_contract(profiles: list, query: str) -> dict:
                 for w, c in freq.most_common() if c >= max(2, (n + 1) // 2)]
     gaps = [{"subtopic": w, "covered_by": c} for w, c in freq.most_common()
             if 1 <= c < max(2, (n + 1) // 2)][:20]
+
+    # A bot-challenge interstitial is a page you COULD NOT READ, and it looks
+    # exactly like a thin one: a handful of words and a single heading. Reporting
+    # it as weak inverts the finding - it tells you a competitor is beatable when
+    # all you learned is that they block you. Measured 2026-09-01: play-cs.com
+    # (DR 35, ranking ABOVE the site being audited) profiled as
+    # "thin (5 words), no heading structure" from a page whose only heading was
+    # the word "Verification".
+    live = [p for p in live if not _is_challenge(p)]
+    challenged = [{"url": p["url"], "domain": p["domain"],
+                   "why": "bot challenge / JS interstitial - NOT read, and NOT evidence "
+                          "the page is thin. Escalate to the browser recipe below.",
+                   "marker": p["headings"][0] if p.get("headings") else None}
+                  for p in profiles if p.get("ok") and _is_challenge(p)]
 
     words = sorted(p["words"] for p in live)
     heads = sorted(p["heading_count"] for p in live)
@@ -256,6 +293,9 @@ def build_contract(profiles: list, query: str) -> dict:
         "contract": contract,
         "gaps": gaps,
         "weak_results": weak,
+        # Separate from `unread` (a fetch that failed) and from `weak_results` (a page
+        # read and found soft): these were fetched successfully and still not read.
+        "challenged": challenged,
         "pages": [{k: p[k] for k in ("url", "domain", "words", "heading_count", "headings",
                                      "has_table", "newest_date_seen", "ugc") if k in p}
                   for p in live],
