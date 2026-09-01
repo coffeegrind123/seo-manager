@@ -405,7 +405,17 @@ def cmd_inspect(a):
             "crawled_as": idx.get("crawledAs"),
             "referring_urls": idx.get("referringUrls") or [],
         })
+    # A numeric summary, so "is this page indexed yet" can be a REGISTERED
+    # hypothesis rather than a note somebody re-checks by eye. remeasure.py
+    # needs a number; `coverage` is prose.
+    indexed = sum(1 for r in results if r["verdict"] == "PASS")
+    unknown = sum(1 for r in results
+                  if (r["coverage"] or "").lower().startswith("url is unknown"))
     payload = {"ok": bool(results) or not errors, "check": "gsc-inspect", "property": p,
+               "summary": {"checked": len(results), "indexed": indexed,
+                           "unknown_to_google": unknown,
+                           "other": len(results) - indexed - unknown,
+                           "errors": len(errors)},
                "results": results, "errors": errors,
                "reading": ("`canonical_agrees: false` is the finding to act on - Google chose a "
                            "different canonical from the one the page declares, so the page's "
@@ -581,6 +591,17 @@ def run_control():
             "if everything were flagged the warning would carry no information")
     c.check("a_window_ending_exactly_at_the_edge_is_clean",
             lag_note(str(today - timedelta(days=DATA_LAG_DAYS))) is None)
+
+    # The inspect summary, which a remeasure hypothesis reads as its metric.
+    _rows = [{"verdict": "PASS", "coverage": "Submitted and indexed"},
+             {"verdict": "NEUTRAL", "coverage": "URL is unknown to Google"},
+             {"verdict": "NEUTRAL", "coverage": "Discovered - currently not indexed"}]
+    _ix = sum(1 for r in _rows if r["verdict"] == "PASS")
+    _un = sum(1 for r in _rows if (r["coverage"] or "").lower().startswith("url is unknown"))
+    c.check("inspect_summary_counts_indexed_and_unknown_separately",
+            (_ix, _un, len(_rows) - _ix - _un) == (1, 1, 1),
+            "'unknown to Google' and 'discovered, not indexed' are different states "
+            "with different fixes - collapsing them makes the metric unreadable")
 
     # Property identity.
     c.check("domain_and_url_properties_are_not_interchangeable",
