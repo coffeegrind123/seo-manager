@@ -151,6 +151,109 @@ check("CONTROL keyword --days is NOT refused", out.get("error") != "window_not_s
 rc, out = cli("expand", "--seed", "zzz-control-seed", "--days", "30")
 check("CONTROL expand --days is NOT refused", out.get("error") != "window_not_selectable")
 
+# --------------------------------------------------------------------------
+# The CRAWLER side. Every case below is a way the crawl/submission surface
+# returns a confident wrong answer rather than an error.
+# --------------------------------------------------------------------------
+
+def stub_by_method(table, default=None):
+    """Different payload per endpoint - crawlissues reads two of them."""
+    def _call(method, key, **kw):
+        if method in table:
+            return {"ok": True, "d": table[method]}
+        return default if default is not None else {"ok": True, "d": []}
+    bing.call = _call
+
+
+print("\n8. crawl stats: a running total must never be summed over days")
+# Two columns, deliberately opposite in shape. CrawledPages bounces (a daily
+# count); InIndex only rises (a stock). Summing the second produced InIndex =
+# 82,767 on a live account whose index holds 4,809 pages.
+days = [
+    {"Date": "/Date(1787443200000)/", "CrawledPages": 293, "InIndex": 1025, "Code4xx": 1},
+    {"Date": "/Date(1787529600000)/", "CrawledPages": 169, "InIndex": 1268, "Code4xx": 2},
+    {"Date": "/Date(1787616000000)/", "CrawledPages": 216, "InIndex": 1541, "Code4xx": 1},
+    {"Date": "/Date(1787702400000)/", "CrawledPages": 411, "InIndex": 1665, "Code4xx": 3},
+    {"Date": "/Date(1787788800000)/", "CrawledPages": 275, "InIndex": 1795, "Code4xx": 0},
+]
+stub_by_method({"GetCrawlStats": days})
+r = bing.crawlstats("k", "https://x.net/")
+check("a bouncing daily count is summed", r["window_totals"]["crawled_pages"] == 293 + 169 + 216 + 411 + 275)
+check("a monotonic stock is NOT summed", "in_index" not in r["window_totals"])
+check("and it is named in refused_to_sum", "in_index" in r["refused_to_sum"]["columns"])
+check("the stock reports its LATEST value", r["latest_stock"]["in_index"]["latest"] == 1795)
+check("and its movement over the window", r["latest_stock"]["in_index"]["change_over_window"] == 770)
+check("the two column kinds really do differ",
+      r["column_kinds"]["in_index"]["kind"] != r["column_kinds"]["crawled_pages"]["kind"])
+check("the measured kind agrees with the reference for in_index",
+      "kind_disagrees_with_reference" not in r)
+
+# CONTROL: hand it a stock shaped like a flow and the disagreement must SHOW,
+# not be silently overridden by the hardcoded reference table.
+flipped = [dict(d, InIndex=v) for d, v in zip(days, [1025, 900, 1541, 1100, 1795])]
+stub_by_method({"GetCrawlStats": flipped})
+r2 = bing.crawlstats("k", "https://x.net/")
+check("CONTROL a reference/measurement disagreement is reported",
+      any(x["column"] == "in_index" for x in r2.get("kind_disagrees_with_reference", [])))
+check("CONTROL and the MEASURED kind wins", r2["column_kinds"]["in_index"]["kind"] == "flow")
+
+print("\n9. an empty crawl-issue list is UNKNOWN when the stats disagree")
+stub_by_method({"GetCrawlIssues": [],
+                "GetCrawlStats": [dict(d, CrawlErrors=e) for d, e in zip(days, [2, 2, 1, 4, 3])]})
+r = bing.crawlissues("k", "https://x.net/", 20)
+check("errors in stats + nothing here is unknown, not none", r["verdict"] == "unknown")
+check("and it says which reading contradicts it", "12" in r["why_not_none"] or "crawl errors" in r["why_not_none"])
+
+# CONTROL: with no errors anywhere, empty really is empty - the guard must not
+# refuse every zero, only the unsupported ones.
+stub_by_method({"GetCrawlIssues": [],
+                "GetCrawlStats": [dict(d, CrawlErrors=0) for d in days]})
+r = bing.crawlissues("k", "https://x.net/", 20)
+check("CONTROL a corroborated zero is reported as none", r["verdict"] == "none")
+
+stub_by_method({"GetCrawlIssues": [{"Url": "https://x.net/a", "HttpCode": 404,
+                                    "Issues": 4 | 64, "InLinks": 3}]})
+r = bing.crawlissues("k", "https://x.net/", 20)
+check("a bitmask row decodes both of its flags",
+      set(r["issues"][0]["issues"]) == {"code_4xx", "important_url_blocked_by_robots_txt"})
+check("and keeps the raw mask so a decoder bug is auditable", r["issues"][0]["issues_raw"] == 68)
+
+print("\n10. GetFeeds carries a SECOND never-sentinel that decodes to a real date")
+stub_by_method({"GetFeeds": [{"Url": "https://x.net/sitemap.xml", "Type": "Sitemap",
+                              "Status": "Success", "UrlCount": 6127,
+                              "LastCrawled": "/Date(1788155102000)/",
+                              "Submitted": "/Date(-11644473600000)/",
+                              "FileSize": 0, "Compressed": False}]})
+r = bing.feeds("k", "https://x.net/", False)
+f = r["feeds"][0]
+check("the FILETIME epoch is 'never', not 1601-01-01", f["submitted"] is None)
+check("and it says so rather than leaving a bare null", "submitted_means" in f)
+check("CONTROL a real crawl date is still read", f["last_crawled"] == "2026-08-31")
+check("Bing's held url count is reported as BING's, not as the truth",
+      f["url_count_per_bing"] == 6127)
+
+print("\n11. submit: the guards run before the network, not after")
+bing.call = lambda method, key, **kw: {
+    "ok": True, "d": {"DailyQuota": 2, "MonthlyQuota": 3000}}
+sent = {}
+bing.post = lambda method, key, payload: (sent.update(payload) or {"ok": True, "d": None})
+
+r = bing.submit("k", "https://x.net/", ["https://x.net/a", "https://evil.example/b"], None, False)
+check("an off-site url is dropped before sending", r["on_site"] == 1)
+check("and named, so a typo is visible", r["off_site"] == ["https://evil.example/b"])
+check("no --yes means nothing was submitted", r["submitted"] is False and r["dry_run"] is True)
+check("and post() was never reached", sent == {})
+
+r = bing.submit("k", "https://x.net/", ["https://x.net/a", "https://x.net/b", "https://x.net/c"], None, True)
+check("a batch over the daily quota is refused", r["ok"] is False)
+check("and says so rather than truncating silently", r["error"] == "batch exceeds the daily quota")
+check("CONTROL the refusal did not send a partial batch", sent == {})
+
+r = bing.submit("k", "https://x.net/", ["https://x.net/a", "https://x.net/a"], None, True)
+check("CONTROL a within-quota batch DOES send", r["submitted"] is True)
+check("deduplicated on the way", sent["urlList"] == ["https://x.net/a"])
+check("and the receipt does not claim a crawl happened", "not a crawl confirmation" in r["note"])
+
 print()
 if FAILS:
     print(f"FAILED: {len(FAILS)} -> {FAILS}")
