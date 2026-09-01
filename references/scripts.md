@@ -168,6 +168,9 @@ python3 $SEO/vitals.py origin https://example.com             # CrUX field data 
 
 # run the test suites - NOT `pytest`, which collects from 1 of 18 files and exits 0
 python3 $SEO/run_tests.py                # 18 suites, JSON verdict, exit 1 on any failure
+# ⏱ ~1m35s on a 9p mount (~10s user, ~43s sys - it is process churn, not network).
+# `controls.py audit` is ~39s for the same reason. Neither has hung; do not run them
+# inside a 2-minute tool timeout together.
 python3 $SEO/run_tests.py --list         # what would run + what pytest would collect
 python3 $SEO/run_tests.py -k sitegraph   # one suite by substring
 python3 $SEO/run_tests.py control        # prove the runner can fail
