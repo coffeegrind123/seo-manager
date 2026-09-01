@@ -102,9 +102,18 @@ counts body links only, so every page that lives in the global nav scores zero �
 those are the most reachable pages you have. They are reported separately as
 `nav_hub_urls` with their true inbound count; read that field before treating one as a
 finding. Measured on combatskirmish.net 2026-09-01: of 27 zero-contextual pages, 6 were
-nav hubs carrying 3,978-12,070 inbound links each. The remaining 21 were the real
-finding — locale home pages (`/es`, `/tr`, …) reachable only through a language switcher
-present on 4% of pages, i.e. the entry point to 21 localized silos held up by furniture.
+nav hubs carrying 3,978-12,070 inbound links each. The remaining 21 were locale home
+pages (`/es`, `/tr`, …), and they turned out to be the SAME artefact one scope down: `/zh`
+is linked from **60 of the 60 pages in its own locale** by breadcrumb and logo, but a
+locale nav covers 1.5% of a 3,977-page site, so a site-wide frequency rule cannot see it.
+`Graph.section_roots()` catches furniture at section scale too, and the site's real orphan
+count is **zero**.
+
+⚠ That fix is deliberately narrow — it requires the target to be the PARENT PATH of the
+pages linking to it — because a share-based section rule would have hidden the island silo
+this tool exists to find: `/guides/bunny-hop` is linked from 16 of 17 guides, a 0.94 share,
+which is indistinguishable from a nav by frequency alone. Only the parent-path test
+separates them, and `test_sitegraph.py` case 8 holds both in one graph to prove it.
 
 **Success criteria**: `canonical-tag-audit`, `sitemap-audit` and `redirect-audit` have all run, plus the `sitegraph.py` link-graph audit, and each returned a read result rather than an error. `silos` was read for `islands` before `orphans` was believed.
 

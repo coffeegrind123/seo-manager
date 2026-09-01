@@ -15,6 +15,9 @@ distinction that silently produces a confident wrong answer. In order:
   5. zero extracted links must refuse a verdict, not report every page an orphan
   6. a page that IS the global nav hub is the most reachable page on the site, so
      counting it as a contextual orphan pads the number until it means nothing
+  7. a LOCALE home is furniture inside its own locale and invisible to a
+     site-wide frequency rule - and the fix for that must not be able to hide
+     the island silo, which has an almost identical share
 """
 import json
 import subprocess
@@ -210,6 +213,53 @@ check("the hub's real reachability is reported",
       any(r["url"] == "/hub" and r["all_inlinks"] == 80 for r in out["nav_hub_urls"]))
 check("the genuinely unlinked page IS still an orphan", "/lost" in out["orphan_urls"])
 check("orphan count excludes the hub", out["orphans"] == 1)
+
+print("\n8. section-scoped furniture, without hiding the island")
+# A locale: 60 pages under /zh, every one linking to /zh by breadcrumb, and /zh
+# linked editorially from nowhere. The real 2026-09-01 shape.
+pages = {f"/zh/p{i}": '<nav><a href="/zh">\u9996\u9875</a></nav><p>content</p>'
+         for i in range(60)}
+# The locale home links its own silo, so the children are not orphans and the
+# only page under test is /zh itself.
+pages["/zh"] = ("<p>the locale home</p>"
+                + "".join(f'<p><a href="/zh/p{i}">page {i}</a></p>' for i in range(60)))
+# ...and, in the SAME graph, the island: 17 guides that cross-link each other and
+# are reached from nowhere outside. 16/17 = 0.94 share, which is higher than the
+# locale nav's own threshold - so only the parent-path rule separates them.
+for i in range(17):
+    body = "".join(f'<p><a href="/guides/g{j}">guide {j}</a></p>'
+                   for j in range(17) if j != i)
+    pages[f"/guides/g{i}"] = body
+# Filler, and it is load-bearing rather than padding: the whole bug is that a
+# locale nav is a LARGE share of its section and a TINY share of the site. With
+# only the pages above, /zh's 60 linkers are 77% of the corpus and site_wide
+# sees it fine - the fixture has to be big enough for the blindness to exist.
+for i in range(250):
+    # They carry their own nav, like any real page - a page with NO outbound link
+    # at all is implausible, and graph_guard correctly refuses a verdict on it.
+    pages[f"/maps/m{i}"] = ('<nav><a href="/maps">Maps</a></nav>'
+                            f'<p><a href="/maps/m{(i + 1) % 250}">next map</a></p>')
+g = build(pages)
+
+roots = g.section_roots()
+check("the locale home is detected as section furniture", g._uid["/zh"] in roots)
+check("a cross-linked guide is NOT - it is not its linkers' parent",
+      g._uid["/guides/g0"] not in roots)
+check("site_wide alone could never have seen the locale nav",
+      g._uid["/zh"] not in g.site_wide(0.3))
+
+with tempfile.TemporaryDirectory() as td:
+    f = os.path.join(td, "g.json")
+    with open(f, "w", encoding="utf-8") as fh:
+        json.dump(g.to_json({"mode": "offline"}), fh)
+    A.graph = f
+    out = sg.cmd_orphans(A)
+check("the locale home is not reported as an orphan",
+      "/zh" not in out["orphan_urls"])
+check("it is listed for review with its real inbound count",
+      any(r["url"] == "/zh" and r["all_inlinks"] == 60 for r in out["nav_hub_urls"]))
+check("and the island guides are STILL not swallowed as furniture",
+      all(not r["url"].startswith("/guides/") for r in out["nav_hub_urls"]))
 
 print()
 if FAILS:

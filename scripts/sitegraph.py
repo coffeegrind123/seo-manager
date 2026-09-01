@@ -204,6 +204,47 @@ class Graph:
             self.anchors.append(text)
         return i
 
+    def section_roots(self, threshold: float = 0.5, min_pages: int = 10) -> set[int]:
+        """Targets that are the ROOT of a path section and are linked from most
+        of the pages beneath them - i.e. a section/locale nav.
+
+        `site_wide` cannot see these. A locale nav appears on 100% of that
+        locale's pages and on 1.5% of the site, so a site-wide frequency rule
+        never fires. Measured 2026-09-01 on combatskirmish.net: /zh was linked
+        from 60 of the 60 pages in its own locale, by a breadcrumb and a logo,
+        and every one of the 21 locale homes still reported ZERO contextual
+        inlinks - which reads as "the entry point to this language is orphaned"
+        when it is the single best-linked page in its own section.
+
+        ⚠ DELIBERATELY NARROW, and the narrowness is the point. It requires the
+        target to be the PARENT PATH of the pages linking to it, so it can never
+        suppress the island finding this tool was written for: /guides/bunny-hop
+        is linked from 16 of the 17 guides, but /guides is their parent and
+        bunny-hop is not, so the guides island stays visible. A pure
+        share-of-section rule would have hidden it at any threshold - 16/17 is
+        0.94, indistinguishable from a nav by frequency alone."""
+        roots: set[int] = set()
+        children: dict[int, list[int]] = defaultdict(list)
+        for uid, meta in self.meta.items():
+            if not meta.get("exists", True):
+                continue
+            u = self.urls[uid]
+            if u == "/":
+                continue
+            for cand, cmeta in self.meta.items():
+                if cand == uid or not cmeta.get("exists", True):
+                    continue
+                if self.urls[cand].startswith(u + "/"):
+                    children[uid].append(cand)
+        for uid, kids in children.items():
+            if len(kids) < min_pages:
+                continue
+            linkers = sum(1 for k in kids
+                          if any(dst == uid for dst, _a, _b in self.adj.get(k, [])))
+            if linkers / len(kids) > threshold:
+                roots.add(uid)
+        return roots
+
     def to_json(self, extra: dict) -> dict:
         return {
             "urls": self.urls,
@@ -612,6 +653,8 @@ def cmd_orphans(a) -> dict:
     if guard:
         return guard
     sw = g.site_wide(a.boiler_threshold)
+    # Furniture at TWO scales - see Graph.section_roots for why one is not enough.
+    furniture = sw | g.section_roots()
     inb = g.inbound(contextual_only=a.contextual, site_wide=sw)
     inb_all = g.inbound() if a.contextual else inb
     orphans, near, hubs = [], [], []
@@ -634,7 +677,7 @@ def cmd_orphans(a) -> dict:
         # 160-4166 inbound links. Zero were unreachable. They are still LISTED,
         # because a hub with no editorial link into it is worth seeing - just not
         # counted as an orphan.
-        if uid in sw:
+        if uid in furniture:
             hubs.append({"url": url, "contextual_inlinks": n,
                          "all_inlinks": len(inb_all.get(uid, []))})
         elif n == 0:
