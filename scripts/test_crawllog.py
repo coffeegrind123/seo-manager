@@ -132,6 +132,95 @@ except Exception as exc:
     failures.append(f"cli/refusal must print JSON: {exc} :: {p.stdout[:200]}")
 
 
+# --------------------------------------------------------------------------
+# The forged-hit subtraction, end to end through scan's own output shape.
+# Written because the DETECTION already existed and passed its tests for a
+# month while the report still published the contaminated rows: the gap was
+# never in detect_ua_spoofing, it was that nothing consumed its answer.
+# --------------------------------------------------------------------------
+rows = [
+    {"key": "grokbot", "bot": "GrokBot", "hits": 45, "_all_ips": {"1.1.1.1": 45}},
+    {"key": "googlebot", "bot": "Googlebot", "hits": 395,
+     "_all_ips": {"66.249.66.1": 300, "66.249.66.2": 95}},
+    {"key": "oai-searchbot", "bot": "OAI-SearchBot", "hits": 215,
+     "_all_ips": {"1.1.1.1": 91, "20.0.0.1": 124}},
+]
+crawllog.subtract_forged(rows, {"_flagged_ip_set": {"1.1.1.1"}})
+by = {r["bot"]: r for r in rows}
+check("spoof/a wholly forged bot nets to zero", by["GrokBot"]["hits_net"], 0)
+check("spoof/and is marked as never having visited",
+      by["GrokBot"]["all_hits_forged"], True)
+check("spoof/CONTROL a clean bot is untouched", by["Googlebot"]["hits_net"], 395)
+check("spoof/CONTROL a clean bot is not marked forged",
+      by["Googlebot"]["all_hits_forged"], False)
+check("spoof/a partly forged bot is reduced", by["OAI-SearchBot"]["hits_net"], 124)
+check("spoof/and is NOT marked as never having visited",
+      by["OAI-SearchBot"]["all_hits_forged"], False)
+check("spoof/forged_share is a ratio of the claim",
+      by["OAI-SearchBot"]["forged_share"], round(91 / 215, 3))
+# No flagged addresses at all must be a no-op, or every clean site would read
+# as if its crawlers were shrinking.
+crawllog.subtract_forged(rows, {})
+check("spoof/CONTROL an empty flagged set changes nothing",
+      by["Googlebot"]["hits_net"], 395)
+check("spoof/CONTROL an empty flagged set unmarks nothing",
+      by["GrokBot"]["hits_net"], 45)
+
+# --------------------------------------------------------------------------
+# `--bot` makes the spoof detector BLIND. Blind must not read as clean.
+# End to end through the CLI, because the guard lives inside cmd_scan and a
+# hand-built namespace would not exercise the code path that produces the JSON.
+# --------------------------------------------------------------------------
+def _line(ua, ip, uri="/maps/de_dust2", status=200):
+    return json.dumps({
+        "ts": 1788000000.0, "status": status, "size": 100, "duration": 0.01,
+        "request": {"method": "GET", "uri": uri, "host": "x.test",
+                    "client_ip": ip + ":1", "remote_ip": ip,
+                    "headers": {"User-Agent": [ua], "Cf-Connecting-Ip": [ip]}}})
+
+# One address claiming THREE operators is the forgery signature; a second,
+# clean bingbot address is the control that the subtraction is selective.
+scanner = "198.51.100.5"
+with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+    for _ in range(9):
+        fh.write(_line("Mozilla/5.0 (compatible; bingbot/2.0)", scanner) + "\n")
+    for _ in range(4):
+        fh.write(_line("Mozilla/5.0 (compatible; Googlebot/2.1)", scanner) + "\n")
+    for _ in range(3):
+        fh.write(_line("Mozilla/5.0 (compatible; YandexBot/3.0)", scanner) + "\n")
+    for _ in range(11):
+        fh.write(_line("Mozilla/5.0 (compatible; bingbot/2.0)", "40.77.0.9") + "\n")
+    log = fh.name
+
+def _scan(extra):
+    p = subprocess.run([sys.executable, os.path.join(HERE, "crawllog.py"), "scan",
+                        "-f", log] + extra, capture_output=True, text=True,
+                       timeout=120, stdin=subprocess.DEVNULL)
+    return json.loads(p.stdout)
+
+full = _scan([])
+bing_full = next(b for b in full["bots"] if b["key"] == "bingbot")
+check("blind/CONTROL unfiltered reports the subtraction as available",
+      full["spoof_subtraction_available"], True)
+check("blind/CONTROL unfiltered subtracts the scanner's hits",
+      bing_full["hits_net"], 11)
+check("blind/CONTROL unfiltered still reports the claimed total",
+      bing_full["hits"], 20)
+
+one = _scan(["--bot", "bingbot"])
+bing_one = next(b for b in one["bots"] if b["key"] == "bingbot")
+check("blind/--bot marks the subtraction unavailable",
+      one["spoof_subtraction_available"], False)
+check("blind/--bot refuses a net figure rather than echoing the claim",
+      bing_one["hits_net"], None)
+check("blind/--bot refuses a forged verdict too", bing_one["all_hits_forged"], None)
+check("blind/--bot still reports the claimed hits", bing_one["hits"], 20)
+check("blind/--bot says why it cannot answer",
+      one["ua_spoofing"].get("available"), False)
+if one["bot_hits_net"] is not None:
+    failures.append("blind/--bot must not publish a top-level net total")
+os.unlink(log)
+
 if failures:
     print("FAILED:")
     for f in failures:

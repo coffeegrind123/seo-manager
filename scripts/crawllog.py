@@ -201,6 +201,22 @@ BOTS = [
     # ordinary mobile visitor. Found by the fix above, not by a search for it.
     ("yandexmobilebot", "YandexMobileBot", "search",
      [".yandex.ru", ".yandex.net", ".yandex.com"]),
+    # Three more Yandex agents, found the same way on 2026-09-01: classify every
+    # distinct UA through classify_ua() and read what it could not name. None of
+    # them contains the substring "yandexbot", so all three sat in `other-bot`
+    # while the Yandex family was already the largest search crawler on the site
+    # (2,048 hits over 7 days, ahead of bingbot's 1,655 and 5x Googlebot's 395).
+    ("yandeximages", "YandexImages", "search",
+     [".yandex.ru", ".yandex.net", ".yandex.com"]),             # 5 hits
+    ("yandexfavicons", "YandexFavicons", "search",
+     [".yandex.ru", ".yandex.net", ".yandex.com"]),             # 3 hits
+    # `user_fetch`, not `search`: Yandex documents this agent as fetching on a
+    # PERSON's behalf (Browser/Turbo), so counting it as index demand would
+    # overstate crawl interest the same way Google-Read-Aloud would. Same rule
+    # as Google-CloudVertexBot above - an uncertain class goes to the bucket
+    # that does NOT flatter the number this program reads.
+    ("yandexuserproxy", "YandexUserproxy", "user_fetch",
+     [".yandex.ru", ".yandex.net", ".yandex.com"]),             # 3 hits
     # 55 hits. Fetches for Vertex AI grounding - NOT Google Search, and not
     # Google-Extended's training corpus either. Filed under ai_training on
     # purpose: that is the bucket which does NOT imply a citation, so a wrong
@@ -326,6 +342,10 @@ def detect_ua_spoofing(bots: list[dict], min_operators: int = 2) -> dict:
             })
     flagged.sort(key=lambda x: (-x["operator_count"], -x["hits"]))
     return {
+        # The DISPLAY list is truncated; the subtraction below must not be.
+        # Subtracting only the top 25 would understate forgery on exactly the
+        # log where it matters most - a scanner farm rotating many addresses.
+        "_flagged_ip_set": {f["ip"] for f in flagged},
         "flagged_ips": flagged[:25],
         "flagged_ip_count": len(flagged),
         "spoofed_hits": sum(f["hits"] for f in flagged),
@@ -373,6 +393,35 @@ def classify_ua(ua: str):
     if "bot" in low or "crawler" in low or "spider" in low or "http" in low:
         return "other-bot", "other-bot", "unknown"
     return None, None, None
+
+
+def subtract_forged(bots: list[dict], spoofing: dict) -> None:
+    """Net every per-bot row against the addresses the spoof detector flagged.
+
+    The detector already existed and already named the addresses. What did not
+    exist was any code that ACTED on them: the report published the contaminated
+    per-bot rows and asked the reader, in prose, to do the arithmetic. Nobody
+    does the arithmetic - `references/prior-art.md` recorded "GrokBot, an answer
+    engine the GEO report had never counted" as a discovery, and measured on
+    2026-09-01 all 45 of those hits came from ONE already-flagged scanner IP at a
+    100% 404 rate against `/.env.vault` and `/@fs/..%252f../.aws/credentials`.
+    Nine bots were 100% forged, including every Anthropic and Perplexity-user
+    row, and the `ai_search` category was 365 claimed against ~128 real.
+
+    A warning that has to be applied by hand is not a control. This makes it
+    structural: `hits` stays as CLAIMED so nothing silently changes meaning, and
+    `hits_net` is what the program should read.
+    """
+    flagged = spoofing.get("_flagged_ip_set") or set()
+    for b in bots:
+        forged = sum(h for ip, h in (b.get("_all_ips") or {}).items() if ip in flagged)
+        b["forged_hits"] = forged
+        b["hits_net"] = b["hits"] - forged
+        b["forged_share"] = round(forged / b["hits"], 3) if b["hits"] else 0.0
+        # Called out separately because "this crawler never visited" and "this
+        # crawler visited less than claimed" are different findings, and only
+        # the first one invalidates a conclusion drawn from the row.
+        b["all_hits_forged"] = bool(b["hits"]) and forged == b["hits"]
 
 
 def run_control() -> dict:
@@ -466,10 +515,25 @@ def run_control() -> dict:
     c.check("yandex_mobile_is_not_swallowed_by_yandexbot_or_the_render_bot",
             classify_ua("Mozilla/5.0 (iPhone) Safari/604.1 (compatible; YandexMobileBot/3.0; "
                         "+http://yandex.com/bots)")[0] == "yandexmobilebot")
-    c.check("the_three_yandex_crawlers_are_three_rows_not_one",
-            len({classify_ua("(compatible; YandexBot/3.0)")[0],
-                 classify_ua("(compatible; YandexMobileBot/3.0)")[0],
-                 classify_ua("(compatible; YandexRenderResourcesBot/1.0)")[0]}) == 3)
+    # Derived from BOTS, not from a snapshot of it. The same fixture written as a
+    # hand-listed roster is what made ADDING an answer engine read as a
+    # regression in test_agentcheck.py: a taxonomy meant to grow must not have
+    # its growth reported as a defect. So the rule is "every Yandex agent in the
+    # table is its OWN row", checked against whatever the table currently holds.
+    _yx = [k for k, _l, _c, _v in BOTS if k.startswith("yandex")]
+    c.check("every_yandex_agent_is_its_own_row_not_swallowed_by_yandexbot",
+            len(_yx) >= 3 and len({classify_ua("(compatible; %s/1.0)" % k)[0]
+                                   for k in _yx}) == len(_yx),
+            "the family is the largest search crawler on this site; collapsing it "
+            "onto one row hides where the errors are")
+    c.check("CONTROL_a_yandex_agent_not_in_the_table_falls_through_to_other_bot",
+            classify_ua("(compatible; YandexZzzNotReal/1.0; +http://yandex.com/bots)")[0]
+            == "other-bot",
+            "otherwise the prefix check above would pass by matching everything")
+    c.check("yandex_userproxy_is_user_fetch_not_search",
+            classify_ua("Mozilla/5.0 (compatible; YandexUserproxy; robot; "
+                        "+http://yandex.com/bots)")[2] == "user_fetch",
+            "a fetch made for a person is not index demand")
     c.check("vertex_is_not_counted_as_a_citing_engine",
             classify_ua("Mozilla/5.0 (compatible; Google-CloudVertexBot; +https://cloud.google"
                         ".com/vertex-ai-bot)")[2] == "ai_training",
@@ -495,6 +559,39 @@ def run_control() -> dict:
     c.check("spoofed_hits_are_counted_for_subtraction",
             detect_ua_spoofing(forged)["spoofed_hits"] == 91,
             str(detect_ua_spoofing(forged)["spoofed_hits"]))
+
+    # The subtraction is now STRUCTURAL, so it needs its own controls in both
+    # directions. Counting the forgery and acting on it are different things,
+    # and the gap between them is what published a scanner as an answer engine.
+    _sub = [{"key": "gptbot", "bot": "GPTBot", "hits": 9,
+             "_all_ips": {"9.9.9.9": 9}},
+            {"key": "googlebot", "bot": "Googlebot", "hits": 50,
+             "_all_ips": {"66.249.66.1": 50}},
+            {"key": "bingbot", "bot": "bingbot", "hits": 12,
+             "_all_ips": {"9.9.9.9": 4, "40.77.0.1": 8}}]
+    _spoof = {"_flagged_ip_set": {"9.9.9.9"}}
+    subtract_forged(_sub, _spoof)
+    _by = {b["bot"]: b for b in _sub}
+    c.check("a_bot_seen_only_from_a_flagged_ip_nets_to_zero",
+            _by["GPTBot"]["hits_net"] == 0 and _by["GPTBot"]["all_hits_forged"] is True,
+            "this is the GrokBot case: 45 claimed hits, one scanner address, "
+            "zero real visits - and it was published as a discovery")
+    c.check("CONTROL_a_bot_from_clean_addresses_is_untouched",
+            _by["Googlebot"]["hits_net"] == 50
+            and _by["Googlebot"]["forged_hits"] == 0
+            and _by["Googlebot"]["all_hits_forged"] is False,
+            "if the subtraction shrank everything it would prove nothing")
+    c.check("a_partly_forged_bot_is_reduced_not_erased",
+            _by["bingbot"]["hits_net"] == 8 and _by["bingbot"]["all_hits_forged"] is False,
+            "partial contamination must not read the same as a bot that never came")
+    # The display list is capped at 25; the subtraction must use the full set.
+    _many = [{"key": "gptbot", "bot": "GPTBot", "hits": 5,
+              "_all_ips": {"10.0.0.99": 5}}]
+    subtract_forged(_many, {"_flagged_ip_set": {"10.0.0.%d" % i for i in range(1, 120)}})
+    c.check("subtraction_uses_the_whole_flagged_set_not_the_truncated_display_list",
+            _many[0]["hits_net"] == 0,
+            "a scanner farm rotating >25 addresses is exactly the case where "
+            "reading the truncated list would understate the forgery")
     c.check("operator_lookup_resolves", operator_of("googlebot") == operator_of("googlebot-image")
             and operator_of("googlebot") is not None)
     return c.verdict(bots_in_registry=len(BOTS))
@@ -883,10 +980,43 @@ def cmd_scan(a):
             "daily": dict(sorted(b["days"].items())),
         })
 
-    by_cat = defaultdict(lambda: {"hits": 0, "bots": []})
+    # ⚠ `--bot` makes the spoof detector BLIND, and blind must not read as clean.
+    # The detector's whole signal is one address presenting as two or more
+    # different companies; filtering the log to a single operator removes every
+    # other claim from that address, so nothing can ever be flagged. Measured
+    # 2026-09-01: unfiltered, bingbot was 1,655 claimed / 1,596 net; the same
+    # window with `--bot bingbot` reported 1,658 / 1,658 - a confident "no
+    # forgery" produced entirely by the filter. Same rule as `no_key` never
+    # meaning `not_cited`: cannot-ask is not the answer no.
+    blind = bool(only)
+    spoofing = detect_ua_spoofing(out_bots)
+    subtract_forged(out_bots, spoofing)
+    if blind:
+        for b in out_bots:
+            b["hits_net"] = None
+            b["forged_hits"] = None
+            b["forged_share"] = None
+            b["all_hits_forged"] = None
+        spoofing = {
+            "available": False,
+            "reason": ("--bot filters the log to one operator, and the detector needs "
+                       "every crawler claimed by an address to tell a scanner from a "
+                       "crawler. Re-run WITHOUT --bot for a spoof verdict."),
+        }
+    net_bot_hits = (total_bot_hits if blind
+                    else sum(b["hits_net"] for b in out_bots))
+    # Ordered by REAL hits. A row that is 100% forged sinks to the bottom, which
+    # is where a crawler that never visited belongs; ordering by the claimed
+    # number puts a scanner above genuine crawl demand.
+    out_bots.sort(key=lambda b: (-(b["hits_net"] if b["hits_net"] is not None else b["hits"]),
+                                 -b["hits"]))
+
+    by_cat = defaultdict(lambda: {"hits": 0, "hits_net": 0, "forged_hits": 0, "bots": []})
     for b in out_bots:
         c = by_cat[b["category"]]
         c["hits"] += b["hits"]
+        c["hits_net"] += 0 if blind else b["hits_net"]
+        c["forged_hits"] += 0 if blind else b["forged_hits"]
         c["bots"].append(b["bot"])
 
     cats = {}
@@ -894,7 +1024,11 @@ def cmd_scan(a):
         if c in by_cat:
             cats[c] = {
                 "hits": by_cat[c]["hits"],
-                "share_of_bot_traffic": round(by_cat[c]["hits"] / total_bot_hits, 3) if total_bot_hits else 0,
+                "hits_net": None if blind else by_cat[c]["hits_net"],
+                "forged_hits": None if blind else by_cat[c]["forged_hits"],
+                # Shares are computed on the NET totals on both sides of the
+                # division: a share of a contaminated whole is not a share.
+                "share_of_bot_traffic": round(by_cat[c]["hits_net"] / net_bot_hits, 3) if net_bot_hits else 0,
                 "bots": by_cat[c]["bots"],
             }
 
@@ -908,7 +1042,10 @@ def cmd_scan(a):
     if unnamed:
         unnamed_block = {
             "hits": unnamed["hits"],
-            "share_of_bot_traffic": round(unnamed["hits"] / total_bot_hits, 3) if total_bot_hits else 0,
+            "hits_net": unnamed["hits_net"],
+            "forged_hits": unnamed["forged_hits"],
+            "spoof_subtraction_available": not blind,
+            "share_of_bot_traffic": round(unnamed["hits_net"] / net_bot_hits, 3) if net_bot_hits else 0,
             "distinct_ips": unnamed["distinct_ips"],
             "error_rate": unnamed["error_rate"],
             "top_user_agents": unnamed["user_agents"],
@@ -923,7 +1060,7 @@ def cmd_scan(a):
                 "suffix, because a guessed suffix reports every legitimate hit as spoofed."),
         }
 
-    spoofing = detect_ua_spoofing(out_bots)
+    spoofing.pop("_flagged_ip_set", None)   # internal only
     for b in out_bots:
         b.pop("_all_ips", None)     # internal only - never part of the payload
 
@@ -938,7 +1075,12 @@ def cmd_scan(a):
         "silo_depth": depth,
         "human_hits": human_hits,
         "bot_hits": total_bot_hits,
-        "bot_share": round(total_bot_hits / (total_bot_hits + human_hits), 3) if (total_bot_hits + human_hits) else 0,
+        "bot_hits_net": None if blind else net_bot_hits,
+        "forged_hits": None if blind else total_bot_hits - net_bot_hits,
+        "bots_entirely_forged": (None if blind
+                                 else [b["bot"] for b in out_bots if b["all_hits_forged"]]),
+        "spoof_subtraction_available": not blind,
+        "bot_share": round(net_bot_hits / (net_bot_hits + human_hits), 3) if (net_bot_hits + human_hits) else 0,
         "by_category": cats,
         "unnamed_bots": unnamed_block,
         "self_hits": sum(b["hits"] for b in out_bots if b["category"] == "self"),
@@ -952,6 +1094,12 @@ def cmd_scan(a):
             "ai_user": "a live fetch because a person asked. The strongest answer-engine signal there is.",
             "seo_tool": "extracts your content as competitor data. Indexes nothing, sends nothing.",
             "unverified": "every count here is UA-claimed. Run `crawllog.py verify` before trusting a search-bot number.",
+            "hits_vs_hits_net": (
+                "`hits` is what the user-agent CLAIMED. `hits_net` subtracts every hit "
+                "from an address the spoof detector flagged, and is the number to read. "
+                "`bots_entirely_forged` lists crawlers that did not visit at all - a row "
+                "there invalidates any conclusion drawn from that bot, it does not merely "
+                "shrink it."),
         },
     }, indent=2, ensure_ascii=False))
 
@@ -1266,6 +1414,8 @@ def cmd_urls(a):
     if a.remote:
         src = Path(__file__).read_text()
         args = ["urls", "--bot", a.bot]
+        if getattr(a, "keep_query", False):
+            args += ["--keep-query"]
         for g in a.glob or []:
             args += ["--glob", g]
         for f in a.file or []:
@@ -1317,7 +1467,7 @@ def cmd_urls(a):
                 continue
             if status_filter and rec["status"] not in status_filter:
                 continue
-            counts[rec["uri"].split("?", 1)[0]] += 1
+            counts[rec["uri"] if a.keep_query else rec["uri"].split("?", 1)[0]] += 1
     for uri, n in counts.most_common():
         print(f"{n}\t{uri}")
 
@@ -1367,6 +1517,13 @@ def cmd_gap2(a):
         "never_crawled_count": len(never),
         "never_crawled_sample": never[: a.top],
         "crawled_but_not_in_sitemap": [{"hits": n, "path": p} for n, p in not_in_sitemap],
+        "crawled_but_not_in_sitemap_note": (
+            "each `path` aggregates EVERY query-string variant of it - sitemap <loc> "
+            "entries carry no query, so the comparison has to be path-to-path. A large "
+            "count on one path may be one URL fetched often OR thousands of parameterised "
+            "URLs, and those have opposite fixes. Re-run `urls --keep-query` before "
+            "reading it as a budget figure. Measured 2026-09-01: `/play 506` was 503 "
+            "`/play?connect=` variants and 3 bare fetches."),
         "most_crawled_in_sitemap": [{"hits": n, "url": u} for n, u in hit[: a.top]],
         "reading": "never_crawled = the sitemap promises a page the bot has not fetched in this window; "
                    "at scale that is a crawl-budget problem, not an indexing one. "
@@ -1418,6 +1575,15 @@ def main():
     add_input_args(s)
     s.add_argument("--bot", required=True)
     s.add_argument("--status", help="only these statuses, e.g. '200' or '4xx,5xx'")
+    # OFF by default because `gap` compares against sitemap <loc> paths, which
+    # carry no query - stripping is correct THERE. It is not correct when you
+    # are reading the hit counts as a budget figure: measured 2026-09-01, `gap`
+    # reported `/play  506` for bingbot and 503 of those were `/play?connect=`
+    # variants, blocked by a robots.txt rule that had shipped that same day. One
+    # collapsed row supported two opposite conclusions and the output could not
+    # tell them apart. Re-run with this flag before believing a single-path total.
+    s.add_argument("--keep-query", action="store_true",
+                   help="count URLs WITH their query string (default: strip it)")
     s.set_defaults(fn=cmd_urls)
 
     s = sub.add_parser("gap", help="sitemap vs what was actually crawled")
