@@ -188,6 +188,7 @@ The six you touch in almost every run:
 | `serp.py` | live SERPs through the provider ladder, plus the weakness/authority scoring the gate needs |
 | `keywords.py` | expansion across six independent suggestion corpora, with a cross-engine agreement signal |
 | `sameness.py` | the corpus sameness gate + a pairwise drift audit |
+| `remeasure.py` | did the change work? Hypotheses with pre-registered directions, re-checked by re-running the same command |
 | `brief.py` | a build brief assembled from measurements — and a hard refusal when page 1 could not be read |
 | `vitals.py` | whole-site Core Web Vitals sampled per TEMPLATE, keyless — and a network baseline, because the first version blamed the site for the container's DNS |
 | `sitegraph.py` | the internal link graph, offline or live — orphans, click depth, broken links, and the ISLAND silos that look well-linked and are reachable from nowhere |

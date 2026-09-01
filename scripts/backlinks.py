@@ -167,8 +167,12 @@ SPAM_PORTS = {"2052", "2053", "2082", "2083", "2086", "2087", "2095", "2096",
 THROWAWAY_SUFFIXES = (".workers.dev", ".pages.dev", ".herokuapp.com", ".vercel.app")
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from controls import Controls  # noqa: E402
+# ⚠ `controls` IS IMPORTED LAZILY, INSIDE run_control() - NOT HERE.
+# This module SHIPS ITS OWN SOURCE to a remote host over stdin for `--remote`
+# runs, and that remote python has no sibling files. A module-level
+# `from controls import ...` dies there with ModuleNotFoundError, and the
+# failure surfaces as "remote scan failed" - which reads as an SSH, glob or log
+# problem and sends you to the wrong system. Broke exactly that way 2026-09-01.
 
 
 def _registrable(host: str) -> str:
@@ -213,6 +217,9 @@ def run_control() -> dict:
     referrer spam on a cPanel port. A classifier that called everything
     `genuine` would have reported 52 backlinks - a 4x overcount of the single
     number this instrument exists to produce."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from controls import Controls          # noqa: PLC0415 - see the
+    # note at the top: a module-level import breaks the --remote path.
     c = Controls("backlinks-control")
     own = {"example.com", "example.net"}
 
