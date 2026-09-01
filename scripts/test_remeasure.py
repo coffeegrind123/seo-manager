@@ -58,6 +58,26 @@ def main() -> int:
           "crawllog's top_silos omits a silo the bot never touched, and that "
           "absence IS the finding")
     check("but only by opting in", R.dig({"a": {}}, "a.b")[0] is None)
+    # Addressing a list element by identity rather than position. A positional
+    # index into a value-sorted list re-points itself between runs, so the verdict
+    # would compare two different bots and call the difference a change.
+    _bots = {"bots": [{"key": "bingbot", "hits": 20, "top_silos": {"/play": 502}},
+                      {"key": "googlebot", "hits": 5}]}
+    check("a list element is addressable by its key",
+          R.dig(_bots, "bots.bingbot.top_silos./play") == (502, None))
+    check("CONTROL a positional index still works",
+          R.dig(_bots, "bots.0.hits") == (20, None))
+    check("CONTROL identity addressing picks the RIGHT element",
+          R.dig(_bots, "bots.googlebot.hits") == (5, None))
+    check("a name matching nothing is an error, not a zero",
+          R.dig(_bots, "bots.nosuchbot.hits")[0] is None)
+    check("and not a zero even when missing_is_zero is on",
+          R.dig(_bots, "bots.nosuchbot.hits", missing_is_zero=True)[0] is None,
+          "missing_is_zero is for a sparse MAP; a named row that does not exist is a broken metric")
+    check("an ambiguous name is refused rather than guessed",
+          R.dig({"bots": [{"key": "x", "hits": 1}, {"key": "x", "hits": 2}]},
+                "bots.x.hits")[0] is None)
+
 
     print("\nquoting: a stored command is round-tripped through a string:")
     check("a quoted argument survives",

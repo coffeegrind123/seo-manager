@@ -120,10 +120,27 @@ def dig(obj, path: str, missing_is_zero: bool = False):
                 return None, f"no key {part!r} at {path!r}"
             cur = cur[part]
         elif isinstance(cur, list):
-            try:
-                cur = cur[int(part)]
-            except (ValueError, IndexError):
-                return None, f"no index {part!r} at {path!r}"
+            # A positional index into a list that is SORTED BY VALUE is a
+            # measurement that silently re-points itself: `bots.0` was bingbot
+            # today and is whatever ranks first at re-check time, so the verdict
+            # compares two different bots and calls it a change. So a non-numeric
+            # segment addresses the element whose own identity field matches it -
+            # which is also what this script's own --help has always documented
+            # (`bots.bingbot.hits`) and what it did not implement until
+            # 2026-09-01, refusing the documented example as "no index".
+            if part.isdigit() or (part[:1] == "-" and part[1:].isdigit()):
+                try:
+                    cur = cur[int(part)]
+                except IndexError:
+                    return None, f"no index {part!r} at {path!r}"
+            else:
+                match = [el for el in cur if isinstance(el, dict) and any(
+                    str(el.get(f, "")).lower() == part.lower()
+                    for f in ("key", "id", "name", "bot", "slug"))]
+                if len(match) != 1:
+                    return None, (f"{part!r} matches {len(match)} elements at {path!r} - "
+                                  "a metric must name exactly one")
+                cur = match[0]
         else:
             return None, f"cannot descend into {type(cur).__name__} at {part!r}"
     if isinstance(cur, bool) or not isinstance(cur, (int, float)):
