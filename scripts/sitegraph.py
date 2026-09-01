@@ -701,6 +701,75 @@ def cmd_orphans(a) -> dict:
                      "counted as orphans.")}
 
 
+def cmd_canonicals(a) -> dict:
+    """Does every page's canonical name a URL this tree actually serves?
+
+    A canonical pointing at a URL that 404s makes the page UNINDEXABLE, and it is
+    invisible in every per-page review because both halves look fine on their own.
+    It has really shipped here: this repo generates on a case-INSENSITIVE 9p mount
+    and production is case-SENSITIVE, so `cs_Assault` and `cs_assault` wrote to one
+    file, the survivor carried the OTHER name's canonical, and both halves of 19
+    pairs pointed at a dead URL while sitting in the sitemap.
+
+    Offline, against the built tree, so it is answerable BEFORE the deploy that
+    would ship it - the same reason the crawler has an offline mode at all.
+
+    Three findings, deliberately separate because the fixes differ:
+      missing      no canonical at all - the page is at the mercy of the engine's
+                   own consolidation
+      dangling     the canonical names a URL not in this graph. On an offline run
+                   that is a strong finding; on a LIVE crawl it may simply be a
+                   page the crawl did not reach, so it is labelled, not asserted
+      non_self     the canonical names a DIFFERENT page in the tree. Often correct
+                   and deliberate (a paginated set, a variant), which is exactly
+                   why it is reported apart from the two that are usually bugs
+    """
+    g, d = load(a.graph)
+    guard = graph_guard(g, d)
+    if guard:
+        return guard
+    known = {g.urls[u].rstrip("/") or "/"
+             for u, m in g.meta.items() if m.get("exists", True)}
+    missing, dangling, non_self = [], [], []
+    for uid, meta in g.meta.items():
+        if not meta.get("exists", True):
+            continue
+        url = g.urls[uid]
+        if a.ignore and re.search(a.ignore, url):
+            continue
+        c = (meta.get("canonical") or "").strip()
+        if not c:
+            missing.append(url)
+            continue
+        cn = c.rstrip("/") or "/"
+        if cn == (url.rstrip("/") or "/"):
+            continue
+        if cn in known:
+            non_self.append({"url": url, "canonical": c})
+        else:
+            dangling.append({"url": url, "canonical": c})
+    live = d.get("mode") == "live"
+    return {
+        "ok": True, "mode": d.get("mode"), "pages": len(known),
+        "missing_canonical": len(missing),
+        "dangling_canonical": len(dangling),
+        "non_self_canonical": len(non_self),
+        "missing_urls": sorted(missing)[: a.limit],
+        "dangling_urls": dangling[: a.limit],
+        "non_self_urls": non_self[: a.limit],
+        "reading": (
+            "`dangling` is the one that costs you a page: a canonical naming a URL "
+            "that does not exist makes the page unindexable while every per-page "
+            "check still passes. `non_self` is frequently CORRECT and deliberate - "
+            "read it, do not fix it on sight."
+            + (" ⚠ This was a LIVE crawl, so a dangling canonical may just be a page "
+               "the crawl never reached. Re-run offline against the built tree before "
+               "treating any of these as a defect." if live else
+               " This was an OFFLINE run over the built tree, so the URL set is "
+               "complete and a dangling canonical is a real finding.")),
+    }
+
+
 def cmd_silos(a) -> dict:
     """The report that surfaces the problem without being asked. Group pages by
     silo and show the inlink distribution; a silo whose median inbound link count
@@ -928,7 +997,8 @@ def main() -> None:
 
     for name, fn, extra in (("inlinks", cmd_inlinks, "url"), ("orphans", cmd_orphans, None),
                             ("silos", cmd_silos, None), ("depth", cmd_depth, None),
-                            ("broken", cmd_broken, None), ("report", cmd_report, None)):
+                            ("broken", cmd_broken, None), ("report", cmd_report, None),
+                            ("canonicals", cmd_canonicals, None)):
         p = sub.add_parser(name)
         p.add_argument("--graph", required=True)
         p.add_argument("--limit", type=int, default=25)
@@ -950,7 +1020,7 @@ def main() -> None:
         if name == "depth":
             p.add_argument("--start", default="/")
             p.add_argument("--max-depth", type=int, default=4)
-        if name == "broken":
+        if name in ("broken", "canonicals"):
             p.add_argument("--ignore", help="regex of known-dynamic routes to skip")
         p.set_defaults(fn=fn)
 

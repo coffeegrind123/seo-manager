@@ -261,6 +261,53 @@ check("it is listed for review with its real inbound count",
 check("and the island guides are STILL not swallowed as furniture",
       all(not r["url"].startswith("/guides/") for r in out["nav_hub_urls"]))
 
+print("\n9. canonicals: the one that makes a page unindexable")
+# The real 2026-07-17 shape: a case-collision left /maps/cs_assault carrying
+# /maps/cs_Assault's canonical, and that URL does not exist. Both halves look
+# fine in isolation, which is why only a tree-wide check finds it.
+pages = {
+    "/maps/a": '<link rel="canonical" href="/maps/a"><a href="/maps/b">b</a>',
+    "/maps/b": '<link rel="canonical" href="/maps/Nope"><a href="/maps/a">a</a>',
+    "/maps/c": '<link rel="canonical" href="/maps/a"><a href="/maps/a">a</a>',
+    "/maps/d": '<a href="/maps/a">a</a>',
+}
+g = sg.Graph()
+for url, html in pages.items():
+    pp = sg.parse(html)
+    src = g.uid(url)
+    g.meta[src] = {"exists": True, "words": pp.words, "title": pp.title,
+                   "canonical": sg.norm(pp.canonical) if pp.canonical else ""}
+    for href, anchor, boiler in pp.links:
+        g.adj[src].append((g.uid(sg.norm(href)), g.aid(anchor), boiler))
+
+
+class AC:
+    graph = None
+    limit = 50
+    ignore = None
+    boiler_threshold = 0.3
+
+
+with tempfile.TemporaryDirectory() as td:
+    f = os.path.join(td, "g.json")
+    with open(f, "w", encoding="utf-8") as fh:
+        json.dump(g.to_json({"mode": "offline"}), fh)
+    AC.graph = f
+    out = sg.cmd_canonicals(AC)
+
+check("a canonical naming a non-existent URL is DANGLING",
+      out["dangling_canonical"] == 1
+      and out["dangling_urls"][0]["url"] == "/maps/b")
+check("a canonical naming another REAL page is non_self, not dangling",
+      out["non_self_canonical"] == 1 and out["dangling_canonical"] == 1)
+check("a page with no canonical is reported separately",
+      out["missing_canonical"] == 1 and "/maps/d" in out["missing_urls"])
+check("a correct self-canonical is not reported at all",
+      "/maps/a" not in out["missing_urls"]
+      and all(r["url"] != "/maps/a" for r in out["dangling_urls"] + out["non_self_urls"]))
+check("an offline run says the URL set is complete",
+      "OFFLINE" in out["reading"])
+
 print()
 if FAILS:
     print(f"FAILED: {len(FAILS)} -> {FAILS}")

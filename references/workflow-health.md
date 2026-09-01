@@ -81,8 +81,18 @@ and does ~4,000 pages in about 30 seconds:
 
 ```bash
 python3 $SEO/sitegraph.py crawl --root <content-dir>=/ --out .seo/graph/site.json
-python3 $SEO/sitegraph.py silos --graph .seo/graph/site.json     # read this FIRST
+python3 $SEO/sitegraph.py silos --graph .seo/graph/site.json       # read this FIRST
+python3 $SEO/sitegraph.py canonicals --graph .seo/graph/site.json  # then this
 ```
+
+⚠ **Run `canonicals` on the built tree, before the deploy.** A canonical naming a
+URL that 404s makes the page **unindexable**, and nothing about either half looks
+wrong on its own — which is why it shipped here once already: the repo generates on
+a case-INSENSITIVE mount and production is case-SENSITIVE, so `cs_Assault` and
+`cs_assault` wrote to one file, the survivor carried the other name's canonical, and
+both halves of 19 pairs pointed at a dead URL from inside the sitemap. Offline is the
+whole point — a live crawl cannot tell a dangling canonical from a page it simply did
+not reach, and the tool says so in its own output rather than letting you assume.
 
 ⚠ **Read `external_silo_median` and `islands`, not `inlinks_median`.** A silo whose
 pages cross-link each other has healthy-looking inbound counts on every page and is
