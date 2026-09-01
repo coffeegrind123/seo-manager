@@ -119,6 +119,50 @@ python3 $SEO/seostate.py propose --type fix --title "..." --source international
 
 ---
 
+## 3b. Ask which locale actually EARNS, and what it earns for
+
+The mesh being correct says nothing about whether a locale is worth having, and
+the answer is routinely not the one the English-speaking team expects. Do this
+before any decision to cut, translate, or expand a locale.
+
+```bash
+python3 $SEO/bing.py pages --limit 60          # per-URL clicks/CTR - sorted by CLICKS
+python3 $SEO/bing.py pagequeries --page 'https://example.com/zh/'   # what that page earns for
+python3 $SEO/bing.py expand --seed '<the locale's own head term>' \
+        --country cn --language zh-CN --limit 200                   # the demand around it
+```
+
+Then diff the demand against what the page already ranks for. That is the gap,
+and it is stated in impressions rather than intuition.
+
+**Measured on combatskirmish.net, 2026-09-01, and every step of it was a
+surprise to the people who built the site:**
+
+- `/zh/` earned **2,298 of the site's 3,357 Bing clicks — 68%** — at a 27% CTR
+  from position 4, against the English homepage's 2.1% from four times the
+  impressions. The site's own access log agreed independently: `cn.bing.com`
+  sent 1,988 referrals against google.com's 495.
+- The phrase driving it, **网页版** ("web version", 20,770 impressions), appeared
+  **nowhere on the page**. It ranked #2 on relevance alone.
+- The gap came to ~14,000 impressions of Chinese demand with no presence at all.
+
+⚠ **Two disciplines this needs, both of which changed the answer here.**
+
+**Strip brand and competitor terms before summing a gap.** A competitor's own
+brand (`webcs.xyz`, 21,178 impressions) is demand you cannot serve, and leaving
+it in inflates the opportunity by more than the opportunity.
+
+**Check that the phrase is TRUE before targeting it.** 中文版 ("Chinese version")
+was worth another ~4,700 impressions and was rejected: the page is in Chinese but
+the game is not localised — no `game_langs`, no `zh_CN` strings in the client — so
+the phrase would promise a build that does not exist. A keyword gap is a reason to
+check a claim, never a reason to make one.
+
+And when the winning page is that large a share of the site's traffic, changes to
+it are **additive** — keep every token that is already there. There is no A/B here.
+
+---
+
 ## 4. Report
 
 - Locales declared vs locales actually reachable.
