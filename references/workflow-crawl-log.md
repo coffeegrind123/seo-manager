@@ -184,8 +184,12 @@ character 155 of an otherwise ordinary iPhone Safari UA, so 482 hits — the
 largest unnamed crawler on the site — were filed under a key that read as a
 mobile visitor, with several distinct crawlers collapsed onto it. The key now
 keeps both ends. Naming the bots that fix revealed moved **57% of the unknown
-bucket** into correctly categorised rows in one pass, including an `ai_search`
-engine (`GrokBot`) the GEO report had never counted.
+bucket** into correctly categorised rows in one pass.
+
+⚠ One of those rows, `GrokBot`, was written up here as an `ai_search` engine the
+GEO report had never counted. Re-measured with the forged-hit subtraction below,
+it is **45 claimed hits and zero real ones** — a scanner wearing the name. Read
+`hits_net`, never `hits`.
 
 **The three OpenAI agents are not interchangeable and conflating them is the
 most common mistake in this area.** `GPTBot` trains. `OAI-SearchBot` builds the
@@ -255,8 +259,61 @@ crawl total.
 an IP presenting as crawlers belonging to **two or more different companies**.
 No address is legitimately Anthropic's crawler *and* OpenAI's *and* Perplexity's.
 
-**Read it BEFORE the `by_category` totals**, because that is precisely what it
-corrupts. Measured on a live site 2026-08-01:
+**It is now SUBTRACTED for you — read `hits_net`, not `hits`.** Until 2026-09-01
+this block only *warned*; the per-bot and per-category rows printed beside it
+were the contaminated ones, and the instruction to do the arithmetic was prose in
+a JSON field. Nobody did the arithmetic, including this skill's own roadmap
+document, which wrote up a scanner as a newly-discovered answer engine. Every row
+now carries four fields:
+
+| field | means |
+|---|---|
+| `hits` | what the user-agent CLAIMED. Unchanged, so no old reading silently shifts |
+| `hits_net` | hits from addresses the detector did **not** flag. **This is the number to read** |
+| `forged_share` | `forged_hits / hits` |
+| `all_hits_forged` | the crawler never visited at all — this **invalidates** any conclusion drawn from the row, rather than merely shrinking it |
+
+`by_category` carries `hits`/`hits_net`/`forged_hits`, and its
+`share_of_bot_traffic` is netted on **both** sides of the division — a share of a
+contaminated whole is not a share. Rows sort by `hits_net`, so a scanner cannot
+outrank real crawl demand. The top level adds `bot_hits_net` and
+`bots_entirely_forged`.
+
+Measured on combatskirmish.net over 7 days / 1,485,860 lines, 2026-09-01:
+
+| category | claimed | real | forged |
+|---|---|---|---|
+| `ai_search` | 365 | **128** | 65% |
+| `ai_user` | 293 | **112** | 62% |
+| `social` | 179 | **15** | 92% |
+| `search` | 6,296 | 5,929 | 6% |
+
+Twelve bots were entirely forged, every Anthropic row among them — so "Claude
+does not cite us" had a simpler explanation than anything in the content:
+Claude's crawlers had not fetched the site at all.
+
+⚠⚠ **`--bot` turns the detector OFF, and until 2026-09-01 that read as clean.**
+The signal is one address presenting as two or more different companies, so
+filtering the log to a single operator removes every other claim from that
+address and nothing can ever be flagged. Measured: unfiltered, bingbot was
+**1,655 claimed / 1,596 net**; the same window with `--bot bingbot` reported
+**1,658 / 1,658** — a confident "no forgery" produced entirely by the filter.
+A `--bot` run now sets `hits_net`, `forged_hits`, `forged_share` and
+`all_hits_forged` to **null**, and `spoof_subtraction_available: false` with the
+reason. Same rule as `no_key` never meaning `not_cited`: cannot-ask is not no.
+
+⚠ **`urls` strips the query string, and `gap` therefore aggregates every
+parameterised variant onto one path.** That is correct for the comparison —
+sitemap `<loc>` entries carry no query — and wrong the moment you read a hit
+count as a budget figure. Measured 2026-09-01: `gap` reported `/play 506` for
+bingbot, and `urls --keep-query` showed **503 of them were `/play?connect=`
+across 408 distinct URLs against a single bare row**. "One page fetched 506
+times" and "408 junk URLs" have opposite fixes. Re-run with `--keep-query`
+before believing any single-path total; `gap` now says so in its own output.
+
+**Read `ua_spoofing` BEFORE the `by_category` totals** anyway, because the
+subtraction is a floor rather than a guarantee: a scanner that forges only ONE identity is
+invisible to it. Measured on a live site 2026-08-01:
 
 ```
 2a09:bac5:…::3e3:e   12 operators   190 hits
@@ -295,7 +352,7 @@ about the log and a false alarm about the internet.
 
 **Success criteria**: `resolver_control` passed. Every bot verdict is one of the THREE states, and `null` is never counted as spoofed — only `spoofed_hits` is subtracted from a total.
 
-**Success criteria**: `ua_spoofing` was read BEFORE the `by_category` totals were believed, any flagged address was checked against the operator's own IPs, and an empty result is reported as a ceiling on honesty rather than a clean bill of health.
+**Success criteria**: every crawler figure quoted anywhere downstream is `hits_net`, not `hits`; any bot listed in `bots_entirely_forged` is reported as "did not visit" rather than as a small number; `ua_spoofing` was read BEFORE the `by_category` totals were believed; any flagged address was checked against the operator's own IPs; and an empty result is reported as a ceiling on honesty rather than a clean bill of health.
 
 ---
 

@@ -165,9 +165,17 @@ keep both ends surfaced, in one pass: `YandexMobileBot` (482),
 "yandexbot"), `Google-CloudVertexBot` (55), `GrokBot` (45), `YisouSpider` (60),
 `Google-Read-Aloud` (20), `360Spider` (14), `coccocbot` (4).
 
-Naming them moved **57% of the unknown bucket** into correctly categorised rows,
-and one of them — **GrokBot, an answer engine the GEO report had never
-counted** — belongs to the category this program uses to judge AI visibility.
+Naming them moved **57% of the unknown bucket** into correctly categorised rows.
+
+⚠ **This entry originally claimed one of them — "GrokBot, an answer engine the
+GEO report had never counted" — as a discovery. It was not a discovery, it was
+the scanner.** All 45 hits came from a single already-flagged address at a 100%
+404 rate against `/.env.vault`, `/@fs/..%252f../.aws/credentials` and
+`/proc/self/environ`. `Google-CloudVertexBot` (55), which this entry discusses
+at length as a taxonomy decision, was 55/55 forged too. The spoof detector had
+named both addresses in the same report; nothing subtracted them, so a warning
+printed one screen above was read past. See #10 below — the correction, and the
+structural fix that makes it impossible to repeat.
 
 Three decisions in that fix are the reusable part:
 
@@ -195,6 +203,186 @@ different binary; and a coarse `zgrep` over whole log lines "found" Yeti and
 Sogou that a UA-field-scoped grep showed were not there at all. The reliable
 method was neither: classify every distinct UA **through `classify_ua()` itself**
 and read what the function could not name.
+
+### ✅ #10 — The spoof detector found the forgery and nothing subtracted it — **FIXED 2026-09-01 (`crawllog.py`)**
+
+Third pass, and the pattern from the second one held: **a general re-survey was
+again worth nothing, and reading somebody else's API map was worth a lot.** The
+sibling landscape had not moved — claude-seo 16,046★ and open-seo 16,097★ are
+both still on the push dates recorded a day earlier, geolook unchanged at 648★
+since 08-10. What paid was `gh search repos "yandex webmaster api"` /
+`"seznam webmaster"` — MCP servers whose CODE is unusable here and whose
+**endpoint enumeration is exactly the deliverable**, the same trick that produced
+`bing.py` from `merj/bing-webmaster-tools`.
+
+But the survey never got as far as building anything, because running the
+existing instrument to justify the new one found the existing one lying.
+
+**The defect.** `detect_ua_spoofing()` names the forging addresses, counts their
+hits, and then prints, in prose: *"Treat every hit from these addresses as forged
+and subtract it before reading any per-bot or per-category total."* Nothing
+subtracted it. The per-bot rows in the same JSON were the contaminated ones, and
+the warning sat one screen above them.
+
+**A warning that has to be applied by hand is not a control**, and this file is
+the proof: §9 above recorded GrokBot as an answer engine newly discovered on the
+site, from a row that was 45/45 forged.
+
+Measured over 7 days on combatskirmish.net, 1,485,860 log lines:
+
+| category | claimed | real | forged |
+|---|---|---|---|
+| `ai_search` | 365 | **128** | 65% |
+| `ai_user` | 293 | **112** | 62% |
+| `social` | 179 | **15** | 92% |
+| `search` | 6,296 | 5,929 | 6% |
+
+Twelve bots were **entirely** forged — `GrokBot`, `Google-CloudVertexBot`,
+`CCBot`, `Claude-User`, `Claude-SearchBot`, `ClaudeBot`, `Perplexity-User`,
+`Google-Extended`, `meta-externalagent`, `TelegramBot`, `Slackbot`,
+`LinkedInBot`. Two of those twelve are the ones §9 wrote up as taxonomy
+findings. And one is a finding in its own right: **every Anthropic crawler row
+is forged, so Claude's crawlers have not fetched this site at all** — which is a
+better explanation for absent citations than anything in the content.
+
+The two categories worst hit are precisely the ones the reading block calls the
+GEO signal, exactly as `detect_ua_spoofing`'s own docstring predicted they would
+be. It predicted it, printed it, and then published the inflated number anyway.
+
+**The fix is structural, and deliberately keeps both numbers.** `hits` stays as
+CLAIMED so no existing reading silently changes meaning; `hits_net` is what the
+program reads; `forged_share` and `all_hits_forged` sit alongside, because "this
+crawler visited less than claimed" and "this crawler never came" are different
+findings and only the second invalidates a conclusion. Rows now sort by
+`hits_net`, so a scanner cannot outrank real crawl demand. Categories net on
+both sides of the division — a share of a contaminated whole is not a share.
+
+Three things in the fix are the reusable part:
+
+- **The subtraction reads the FULL flagged set, not the printed one.** The
+  display list truncates at 25; subtracting only what is displayed would
+  understate forgery on precisely the log that matters most, a farm rotating
+  many addresses. Controlled with a 119-address fixture.
+- **Controls in both directions, again.** A bot seen only from a flagged address
+  must net to zero; a bot from clean addresses must be **untouched**. Without
+  the second, a subtraction that shrank everything would pass.
+- **The taxonomy control was rewritten to derive from `BOTS`** rather than list
+  the Yandex agents by hand — the `test_agentcheck.py` lesson: a table meant to
+  grow must not have its growth reported as a regression. Adding `YandexImages`,
+  `YandexFavicons` and `YandexUserproxy` (all sitting unnamed in `other-bot`)
+  would otherwise have broken it.
+
+### #11 — Yandex Webmaster API v4 — **MAPPED, DEFERRED BY THE OWNER 2026-09-01**
+
+The measurement that came out of #10 is the argument for it. Net of forgery, over
+7 days:
+
+| engine | real hits | distinct URLs |
+|---|---|---|
+| **Yandex** (5 agents) | **1,995** | 1,409 |
+| Baidu | 1,318 | 1,192 |
+| Bing | 1,596 | 884 |
+| **Google** | **395** | **313** |
+
+Yandex is the largest search crawler on this site and Googlebot is the smallest
+of the four, on a 3,568-page silo. The program measures Google (GSC) and Bing
+(`bing.py`) and has **never once queried the engine that crawls it most**.
+
+`weselow/Yandex-webmaster-mcp-server` (MIT, TypeScript, unusable as a dependency)
+enumerates the whole v4 surface, base `https://api.webmaster.yandex.net/v4`:
+
+- `/hosts`, `/hosts/{id}/summary`, `/owner-verification`, `/diagnostics`
+- `/indexing/history`, `/indexing/samples`
+- `/search-urls/in-search/{samples,history}`, `/search-urls/events/{samples,history}`
+  — appearance and **exclusion events with reasons**, which nothing else here has
+- `/search-queries/{all/history,popular}`, `/query-analytics/list`
+- `/links/external/samples`, `/links/internal/broken/samples` — free backlink data
+- `/sqi-history`, `/important-urls`, `/original-texts`
+- **`/recrawl/quota` and `/recrawl/queue`** — a direct, quota-metered recrawl
+  request. Google has no such lever for ordinary pages, Bing's arrived with
+  `bing.py submit`, and IndexNow is fire-and-forget with no feedback at all.
+
+`PavelUngr/seznam-webmaster-mcp` maps a much smaller Czech equivalent (index
+counts, per-document detail, `reindex_url` at 500/day, plain API-key auth).
+SeznamBot is 77 real hits here — cheap, and worth it only after Yandex.
+
+**Blocked on an owner action, not on design**: an OAuth token from
+`oauth.yandex.ru` with `webmaster:hostinfo` + `webmaster:verify`. Everything
+after that automates, verification included — `/owner-verification` returns a DNS
+TXT value and this project already drives Cloudflare DNS through the API.
+
+⚠ Do not build it before the token exists. A tool whose only reachable state is
+`no_key` is the stub #2 warned about, and this API cannot be probed live without
+one — and `bing.py` was good *because* every endpoint was probed before a line
+was written.
+
+**Owner's call, 2026-09-01: deferred**, with the Google side taken first on the
+grounds that Googlebot fetching 313 distinct URLs a week out of 3,568 is its own
+problem. Baidu (`Baiduspider`, 1,318 real hits and 290 MB/7d — the heaviest
+search crawler here by bandwidth, also unmeasured) deferred with it; its Ziyuan
+push API needs a verified site in Baidu's webmaster platform and the payoff for a
+`.net` with no Chinese hosting is genuinely uncertain. Both stay here with their
+measured numbers so the case does not have to be rebuilt.
+
+### ✅ #12 — Crawl budget, measured per engine — **the Google side, 2026-09-01**
+
+Taken instead of #11. `crawllog.py urls` + `gap` against the live sitemap, over
+the whole retained log window:
+
+| engine | sitemap URLs crawled | coverage of 5,388 | never crawled |
+|---|---|---|---|
+| YandexBot | 2,672 | **49.6%** | 2,716 |
+| Googlebot | 2,390 | **44.4%** | 2,998 |
+| bingbot | 792 | **14.7%** | 4,596 |
+
+Bing is last by coverage and first by traffic. The reason was one row of `gap`'s
+output — and reading it correctly took three attempts, each of which would have
+shipped a different wrong fix:
+
+1. **`/play 506` on bingbot, not in the sitemap** → "a bare 302 is eating 25% of
+   Bing's budget; block it." Wrong.
+2. `urls --keep-query`: **503 of the 506 are `/play?connect=` across 408 distinct
+   URLs**, and `/play?connect=` is *already* `Disallow`ed → "the rule is being
+   ignored; go serve-side." Also wrong.
+3. `grep -c` over every release directory on the box: **the rule reached
+   production on 2026-09-01, the same day**. Every earlier release has zero
+   occurrences. So the 440 August and 61 early-September hits are all *pre-fix*,
+   and the 30% figure is the problem the fix was written for, not evidence
+   against it.
+
+Nothing is concluded from that yet. It is registered instead:
+`remeasure.py record --id bing-play-connect-block`, baseline **502** `/play`-silo
+hits in the 14 days to 2026-09-01, expect `decrease` by ≥400, `not_before
+2026-09-22` — with the falsification written down in advance ("if it does not
+drop, the rule is not being honoured and the next step is a serve-side block,
+not another robots.txt edit").
+
+**Two tool defects fell out of the three attempts, and both are the same shape:**
+an output that cannot distinguish two states with opposite fixes.
+
+- **`urls` strips the query, so `gap` collapses every parameterised variant onto
+  one path.** Correct for the comparison — sitemap `<loc>` entries carry no
+  query — and wrong the instant a reader treats the count as a budget figure.
+  Fixed with `--keep-query` (off by default, forwarded over `--remote`) and a
+  note in `gap`'s own output pointing at it.
+- **`--bot` makes the spoof detector blind, and blind read as clean.** The signal
+  is one address claiming several operators; filter to one operator and nothing
+  can ever be flagged. Unfiltered, bingbot was 1,655 claimed / 1,596 net; the
+  same window with `--bot bingbot` said 1,658 / 1,658. A `--bot` run now returns
+  `null` for every net field plus `spoof_subtraction_available: false` — the
+  `no_key` rule, applied to an instrument instead of a credential.
+
+**And one in `remeasure.py`, found by trying to use it**: `--metric` refused
+`bots.bingbot.top_silos./play` with "no index 'bingbot'", because `bots` is a
+list and only positional indices were implemented — while the script's own
+`--help` had documented the identity form since it was written. Worse than a
+missing feature: the workaround, `bots.0`, is a positional index into a list
+**sorted by value**, so it silently re-points itself between runs and the verdict
+compares two different bots. Now resolved by identity (`key`/`id`/`name`/`bot`/
+`slug`), with a name matching zero or several elements refused rather than
+guessed — and refused even under `--missing-is-zero`, which is for a sparse map,
+not for a row that does not exist.
+
 
 ---
 
