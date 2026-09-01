@@ -92,6 +92,112 @@ Checked, not assumed — worth knowing before copying anything.
 
 ---
 
+## Second pass, 2026-09-01 — what a re-survey was and was not worth
+
+Re-run with `gh` the day after the survey above. **The sibling landscape had not
+moved**: claude-seo 16,033★ (pushed 08-26), open-seo 16,048★ (08-24), geolook
+648★ (08-10) — all unchanged since the teardown. A general re-survey at this
+cadence yields nothing, and that is worth knowing so nobody repeats it weekly.
+
+**What DID pay was searching for an API map rather than for a project.**
+`merj/bing-webmaster-tools` (21★, a pydantic wrapper) is useless as a dependency
+and excellent as documentation: it enumerates every Bing Webmaster endpoint with
+its response model, including a whole service area this skill never called.
+`isiahw1/mcp-server-bing-webmaster` covers the same ground as an MCP server.
+
+That reframes what "integrating other projects" means here. The unusable half of
+a project is its code; the usable half is its **map of somebody else's API**, and
+that transfers cleanly into a stdlib caller. Read the models, write the client.
+
+### ✅ #8 — The Bing CRAWLER surface — **BUILT 2026-09-01 (`bing.py`)**
+
+`bing.py` asked Bing what SEARCHERS did and never asked what BINGBOT did, on a
+site where Bing carries the traffic and "is the new silo being crawled at all"
+was an open question answered only from access logs. Six subcommands now close
+it — `crawlstats`, `crawlissues`, `feeds`, `blocked`, `crawlsettings`, and the
+`quota`/`submit` pair that is the first crawl-acceleration lever in the skill.
+
+Every endpoint was probed live before a line was written, and the probes
+produced findings the moment they ran:
+
+- **`GetCrawlStats` mixes daily counts and running totals in one row and labels
+  neither.** Summing it gave `Code2xx: 96,000` for a site with 7,408 pages
+  crawled and `InIndex: 82,767` for an index of 4,809 — the exact arithmetic
+  error the quality bar already warns about, reproduced from scratch on a new
+  source. The tool re-derives each column's kind from the series **every run**
+  rather than trusting a hardcoded table, and reports a disagreement, because a
+  remembered constraint nobody re-checks is how the `--days` bug shipped.
+- **A SECOND "never" sentinel, and this one decodes to a real date.**
+  `_dotnet_date` guarded `DateTime.MinValue` (`-62135568000000` → year 0001).
+  `GetFeeds` returns `-11644473600000` — the Windows FILETIME epoch — for a
+  sitemap Bing discovered itself, and it shipped in the first run as
+  `"submitted": "1601-01-01"`. The guard is now a **sanity floor**, not a list
+  of magic numbers: a third sentinel from a fourth epoch would slip past an
+  enumeration, and no date before the web is a submission date.
+- **`crawlissues` returned an empty list while `crawlstats` logged 91 crawl
+  errors over the same window.** Those cannot both be complete, so the empty
+  answer is `verdict: unknown` with the contradiction named — never "no crawl
+  issues", which would be a finding about the site made from a gap in the
+  instrument.
+- **`feeds --verify` dated a deploy from the crawler's side**: live sitemap
+  5,388 URLs, Bing holding 6,127 from a feed crawl on 2026-08-31.
+
+`submit` is the only mutating call in the script and is a dry run until `--yes`.
+It also carries a rule that is about the PROGRAM rather than the API: submitting
+into a silo that is the subject of an open `remeasure.py` hypothesis is a second
+intervention landing inside someone else's experiment, so it is an owner
+decision, not an agent one.
+
+### ✅ #9 — The unnamed-crawler bucket — **FIXED 2026-09-01 (`crawllog.py`)**
+
+Not on any roadmap, found by using the tool rather than reading about it. The
+`other-bot` bucket was the fifth-largest crawler row on the site — 1,442 hits
+over seven days — and the field that exists to make it diagnosable was blinded
+by its own truncation.
+
+**The UA display key cut at 120 characters, and a bot token is appended at the
+END of a spoofed browser string.** `YandexMobileBot` identifies itself at
+character 155 of an otherwise ordinary iPhone Safari UA. So the largest unnamed
+crawler on the site — 482 hits — was filed under a key that read as a mobile
+visitor, with several distinct crawlers collapsed onto it. Widening the key to
+keep both ends surfaced, in one pass: `YandexMobileBot` (482),
+`YandexRenderResourcesBot` (106, which does not contain the substring
+"yandexbot"), `Google-CloudVertexBot` (55), `GrokBot` (45), `YisouSpider` (60),
+`Google-Read-Aloud` (20), `360Spider` (14), `coccocbot` (4).
+
+Naming them moved **57% of the unknown bucket** into correctly categorised rows,
+and one of them — **GrokBot, an answer engine the GEO report had never
+counted** — belongs to the category this program uses to judge AI visibility.
+
+Three decisions in that fix are the reusable part:
+
+- **Every new bot's rDNS list is EMPTY unless the operator documents a suffix.**
+  A guessed suffix does not fail quietly — it reports every legitimate hit from
+  that crawler as spoofed, a confident finding about someone else's
+  infrastructure manufactured entirely by our own table.
+- **`Google-CloudVertexBot` went to `ai_training`, the bucket that does NOT
+  imply a citation**, precisely because its class is uncertain. A wrong guess
+  must not inflate the `ai_search` number the program reads as AI visibility.
+  Two new categories keep the same line: `user_fetch` (a person pressing Read
+  Aloud is not an assistant citation) and `self`.
+- **`self` exists because the instrument was in its own data.** `seo-manager/1.0`
+  had 44 hits in the report it produced, counted as an unidentified bot.
+- **The fix broke `test_agentcheck.py`, correctly.** Its fixture enumerated the
+  `ai_search` roster by hand, so ADDING an answer engine read as
+  "`ai_search_fully_blocked` does not fire". The fixture now derives the roster
+  from `BOTS` and checks the rule rather than the snapshot — a taxonomy meant to
+  grow must not have its growth reported as a regression.
+
+**And the measurement that got there was itself broken twice**, both caught by
+controls: a first sweep used `bc`, which is not installed on the central VPS, so
+every count came back as a shell error reading as `0` — the binutils trap, on a
+different binary; and a coarse `zgrep` over whole log lines "found" Yeti and
+Sogou that a UA-field-scoped grep showed were not there at all. The reliable
+method was neither: classify every distinct UA **through `classify_ua()` itself**
+and read what the function could not name.
+
+---
+
 ## Ranked gaps
 
 ### ✅ #0 — A shared control primitive — **BUILT 2026-09-01 (`controls.py`)**

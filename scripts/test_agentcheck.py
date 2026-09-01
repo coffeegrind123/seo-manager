@@ -114,9 +114,24 @@ check("a fully open robots.txt passes", r["verdict"] == "pass", str(rules_of(r))
 check("ai_search counted as fully allowed",
       r["summary"]["ai_search"]["allowed"] == r["summary"]["ai_search"]["total"])
 
-block_search = (allow_all + "\nUser-agent: OAI-SearchBot\nUser-agent: PerplexityBot\n"
-                "User-agent: Claude-SearchBot\nUser-agent: DuckAssistBot\n"
-                "User-agent: YouBot\nDisallow: /\n")
+# Derived from the taxonomy rather than pinned to a snapshot of it. A hardcoded
+# roster here fails every time an answer engine is ADDED - which is a change to
+# the world, not a regression - and the failure names the wrong thing: it read
+# "ai_search_fully_blocked does not fire" when the truth was "there is now a
+# citing crawler this fixture never blocked". (GrokBot, added 2026-09-01.)
+#
+# The assertion below is about the RULE - block every citing crawler and the
+# verdict is `fully`, not `partially` - so deriving the input cannot make it a
+# mirror of the implementation. The roster itself is checked independently
+# straight after, so a taxonomy that silently emptied still fails.
+from crawllog import BOTS as _BOTS  # noqa: E402
+_ai_search = [label for _k, label, cat, _v in _BOTS if cat == "ai_search"]
+check("the ai_search roster is not empty", len(_ai_search) >= 4, str(_ai_search))
+check("and still holds the engines this fixture was written around",
+      {"OAI-SearchBot", "PerplexityBot", "Claude-SearchBot"} <= set(_ai_search),
+      str(sorted(_ai_search)))
+block_search = (allow_all + "".join(f"\nUser-agent: {b}" for b in _ai_search)
+                + "\nDisallow: /\n")
 r = policy_from(block_search)
 check("ai_search_fully_blocked fires", "ai_search_fully_blocked" in rules_of(r), str(rules_of(r)))
 check("farmed_not_read fires when trainers stay allowed",

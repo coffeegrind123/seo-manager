@@ -182,9 +182,51 @@ BOTS = [
     ("zoominfobot", "ZoominfoBot", "seo_tool", []),
     ("censysinspect", "CensysInspect", "seo_tool", []),
     ("internetmeasurement", "InternetMeasurement", "seo_tool", []),
+    # --- Added 2026-09-01, each MEASURED in this site's own access log ------
+    # Found by classifying every distinct UA through classify_ua() and reading
+    # what landed in `other-bot`, rather than by guessing which engines exist.
+    # Hit counts are from combatskirmish.net, 2026-08-31..09-01.
+    #
+    # ⚠ Verification domains are LEFT EMPTY where the operator publishes no
+    # documented rDNS suffix. A guessed suffix does not fail quietly - it makes
+    # every legitimate hit report as SPOOFED, which is a confident finding about
+    # someone else's crawler produced entirely by our own table.
+    ("grokbot", "GrokBot", "ai_search", []),                    # xAI, 28 hits
+    # Does NOT contain the substring "yandexbot", so it fell through to other-bot.
+    ("yandexrenderresourcesbot", "YandexRenderResourcesBot", "search",
+     [".yandex.ru", ".yandex.net", ".yandex.com"]),             # 38 hits
+    # 482 hits - the LARGEST unnamed crawler on the site, and invisible until the
+    # UA display key stopped cutting at 120 characters: its whole UA is an iPhone
+    # Safari string with the identity appended at character 155, so it read as an
+    # ordinary mobile visitor. Found by the fix above, not by a search for it.
+    ("yandexmobilebot", "YandexMobileBot", "search",
+     [".yandex.ru", ".yandex.net", ".yandex.com"]),
+    # 55 hits. Fetches for Vertex AI grounding - NOT Google Search, and not
+    # Google-Extended's training corpus either. Filed under ai_training on
+    # purpose: that is the bucket which does NOT imply a citation, so a wrong
+    # guess here cannot inflate the ai_search number this program reads as AI
+    # visibility. Move it only on evidence that it feeds a citing surface.
+    ("google-cloudvertexbot", "Google-CloudVertexBot", "ai_training",
+     [".googlebot.com", ".google.com"]),
+    ("yisouspider", "YisouSpider", "search", []),               # Shenma/UC, 12 hits
+    ("360spider", "360Spider", "search", []),                   # Qihoo 360, 6 hits
+    ("coccocbot", "coccocbot", "search", []),                   # Coc Coc (VN), 4 hits
+    ("google-read-aloud", "Google-Read-Aloud", "user_fetch",
+     [".googlebot.com", ".google.com"]),                        # 19 hits
+    # This skill's OWN fetches. sitegraph/vitals/agentcheck all crawl the site
+    # with this UA, so without an entry the instrument appears in its own data
+    # as an unidentified bot - 33 hits on the window measured.
+    ("seo-manager/", "seo-manager (this skill)", "self", []),
 ]
 
-CATEGORY_ORDER = ["search", "ai_search", "ai_user", "ai_training", "social", "seo_tool"]
+# `user_fetch` is user-TRIGGERED but not an assistant: Google-Read-Aloud is a
+# person pressing a button, not a crawl and not a citation. It is deliberately
+# NOT folded into `ai_user`, which is the GEO signal - conflating the two would
+# inflate exactly the number this program uses to judge AI visibility.
+# `self` is this skill's own traffic, kept visible rather than hidden so nobody
+# reads our own crawler as third-party interest.
+CATEGORY_ORDER = ["search", "ai_search", "ai_user", "ai_training", "social",
+                  "seo_tool", "user_fetch", "self"]
 
 # Paths that are never an indexable page. Crawl spent here is not necessarily
 # waste (an image crawl can be entirely legitimate) but it is not page-crawl
@@ -301,6 +343,23 @@ def detect_ua_spoofing(bots: list[dict], min_operators: int = 2) -> dict:
     }
 
 
+# Measured 2026-09-01: the UA sample in the report was keyed on `ua[:120]`, and
+# a bot token is appended at the END of a spoofed browser string - Yandex's
+# mobile crawler identifies itself at character 155 of
+#   "Mozilla/5.0 (iPhone; ...) Safari/604.1 (compatible; YandexBot/3.0; ...)".
+# So the one field whose job is to make the unnamed bucket diagnosable was
+# systematically cutting off the part that names the bot, and several distinct
+# crawlers collapsed onto one key that read as an ordinary iPhone browser.
+UA_HEAD, UA_TAIL = 110, 90
+
+
+def ua_key(ua: str) -> str:
+    """A display key that keeps BOTH ends, because the identity is at the tail."""
+    if len(ua) <= UA_HEAD + UA_TAIL + 5:
+        return ua
+    return f"{ua[:UA_HEAD]} … {ua[-UA_TAIL:]}"
+
+
 def classify_ua(ua: str):
     """Return (bot_key, bot_label, category) for a user-agent string.
 
@@ -363,6 +422,62 @@ def run_control() -> dict:
         str(classify_ua("Mozilla/5.0 (Windows NT 10.0) Chrome/120 Safari/537.36")))
     c.check("an_unknown_crawler_is_still_recognised_as_one",
             classify_ua("SomeNewCrawler/1.0 (+http://x)")[0] == "other-bot")
+
+    # THE TAIL. A bot token is appended at the END of a spoofed browser string,
+    # so a display key that keeps only the head hides exactly the identity it
+    # exists to show - and collapses several crawlers onto one iPhone-looking
+    # key. The expected answer is derived from where the token SITS, not from
+    # the implementation: index 155 of a 188-character real UA.
+    long_ua = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 "
+               "(KHTML, like Gecko) Version/26.2 Mobile/15E148 Safari/604.1 "
+               "(compatible; YandexBot/3.0; +http://yandex.com/bots)")
+    c.check("the_identifying_token_really_is_past_a_120_char_cut",
+            "yandexbot" not in long_ua[:120].lower(),
+            "if this fails the fixture changed, not the code")
+    c.check("the_ua_display_key_keeps_the_tail",
+            "YandexBot" in ua_key(long_ua), ua_key(long_ua))
+    c.check("a_short_ua_is_not_mangled",
+            ua_key("Go-http-client/2.0") == "Go-http-client/2.0")
+    c.check("two_uas_sharing_a_long_prefix_do_not_collapse",
+            ua_key(long_ua) != ua_key(long_ua.replace("YandexBot/3.0", "SomeOtherBot/9")),
+            "a head-only key made these one row")
+
+    # The bots added on measurement, and the two categories that exist so a
+    # user-triggered fetch is never counted as an assistant citation.
+    c.check("grokbot_is_an_answer_engine_not_a_training_crawler",
+            classify_ua("Mozilla/5.0 (compatible; GrokBot/1.0; +https://x.ai/grokbot)")[2]
+            == "ai_search")
+    c.check("yandex_render_is_not_swallowed_by_yandexbot",
+            classify_ua("Mozilla/5.0 (compatible; YandexRenderResourcesBot/1.0)")[0]
+            == "yandexrenderresourcesbot")
+    c.check("CONTROL_plain_yandexbot_still_classifies",
+            classify_ua("Mozilla/5.0 (compatible; YandexBot/3.0)")[0] == "yandexbot")
+    c.check("read_aloud_is_user_fetch_not_ai_user",
+            classify_ua("Chrome/138 Safari/537.36 (compatible; Google-Read-Aloud; +https://g)")[2]
+            == "user_fetch",
+            "folding it into ai_user would inflate the GEO signal with a TTS button press")
+    c.check("CONTROL_googlebot_is_untouched_by_the_read_aloud_entry",
+            classify_ua("Mozilla/5.0 (compatible; Googlebot/2.1)")[0] == "googlebot")
+    c.check("this_skills_own_fetches_are_categorised_self",
+            classify_ua("seo-manager/1.0 (+https://github.com/; SEO research)")[2] == "self",
+            "otherwise the instrument shows up in its own report as a mystery crawler")
+    c.check("every_new_category_is_in_CATEGORY_ORDER",
+            {"user_fetch", "self"} <= set(CATEGORY_ORDER))
+    c.check("yandex_mobile_is_not_swallowed_by_yandexbot_or_the_render_bot",
+            classify_ua("Mozilla/5.0 (iPhone) Safari/604.1 (compatible; YandexMobileBot/3.0; "
+                        "+http://yandex.com/bots)")[0] == "yandexmobilebot")
+    c.check("the_three_yandex_crawlers_are_three_rows_not_one",
+            len({classify_ua("(compatible; YandexBot/3.0)")[0],
+                 classify_ua("(compatible; YandexMobileBot/3.0)")[0],
+                 classify_ua("(compatible; YandexRenderResourcesBot/1.0)")[0]}) == 3)
+    c.check("vertex_is_not_counted_as_a_citing_engine",
+            classify_ua("Mozilla/5.0 (compatible; Google-CloudVertexBot; +https://cloud.google"
+                        ".com/vertex-ai-bot)")[2] == "ai_training",
+            "ai_search is the GEO signal; a guess must not inflate it")
+    c.check("no_new_bot_claims_an_rdns_suffix_it_cannot_source",
+            all(not v for k, _l, _c, v in BOTS
+                if k in ("grokbot", "yisouspider", "360spider", "coccocbot", "seo-manager/")),
+            "a guessed suffix reports every legitimate hit as spoofed")
 
     # SPOOF DETECTION, with its own control: one operator's several crawlers
     # from one address are LEGITIMATE and must never be flagged.
@@ -719,7 +834,7 @@ def cmd_scan(a):
                     b["ips"][rec["ip"]] += 1
                 b["status"][str(rec["status"])] += 1
                 b["silos"][silo_of(rec["uri"], depth)] += 1
-                b["uas"][rec["ua"][:120]] += 1
+                b["uas"][ua_key(rec["ua"])] += 1
                 if ASSET_RE.search(path_only):
                     b["assets"] += 1
                 if rec["status"] >= 400:
@@ -758,7 +873,11 @@ def cmd_scan(a):
             # a scanner rotating many IPs would hide under a top-5 truncation.
             # Stripped from the payload before printing.
             "_all_ips": dict(b["ips"]),
-            "user_agents": dict(b["uas"].most_common(3)),
+            # The unnamed bucket gets a WIDE sample: three strings cannot
+            # characterise a bucket that is, on this site, the fifth-largest
+            # crawler by hits. Everything else is already identified, so three
+            # is plenty there.
+            "user_agents": dict(b["uas"].most_common(a.top if key == "other-bot" else 3)),
             "first_seen": _iso(b["first"]),
             "last_seen": _iso(b["last"]),
             "daily": dict(sorted(b["days"].items())),
@@ -779,6 +898,31 @@ def cmd_scan(a):
                 "bots": by_cat[c]["bots"],
             }
 
+    # `other-bot` is NOT a synonym for "an unknown crawler". On this site it
+    # also holds vulnerability probes (a UA field containing
+    # `http://<site>/wp-admin/install.php`), TLS validation, and network
+    # scanners. Reporting its hit count as crawl activity overstates crawl
+    # demand; the UA list is what makes the difference readable.
+    unnamed = next((b for b in out_bots if b["key"] == "other-bot"), None)
+    unnamed_block = None
+    if unnamed:
+        unnamed_block = {
+            "hits": unnamed["hits"],
+            "share_of_bot_traffic": round(unnamed["hits"] / total_bot_hits, 3) if total_bot_hits else 0,
+            "distinct_ips": unnamed["distinct_ips"],
+            "error_rate": unnamed["error_rate"],
+            "top_user_agents": unnamed["user_agents"],
+            "reading": (
+                "Every UA here matched none of the names in BOTS. Some are real crawlers "
+                "worth adding to the table; some are scanners and attack probes that are "
+                "not crawl demand at all. A high error_rate points at the second. Read the "
+                "strings before treating this bucket as crawler traffic."),
+            "what_to_do": (
+                "For any string here that is a genuine crawler, add it to BOTS in "
+                "crawllog.py - leaving the rDNS list EMPTY unless the operator documents a "
+                "suffix, because a guessed suffix reports every legitimate hit as spoofed."),
+        }
+
     spoofing = detect_ua_spoofing(out_bots)
     for b in out_bots:
         b.pop("_all_ips", None)     # internal only - never part of the payload
@@ -796,6 +940,11 @@ def cmd_scan(a):
         "bot_hits": total_bot_hits,
         "bot_share": round(total_bot_hits / (total_bot_hits + human_hits), 3) if (total_bot_hits + human_hits) else 0,
         "by_category": cats,
+        "unnamed_bots": unnamed_block,
+        "self_hits": sum(b["hits"] for b in out_bots if b["category"] == "self"),
+        "self_hits_means": ("this skill's OWN fetches (sitegraph, vitals, agentcheck). Counted "
+                            "so the number is visible, and categorised `self` so it is never "
+                            "read as third-party crawl interest."),
         "bots": out_bots,
         "reading": {
             "ai_training": "reads you, never cites you, sends no traffic",

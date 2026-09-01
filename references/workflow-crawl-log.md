@@ -16,6 +16,12 @@ It answers questions nothing else here can:
 - Which AI crawlers read the site, and are they the ones that can cite it?
 - Which "Googlebot" hits were not Googlebot?
 
+It is now first-party **twice over**, because the crawler will also tell you its
+own side of the story. See §1b: `bing.py crawlstats` is Bingbot's record of the
+same events, and on a site where Bing carries the traffic the two readings check
+each other. Where they disagree, one of them is wrong and you have learned
+something either way.
+
 ---
 
 ## 0. Preflight
@@ -59,6 +65,87 @@ guess is wrong and every number below it is drawn from a subset.
 
 ---
 
+## 1b. The crawler's own record — `bing.py`
+
+The access log is what arrived. This is what Bing believes it did, and what it
+did with the result. No user-agent to verify, no log to parse, no spoofing to
+strip. It is a different instrument reading the same events, which is why it is
+worth running both.
+
+```bash
+SEO=~/.claude/skills/seo-manager/scripts
+python3 $SEO/bing.py sites                # the auth control - run it FIRST
+python3 $SEO/bing.py crawlstats           # fetched per day, codes, pages in index
+python3 $SEO/bing.py crawlissues          # per-URL problems, empty answer guarded
+python3 $SEO/bing.py feeds --verify       # the sitemap AS BING HOLDS IT
+python3 $SEO/bing.py blocked              # account-level blocks. Invisible to any crawl
+python3 $SEO/bing.py crawlsettings        # a self-imposed crawl-rate cap
+```
+
+**Read them in that order, and read `blocked` even when everything looks fine.**
+It is the only one of the six that describes state you set rather than state the
+crawler observed: an account-level block survives every deploy, appears in no
+crawl of the site, and is invisible to every other instrument here.
+
+⚠ **`crawlstats` mixes two kinds of column in one row and labels neither.**
+`CrawledPages` is a count for that day; `Code2xx`, `InIndex`, `InLinks` and
+`BlockedByRobotsTxt` are running totals or stocks. Summing the second kind
+produced `Code2xx: 96,000` for a site Bing had crawled 7,408 pages of, and
+`InIndex: 82,767` for an index holding 4,809. The tool re-derives each column's
+kind from the series every run and **refuses to sum** the cumulative ones —
+read `latest_stock.<col>.latest`, and `.change_over_window` for movement.
+
+⚠ **`all_other_codes` is not an error rate and Bing documents no breakdown of
+it.** On the site measured it ran at 0.88× the pages crawled, which is far too
+large to be a per-day count of responses to those crawls. The tool reports it
+under `caution` for that reason. Do not build a finding on it.
+
+⚠ **An empty `crawlissues` is not "no issues".** It is cross-examined against
+`crawlstats`: errors there plus nothing here is `verdict: unknown`, with the
+contradiction named. Only a zero corroborated by an independent reading is
+reported as `none`.
+
+### The sitemap gap is a DATE, not a defect
+
+`feeds` reports `url_count_per_bing` from Bing's last crawl **of the feed**, so a
+sitemap you changed yesterday still reads with the old total. `--verify` counts
+the live file and prints the delta. Measured on combatskirmish.net 2026-09-01:
+live 5,388, Bing 6,127, `last_crawled` 2026-08-31 — a 739-URL gap that is
+either a change bingbot has not re-read or a change that never deployed.
+`last_crawled` against your deploy date is what separates the two. Neither is a
+defect on its own, and reporting the delta as one is the mistake to avoid.
+
+---
+
+## 1c. Getting crawled — the two channels, and they are not the same
+
+There are exactly two ways to ask for a crawl, they have separate quotas, and a
+ping to one does nothing for the other:
+
+| | `indexnow.py ping` | `bing.py submit` |
+|---|---|---|
+| reaches | Bing, Yandex, Seznam, Naver, DuckDuckGo | Bing only |
+| costs | keyless, no quota worth counting | a real per-site allowance (100/day, 3,000/month on the account measured) |
+| needs | a key file on the site | a verified Bing Webmaster account |
+
+**Neither reaches Google**, which has never joined IndexNow and restricts its
+Indexing API to `JobPosting`/`BroadcastEvent`. `indexnow.py google-steps` batches
+the manual follow-up instead of pretending otherwise.
+
+`submit` is the only mutating call in `bing.py`, so it is a **dry run until
+`--yes`**. It drops off-site URLs before spending the call (Bing rejects the
+whole batch for one), refuses a batch larger than the remaining quota rather
+than truncating it, and its receipt says explicitly that it is a receipt for the
+REQUEST — not a crawl confirmation. Verify a few days later with
+`bing.py urlinfo --url <u>`, always alongside a known-crawled control.
+
+⚠ **Spending the quota on a silo that is the subject of an open re-measure
+hypothesis contaminates it.** Submission is a second intervention landing inside
+someone else's experiment; check `remeasure.py due` before you submit, and if it
+collides, say so and let the owner choose.
+
+---
+
 ## 2. Read it in this order
 
 ### a. `by_category` — the shape of the whole picture
@@ -71,6 +158,34 @@ guess is wrong and every number below it is drawn from a subset.
 | `ai_training` | trains a model. Never cites, never sends traffic. |
 | `social` | link unfurls |
 | `seo_tool` | third-party crawlers reselling your content as competitor data |
+| `user_fetch` | user-**triggered** but not an assistant — Google-Read-Aloud is a person pressing a button. Deliberately not folded into `ai_user`, which is the GEO signal |
+| `self` | this skill's own fetches (`sitegraph`, `vitals`, `agentcheck`). Visible so nobody reads our crawler as third-party interest |
+| `unknown` | matched no name in the table. **Not a synonym for "an unknown crawler"** — see below |
+
+### a2. `unnamed_bots` — read this before treating `unknown` as crawl demand
+
+The `unknown` bucket is routinely one of the largest rows in the report, and it
+is a mixture of three different things: real crawlers not yet in the table,
+network scanners, and outright attack probes. On combatskirmish.net it held
+vulnerability scanning (`l9scan`/leakix), a UA field containing
+`http://<site>/wp-admin/install.php`, and an academic scanner — alongside
+genuine crawlers. A high `error_rate` on the bucket points at the scanners.
+
+`unnamed_bots` surfaces its top user-agent strings so the bucket is diagnosable
+instead of opaque. Where a string is a genuine crawler, add it to `BOTS` in
+`crawllog.py` — **leaving the rDNS list empty unless the operator documents a
+suffix.** A guessed suffix does not fail quietly: it reports every legitimate
+hit from that crawler as SPOOFED, which is a confident finding about someone
+else's infrastructure manufactured entirely by our own table.
+
+⚠ **The UA sample used to cut at 120 characters, and a bot token is appended at
+the END of a spoofed browser string.** `YandexMobileBot` identifies itself at
+character 155 of an otherwise ordinary iPhone Safari UA, so 482 hits — the
+largest unnamed crawler on the site — were filed under a key that read as a
+mobile visitor, with several distinct crawlers collapsed onto it. The key now
+keeps both ends. Naming the bots that fix revealed moved **57% of the unknown
+bucket** into correctly categorised rows in one pass, including an `ai_search`
+engine (`GrokBot`) the GEO report had never counted.
 
 **The three OpenAI agents are not interchangeable and conflating them is the
 most common mistake in this area.** `GPTBot` trains. `OAI-SearchBot` builds the
