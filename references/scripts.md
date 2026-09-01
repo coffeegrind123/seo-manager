@@ -22,7 +22,7 @@ separately, or write the path out in full.
 | `sameness.py` | the corpus sameness gate + a pairwise drift audit |
 | `sitegraph.py` | **the internal link graph** — build it from a LOCAL generated tree (no network, works on an undeployed build) or by live BFS, then ask it for orphans, click depth, broken links and `silos`. That last one is the point: it ranks silos by EXTERNAL-silo inbound links and flags **islands** — a silo whose pages cross-link each other so every naive inlink count looks healthy while nothing outside points in. Counts `<link rel=alternate hreflang>` as a discovery edge, ignores self-loops, and detects site furniture by FREQUENCY rather than by tag, because a nav rendered as `<p class="silonav">` defeats a tag-based rule. `orphans --contextual` splits out pages that are THEMSELVES global-nav furniture into `nav_hub_urls` — a hub with 12,070 inbound links is the most reachable page on the site, and counting it as an orphan pads the number until the real orphan hides in the list |
 | `authority.py` | DR-equivalent, and the KD zones / volume band that follow from it. Also `--bulk` competitor scoring, free referring-domain counts, a 12-month authority trend, and two independent popularity reads (Cloudflare Radar + **Tranco**, which is keyless and carries 40 days of rank history) |
-| `bing.py` | **the only free source of real search volume AND backlinks** — Bing Webmaster Tools for a site you own. Impressions per query, related-keyword expansion with numbers, inbound links, query stats, and `pages`/`pagequeries` for the PAGE dimension — which URL actually earns the clicks, and for which searches. `queries` alone cannot tell a locale page ranking in its own language from the homepage ranking for that language, and those two have opposite fixes |
+| `bing.py` | **the only free source of real search volume AND backlinks** — Bing Webmaster Tools for a site you own. Impressions per query, related-keyword expansion with numbers, inbound links, query stats, `urlinfo` for Bing's own per-URL index record (discovered / last crawled / size — its answer to Google's URL Inspection), and `pages`/`pagequeries` for the PAGE dimension — which URL actually earns the clicks, and for which searches. `queries` alone cannot tell a locale page ranking in its own language from the homepage ranking for that language, and those two have opposite fixes |
 | `trendfeeds.py` | **keyless demand signals**: Google Trends' RSS feed (works where the 429-ing JSON API does not), Wikimedia pageviews as absolute topic demand, HN + StackExchange chatter, **GDELT's per-topic news-volume timeline**, and Google News (who is covering the topic now) |
 | `rankcheck.py` | batch rank checks for every tracked keyword |
 | `serpd.py` | **the fast path for SERP-heavy runs**: a long-lived headed Chrome behind `localhost:8791`. One curl per check, real Google, no DOM in your context. 25 checks in ~37s and 1.4KB of verdicts. |
@@ -44,7 +44,7 @@ separately, or write the path out in full.
 | `test_measure.py` | the controls for the **measurement** scripts (`crawllog` / `backlinks` / `decay`). Every case is a bug that shipped and was caught against live data, or a distinction that silently produces a confident wrong answer — UA registry ordering (`Googlebot-Image` contains "googlebot"; `ChatGPT-User` does not contain "gptbot"), and the three-state verification that keeps "cannot ask" out of the same code path as "the answer is no" |
 | `test_keywords.py` | the controls for the band analysers, chiefly `keywords.py bing`: Bing returns one row PER MARKET, so a plain mean over rows lets a 3-impression market move the headline position as much as a 3,000-impression one (the position must be impression-weighted); script segmentation, because a blended CTR hid a segment earning 73% of clicks at 12x the average rate; and `ctr_underperformer`, which must fire on a top-10 page with <2% CTR but NOT on a deep ranking, where low CTR is expected |
 | `test_backlinks.py` | the controls for referrer classification: attack probes vs real links from the same host (`wordpress.org` → `/wp-login.php` vs → `/`), a second owned domain at any subdomain/port, bare-IP and cPanel-port referrer spam, hotlinked assets, and a structural check that **every `referrers` flag survives the `--remote` argv reconstruction** — a flag added to the parser and forgotten there is silently dropped, and only on remote runs |
-| `test_bing.py` | the controls for the Bing page dimension: `GetPageStats` returning the page URL in a field literally named `Query`, per-date rows that only total after aggregation, click-sorting vs impression-sorting (which invert on real data), CTR on a zero-impression page, and an empty result that must name BOTH "no data yet" and "you typed the URL wrong" rather than implying the page is dead |
+| `test_bing.py` | the controls for the Bing page dimension: `GetPageStats` returning the page URL in a field literally named `Query`, per-date rows that only total after aggregation, click-sorting vs impression-sorting (which invert on real data), CTR on a zero-impression page, and an empty result that must name BOTH "no data yet" and "you typed the URL wrong" rather than implying the page is dead. Also the `urlinfo` decoder — .NET `DateTime.MinValue` (`/Date(-62135568000000-0800)/`) is "never", not year 0001 — and the refusal of `--days` on the four subcommands whose endpoints have no date range, with controls that `keyword`/`expand` still accept it |
 | `test_sitegraph.py` | the controls for the link graph: the `<p class="silonav">` case that defeats tag-based boilerplate detection, self-referential hreflang counted as an inbound link, the island silo whose inlink counts look healthy, a `--start` that was never crawled reporting mass unreachability, a zero-edge graph refusing a verdict instead of calling every page an orphan, a global-nav hub being kept out of the orphan count while staying visible for review, section-scoped furniture (a locale nav on 100% of its locale and 1.5% of the site) being caught WITHOUT swallowing the island silo whose share is almost identical, and a canonical naming a URL the tree does not serve being told apart from one naming a different real page |
 | `test_hreflang.py` / `test_contract.py` / `test_agentcheck.py` / `test_slop.py` / `test_crawllog.py` / `test_competitors.py` | the controls for the above: every rule is fired against synthetic input, so a clean pass on a real site means something. `test_crawllog` covers the UA-spoofing detector (including the control that a single operator's many crawlers are NOT flagged) and the no-input refusal. `test_competitors` fires every guarantee of the page-1 profiler against synthetic input - robots.txt obedience by the HTTP fetcher, injection-shape defanging, that every unread result is offered for browser escalation WITH its reason, and that platform chrome never becomes a 'subtopic page 1 covers' |
 
@@ -95,6 +95,23 @@ python3 $SEO/bing.py traffic --days 90              # IS Bing bigger than Google
 python3 $SEO/bing.py queries --limit 400 > bq.json  # real impressions AND real positions
 python3 $SEO/bing.py pages --limit 40               # WHICH URL earns - sorted by CLICKS, not impressions
 python3 $SEO/bing.py pagequeries --page 'https://example.com/zh/'   # attribution for one page
+
+# Bing's OWN index record for one URL - discovered, last crawled, size. The Bing
+# counterpart to Google's URL Inspection, free and with no quota worth counting, and
+# the one that matters wherever Bing carries the traffic (measure that with `traffic`,
+# do not assume it). ⚠ ALWAYS pair it with a known-crawled control: a URL that DOES NOT
+# EXIST returns exactly the same empty record as a real page Bing has never seen -
+# measured, byte-identical - so `known_to_bing: false` means "no record of this string",
+# never "this page was excluded".
+python3 $SEO/bing.py urlinfo --url https://example.com/guides/x     # the page in question
+python3 $SEO/bing.py urlinfo --url https://example.com/             # CONTROL: known crawled
+
+# ⚠ --days is REFUSED on queries/pages/pagequeries/traffic and that is the guard working:
+# those endpoints take no date range, so a --days they accepted would return the same rows
+# for every value. `keyword` and `expand` are the two that honour it.
+# ⚠ `known_to_bing: false` from `keyword` is NOT a demand verdict either - coverage is
+# patchy, measured: `cs 1.6 non steam` reports exact=2 while plainly larger queries report
+# nothing at all. An unknown query is UNMEASURED.
 python3 $SEO/keywords.py bing bq.json               # band them; READ by_script FIRST
 # ⚠ Chinese/Japanese/Arabic seeds return NOTHING on the default us/en-US market.
 #   That is the wrong question, not absent demand:
@@ -145,6 +162,21 @@ python3 $SEO/hreflang.py codes en-uk eng jp be    # no network at all
 python3 $SEO/agentcheck.py policy https://example.com    # per-crawler, by class
 python3 $SEO/agentcheck.py page https://example.com/page # agent-UX + token budget + JS-dependence
 python3 $SEO/agentcheck.py all https://example.com
+
+# ⚠ Do NOT hand-verify a robots.txt with `urllib.robotparser`.read() behind a CDN.
+# RobotFileParser turns a 401/403 into disallow_all, so a Cloudflare block of the
+# default Python User-Agent reports EVERY path as forbidden - measured 2026-09-01
+# on combatskirmish.net, where it said /maps/de_dust2 was blocked while that page
+# was indexed and had 4,106 Googlebot hits in the logs. The refusal and a real
+# site-wide Disallow are the same value with no way to tell them apart. Fetch the
+# bytes yourself and hand them to .parse(), and always carry a KNOWN-CRAWLABLE
+# control path so a blanket deny is visible as the artefact it is:
+#   curl -s https://example.com/robots.txt -o /tmp/rb.txt
+#   python3 -c "import urllib.robotparser as r;p=r.RobotFileParser();\
+#     p.parse(open('/tmp/rb.txt').read().splitlines());\
+#     print(p.can_fetch('Googlebot','/a-page-you-KNOW-is-indexed'))"   # must be True
+# `agentcheck.py policy` is not affected: it reads robots.txt itself and reports an
+# HTTP error as an error rather than as a verdict.
 
 # does the draft read as machine-written (advisory, unlike the sameness gate)
 python3 $SEO/slop.py scan draft.md

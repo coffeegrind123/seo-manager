@@ -8,7 +8,8 @@ worrying about.
 
   sites      verified sites on this account. Also the auth control - run it
              first when anything else looks wrong.
-  keyword    impressions for ONE query
+  keyword    impressions for ONE query. ⚠ `known_to_bing: false` is NOT a
+             demand verdict - see the coverage note below
   expand     related keywords WITH impressions - keyword research with numbers
   backlinks  inbound links, by count and by source URL
   queries    the queries this site actually appears for on Bing
@@ -17,6 +18,11 @@ worrying about.
              ranking for its own language is a win to extend, the homepage
              ranking for that language is a targeting bug
   pagequeries  the queries ONE page appears for - attribution for the above
+  urlinfo    Bing's own index record for ONE url - discovered, last crawled,
+             size. The Bing counterpart to Google's URL Inspection, and the
+             one that matters where Bing carries the traffic. ⚠ a URL that
+             does not exist returns the SAME empty answer as a real page Bing
+             has never seen - always run it with a known-crawled control
   traffic    clicks / impressions / rank over time
 
 ⚠️ THE ONE THING THAT MATTERS MOST HERE: these are **BING IMPRESSIONS**, not
@@ -38,6 +44,16 @@ genuinely valuable:
     demand somewhere. The converse does not hold - near-zero on Bing does not
     prove near-zero on Google.
 
+⚠ `known_to_bing: false` MEANS "Bing's keyword database has no row for this
+string" - it does NOT mean the query is small, and it must never be used as a
+demand gate. Measured 2026-09-01 on us/en-US over 90 days: `cs 1.6 non steam`
+returned exact = **2**, while `cs 1.6 config`, `cs 1.6 wallhack` and
+`cs 1.6 servers list` - all plainly larger - returned nothing at all. An endpoint
+that reports 2 for one query and nothing for bigger ones is not thresholding by
+volume; its coverage is patchy. So an unknown query is UNMEASURED, which is a
+different state from "no demand" and belongs on the "cannot ask" side of the
+providers.py rule.
+
 Read references/data-sources.md before wiring this into a gate.
 
 Stdlib only. Key from BING_WEBMASTER_API_KEY or ~/.bing_webmaster_key (0600).
@@ -47,12 +63,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 BASE = "https://ssl.bing.com/webmaster/api.svc/json"
 UA = "seo-manager/1.0"
@@ -218,6 +235,76 @@ def backlinks(key, site, pages):
     return out
 
 
+# .NET serialises DateTime.MinValue as /Date(-62135568000000-0800)/. That is not a
+# date, it is "never" - and read naively it becomes year 0001, or a crash. Bing uses it
+# for both DiscoveryDate and LastCrawledDate on a URL it has no record of.
+DOTNET_MIN_MS = -62135568000000
+
+
+def _dotnet_date(v):
+    """/Date(1787460331000)/ -> '2026-08-21'. The MinValue sentinel -> None."""
+    if not isinstance(v, str):
+        return None
+    m = re.search(r"\((-?\d+)", v)
+    if not m:
+        return None
+    ms = int(m.group(1))
+    if ms <= DOTNET_MIN_MS:
+        return None
+    return datetime.utcfromtimestamp(ms / 1000).strftime("%Y-%m-%d")
+
+
+def urlinfo(key, site, url):
+    """Bing's OWN record of one URL: discovered, last crawled, size.
+
+    The Bing counterpart to Google's URL Inspection, and on a site where Bing
+    carries the traffic it is the one that matters. Free, no quota worth counting.
+
+    ⚠ THE TRAP THIS WRAPS. Bing answers ok:true for a URL THAT DOES NOT EXIST,
+    with exactly the same all-sentinel payload it returns for a real page it has
+    never seen. Measured 2026-09-01 on combatskirmish.net: /guides/bunny-hop (a
+    live 200) and /does-not-exist-zzz were byte-identical - both DateTime.MinValue
+    on each date, DocumentSize 0 - while /maps/de_dust2 carried a real discovery
+    and crawl date. So `known_to_bing: false` says "Bing has no record of this
+    string", never "this page exists and Bing declined it", and the two are
+    different findings. Always carry a URL you KNOW is crawled as a control.
+
+    HttpStatus is deliberately not surfaced: it came back 0 on crawled and unknown
+    URLs alike, so reporting it would ship a field that looks meaningful and is not.
+
+    ⚠ IT THROTTLES, AND A THROTTLE LOOKS LIKE AN ANSWER. A tight loop over 46 URLs
+    returned errors for 35 of them (measured 2026-09-01); scored naively that is a
+    76% "not indexed" finding and it was pure rate limiting. Space calls ~1.5s+,
+    retry with backoff, and keep UNMEASURED as a bucket separate from `unknown` -
+    collapsing the two is the same mistake as reading a refused SERP as an empty
+    page 1.
+    """
+    r = call("GetUrlInfo", key, siteUrl=site, url=url)
+    if not r["ok"]:
+        return r
+    d = r["d"] or {}
+    discovered = _dotnet_date(d.get("DiscoveryDate"))
+    crawled = _dotnet_date(d.get("LastCrawledDate"))
+    size = d.get("DocumentSize") or 0
+    return {
+        "ok": True,
+        "url": url,
+        "known_to_bing": bool(discovered or crawled or size),
+        "discovered": discovered,
+        "last_crawled": crawled,
+        "document_size": size,
+        "is_page": d.get("IsPage"),
+        "anchor_count": d.get("AnchorCount"),
+        "child_urls": d.get("TotalChildUrlCount"),
+        "empty_means": (
+            "known_to_bing false = Bing has NO RECORD of this URL string. It is NOT "
+            "evidence the page is excluded or penalised, and it is the SAME answer "
+            "Bing gives for a URL that does not exist - so pair it with a control URL "
+            "you know is crawled before reading it as a finding."
+        ),
+    }
+
+
 def queries(key, site, limit):
     r = call("GetQueryStats", key, siteUrl=site)
     if not r["ok"]:
@@ -351,7 +438,14 @@ def main():
     common.add_argument("--site", help="site url; inferred when the account has exactly one verified site")
     common.add_argument("--country", default="us")
     common.add_argument("--language", default="en-US")
-    common.add_argument("--days", type=int, default=90, help="lookback window (default 90)")
+    # default=None, NOT 90: only `keyword` and `expand` reach an endpoint that
+    # takes a date range. The other subcommands hit endpoints with NO window
+    # parameter at all, so a --days they silently accepted would be a lie that
+    # reads as data - `--days 7` and `--days 30` returned byte-identical rows
+    # on a live account (2026-09-01), which reads as "positions unchanged this
+    # week" and is actually the same fixed window answered twice.
+    common.add_argument("--days", type=int, default=None,
+                        help="lookback window (keyword/expand only; default 90)")
     common.add_argument("--limit", type=int, default=50)
 
     p = argparse.ArgumentParser(
@@ -366,6 +460,9 @@ def main():
         ("pages", "per-PAGE impressions/clicks/CTR - which URL actually earns"),
     ]:
         sub.add_parser(name, help=helptext, parents=[common])
+    ui = sub.add_parser("urlinfo", help="Bing's own record of ONE url: discovered, last crawled, size",
+                        parents=[common])
+    ui.add_argument("--url", required=True, help="exact URL to look up")
     pq = sub.add_parser("pagequeries", help="the queries ONE page appears for",
                         parents=[common])
     pq.add_argument("--page", required=True, help="exact URL as bing.py pages reports it")
@@ -380,8 +477,28 @@ def main():
         print(json.dumps({"ok": False, "error": "no BING_WEBMASTER_API_KEY and no ~/.bing_webmaster_key"}))
         sys.exit(2)
 
+    WINDOWED = ("keyword", "expand")
+    if a.days is not None and a.cmd not in WINDOWED:
+        print(json.dumps({
+            "ok": False,
+            "error": "window_not_selectable",
+            "detail": (
+                f"`{a.cmd}` reads a Bing endpoint that takes no date range, so --days "
+                "cannot be honoured. It is refused rather than ignored: two --days "
+                "values return identical rows, which reads as 'nothing changed' when "
+                "it means 'the window was never applied'."
+            ),
+            "windowed_commands": list(WINDOWED),
+            "what_to_do": (
+                "Drop --days and read the fixed window Bing returns, or compare "
+                "snapshots over time yourself (bing.py traffic is a dated series and "
+                "IS a real time signal)."
+            ),
+        }, indent=2))
+        sys.exit(2)
+
     end = date.today()
-    start = end - timedelta(days=a.days)
+    start = end - timedelta(days=a.days if a.days is not None else 90)
     s, e_ = start.strftime(DATE_FMT), end.strftime(DATE_FMT)
 
     if a.cmd == "sites":
@@ -395,7 +512,9 @@ def main():
         if err:
             print(json.dumps(err, indent=2))
             sys.exit(3)
-        if a.cmd == "pagequeries":
+        if a.cmd == "urlinfo":
+            out = urlinfo(key, site, a.url)
+        elif a.cmd == "pagequeries":
             out = pagequeries(key, site, a.page, a.limit)
         else:
             out = {"backlinks": backlinks, "queries": queries,
@@ -403,6 +522,15 @@ def main():
                 *( (key, site, a.limit)
                    if a.cmd in ("backlinks", "queries", "pages") else (key, site) )
             )
+
+    # State the window on every report that has one it did not choose, so a
+    # reader who never passed --days still knows the span is Bing's, not theirs.
+    if a.cmd in ("queries", "pages", "pagequeries", "traffic") and out.get("ok"):
+        out.setdefault(
+            "window",
+            "Bing's own fixed reporting window - not selectable here; --days is refused "
+            "on this subcommand rather than silently ignored.",
+        )
 
     print(json.dumps(out, indent=2))
     sys.exit(0 if out.get("ok") else 3)

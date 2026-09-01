@@ -149,6 +149,28 @@ Fold case-duplicate identities at generation time and log every drop.
 - **Self-referencing canonical** on every generated page.
 - **Sitemap**: split at 50,000 URLs / 50 MB; `lastmod` = the data's update time,
   not the build time; never list a `noindex` URL.
+  ⚠ **Verify the lastmod rule rather than stating it — it is the one here most
+  likely to be violated by a generator that looks correct.** One command:
+  ```bash
+  curl -s https://example.com/sitemap.xml | grep -oE "https://[^<]+\.xml" \
+    | xargs -I{} curl -s {} | grep -oE "<lastmod>[^<]+</lastmod>" | sort | uniq -c
+  ```
+  **One date with the full URL count beside it is the failure**, and it is silent:
+  Google uses `lastmod` only while it is consistently accurate, so a tree that
+  stamps every URL with the build date has no freshness signal at all rather than
+  a slightly stale one. Measured on combatskirmish.net 2026-09-01: all **5,388**
+  URLs carried the same date, defended in the generator by a comment reasoning
+  that "the whole tree genuinely is regenerated in a single pass — every page's
+  content is as new as this run". Regenerated is not modified, and at that site's
+  observed Googlebot rate (~55 fetches/day) one full pass over the sitemap takes
+  ~97 days, which is exactly when you want to tell a crawler which URLs moved.
+  **The fix that is not fiction: hash each generated page and keep a committed
+  `url -> {hash, date}` manifest** — an unchanged hash keeps its stored date, a
+  changed or new one takes today. The date is then provable from the tree, and
+  URLs with no generated file behind them (SPA routes, server-rendered tiers whose
+  data really does change daily) keep the build date honestly. Control it by
+  running the generator **twice**: the second run must report zero changed and
+  produce byte-identical sitemaps.
 - **Internal links**: hub → spokes, plus 3–5 genuinely related siblings.
   ⚠ Resolve every sibling link **per record** — a related-items block that
   assumes all siblings share the current page's URL shape (locale, tier, prefix)
