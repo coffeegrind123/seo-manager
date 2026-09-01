@@ -12,6 +12,11 @@ worrying about.
   expand     related keywords WITH impressions - keyword research with numbers
   backlinks  inbound links, by count and by source URL
   queries    the queries this site actually appears for on Bing
+  pages      per-PAGE impressions, clicks and CTR - WHICH URL earns. `queries`
+             cannot answer that, and the two have opposite fixes: a locale page
+             ranking for its own language is a win to extend, the homepage
+             ranking for that language is a targeting bug
+  pagequeries  the queries ONE page appears for - attribution for the above
   traffic    clicks / impressions / rank over time
 
 ⚠️ THE ONE THING THAT MATTERS MOST HERE: these are **BING IMPRESSIONS**, not
@@ -234,6 +239,89 @@ def queries(key, site, limit):
     return res
 
 
+def pages(key, site, limit):
+    """Per-PAGE impressions and clicks - the dimension `queries` cannot give you.
+
+    WHY THIS EXISTS (2026-09-01, combatskirmish.net). `queries` said the
+    best-converting terms on the site were Chinese - 488 clicks on 1,462
+    impressions at position 2 - and there was no way to find out WHICH PAGE
+    earned them. Query-level data alone cannot answer "is our Chinese locale
+    working, or is the English homepage ranking for Chinese queries?", and those
+    two have opposite fixes. `pages` answered it in one call: /zh/ carried 8,522
+    impressions and 2,298 clicks at position 4 - a 27% CTR, and more than three
+    times the clicks the homepage got from four times the impressions. 70% of the
+    site's clicks came from one locale page that every internal-linking audit had
+    flagged as having no editorial inbound links at all.
+
+    ⚠ Bing returns this through GetPageStats, whose rows put the PAGE URL in a
+    field named `Query`. That is Bing's naming, not a bug here, and reading it as
+    a search term silently turns a page report into nonsense.
+    """
+    r = call("GetPageStats", key, siteUrl=site)
+    if not r["ok"]:
+        return r
+    rows = r["d"] or []
+    agg: dict = {}
+    for x in rows:
+        # `Query` holds the URL for this endpoint - see the warning above.
+        u = x.get("Query")
+        if not u:
+            continue
+        a = agg.setdefault(u, {"url": u, "impressions": 0, "clicks": 0, "_pos": []})
+        a["impressions"] += x.get("Impressions") or 0
+        a["clicks"] += x.get("Clicks") or 0
+        if x.get("AvgImpressionPosition"):
+            a["_pos"].append(x["AvgImpressionPosition"])
+    out = []
+    for a in agg.values():
+        pos = a.pop("_pos")
+        a["avg_position"] = round(sum(pos) / len(pos), 1) if pos else None
+        # CTR is the reason to read this report rather than the impression column:
+        # a page can carry a fraction of the impressions and most of the clicks.
+        a["ctr"] = round(a["clicks"] / a["impressions"], 4) if a["impressions"] else None
+        out.append(a)
+    out.sort(key=lambda x: x["clicks"] or 0, reverse=True)
+    res = {"ok": True, "site": site, "count": len(out),
+           "totals": {"impressions": sum(x["impressions"] for x in out),
+                      "clicks": sum(x["clicks"] for x in out)},
+           "pages": out[:limit],
+           "reading": ("Sorted by CLICKS, not impressions. A high-impression page with a "
+                       "low CTR and a low-impression page with a high CTR need opposite "
+                       "work, and the impression column hides that.")}
+    if not out:
+        res["empty_means"] = ("authorised and genuinely empty - Bing has no page data for "
+                              "this site yet. On a newly added property that is expected and "
+                              "is NOT evidence that no page ranks.")
+    return res
+
+
+def pagequeries(key, site, page, limit):
+    """The queries ONE page appears for - attribution, the other half of `pages`.
+
+    `pages` says /zh/ earns 70% of the clicks; this says which searches sent
+    them, which is what tells you whether the win is repeatable or a single term.
+    """
+    r = call("GetPageQueryStats", key, siteUrl=site, page=page)
+    if not r["ok"]:
+        return r
+    rows = r["d"] or []
+    out = [{"query": x.get("Query"), "impressions": x.get("Impressions"),
+            "clicks": x.get("Clicks"), "avg_position": x.get("AvgImpressionPosition")}
+           for x in rows]
+    out.sort(key=lambda x: x["impressions"] or 0, reverse=True)
+    res = {"ok": True, "site": site, "page": page, "count": len(out), "queries": out[:limit]}
+    if not out:
+        # ⛔ A URL Bing has never ranked and a MISTYPED URL both return an empty
+        # list, and they are completely different findings. Say so rather than
+        # letting an empty array read as "this page ranks for nothing".
+        res["empty_means"] = ("authorised and empty. This is EITHER a page Bing has no "
+                              "query data for, OR a URL that does not match what Bing "
+                              "indexed (a missing/extra trailing slash is enough). Confirm "
+                              "the exact URL with `bing.py pages` before reading this as a "
+                              "finding about the page.")
+    return res
+
+
 def traffic(key, site):
     r = call("GetRankAndTrafficStats", key, siteUrl=site)
     if not r["ok"]:
@@ -275,8 +363,12 @@ def main():
         ("backlinks", "inbound links"),
         ("queries", "queries this site appears for"),
         ("traffic", "clicks/impressions over time"),
+        ("pages", "per-PAGE impressions/clicks/CTR - which URL actually earns"),
     ]:
         sub.add_parser(name, help=helptext, parents=[common])
+    pq = sub.add_parser("pagequeries", help="the queries ONE page appears for",
+                        parents=[common])
+    pq.add_argument("--page", required=True, help="exact URL as bing.py pages reports it")
     k = sub.add_parser("keyword", help="impressions for one query", parents=[common])
     k.add_argument("--q", required=True)
     e = sub.add_parser("expand", help="related keywords WITH impressions", parents=[common])
@@ -303,9 +395,14 @@ def main():
         if err:
             print(json.dumps(err, indent=2))
             sys.exit(3)
-        out = {"backlinks": backlinks, "queries": queries, "traffic": traffic}[a.cmd](
-            *( (key, site, a.limit) if a.cmd in ("backlinks", "queries") else (key, site) )
-        )
+        if a.cmd == "pagequeries":
+            out = pagequeries(key, site, a.page, a.limit)
+        else:
+            out = {"backlinks": backlinks, "queries": queries,
+                   "traffic": traffic, "pages": pages}[a.cmd](
+                *( (key, site, a.limit)
+                   if a.cmd in ("backlinks", "queries", "pages") else (key, site) )
+            )
 
     print(json.dumps(out, indent=2))
     sys.exit(0 if out.get("ok") else 3)
