@@ -276,7 +276,7 @@ strength:
 2. **(b)** an original measurement or benchmark — time it, count it, compare two
    approaches on the same task and report the numbers;
 3. **(c)** the site's OWN data as a citable stat — `seostate.py rankings` and the
-   `search-console` skill return this project's real traffic and rank history;
+   `gsc.py query` returns this project's real traffic and rank history;
 4. **(d)** an original worked example or end-to-end config no docs page shows;
 5. **(e)** a clear, defended stance where every page-1 result hedges.
 

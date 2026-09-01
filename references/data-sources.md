@@ -402,7 +402,7 @@ is swallowed for the same reason.
 |---|---|---|---|---|
 | **Google Autocomplete** (`suggestqueries`) | free | no | ✅ **verified working** | The free-mode research primitive, and what every "free keyword tool" is built on. Real queries, ordered roughly by popularity. **No volume numbers.** `keywords.py expand` sweeps it with modifier sets, question forms, comparison forms, audience/constraint qualifiers, problem strings, tool-intent verbs, and optional a–z alphabet soup. |
 | **YouTube autocomplete** | free | no | ✅ available | `keywords.py expand --source youtube`. A different demand shape — useful for video-led niches and for spotting how people phrase a problem out loud. |
-| **Search Console queries** | free | service account | ✅ (via `search-console` skill) | **The single best free seam.** Queries this domain *already* earns impressions for, at position 11–50, are proven relevant and half-ranked. `keywords.py gsc <export.json> --band striking-distance`. |
+| **Search Console queries** | free | service account | ✅ (via `gsc.py`) | **The single best free seam.** Queries this domain *already* earns impressions for, at position 11–50, are proven relevant and half-ranked. `keywords.py gsc <export.json> --band striking-distance`. |
 | **DataForSEO keyword ideas** | paid | yes | — | The only source here with real monthly volume + KD. `keywords.py volume`, max 5 seeds per call — seed it with **mid-tail phrases, never head terms** (see the research workflow, step 1.5). |
 
 ### The demand proxy — what it is and what it is not
@@ -572,15 +572,45 @@ it needs an OAuth app or the browser MCP. HN + StackExchange cover the same
 
 ---
 
-## Search Console — use the skill, not a new integration
+## Search Console — `gsc.py`, in this skill
 
-The `search-console` skill already does this properly: service-account JWT + curl,
-no MCP server, no dependencies. It covers sitemaps, index status, and the
-search-analytics queries that matter (striking distance, cannibalisation, CTR
-underperformance, lost traffic).
+⚠ **This section used to say "use the skill, not a new integration" and
+"do not build a second GSC integration here". That was right about the second
+integration and wrong about where the first one belonged**, and the cost was
+visible for months before anyone named it:
 
-**Do not build a second GSC integration here.** Export its JSON and pipe it into
-`keywords.py gsc`.
+- `decay.py` — the instrument that finds the highest-return work on any site
+  older than a few months — opened with *"INPUT: rows, from the `search-console`
+  skill"* and required the operator to export two JSON files by hand and
+  remember which was which. That is precisely the shape that produced this
+  skill's fake "100% page-1 churn": two measurements gathered under different
+  conditions and diffed as if they were one.
+- `indexnow.py` could ping Bing, Yandex, Seznam and Naver automatically and had
+  to print a manual checklist for Google, including the one Google step that
+  *is* automatable — the sitemap re-submit.
+- The post-deploy sequence therefore could not run unattended at all, and lived
+  as a per-project shell script that shelled out to a different skill.
+
+One capability, three places, none of them able to run without a human in the
+middle. `gsc.py` (2026-09-01) brings it inside: `sites`, `sitemaps`,
+`sitemap-submit`, `inspect`, `query`, `decay-export`. Still no MCP server and
+still no dependencies — the RS256 service-account JWT is signed in pure Python
+(PKCS#8 → EMSA-PKCS1-v1_5 → `pow()`), so there is not even an `openssl` binary
+to be missing, and the signer proves itself offline in `gsc.py control` rather
+than failing as an opaque `invalid_grant`.
+
+**The rule that survives: do not build a SECOND one.** `keywords.py gsc`,
+`decay.py`, `authority.py` and `rankcheck.py` all read what `gsc.py` emits, and
+it deliberately emits Google's OWN row shape so a helpfully-renamed field here
+cannot break them.
+
+Three ways this API returns confident nonsense, all guarded in `gsc.py`:
+`contents[].indexed` is a stuck counter that reads 0 on properties with
+thousands of indexed URLs (reported as `null`, never as a number); every count
+comes back as a **string**, and `"9" > "5388"` is true; and the data lags 2-3
+days, so a window ending today is thin because it is not processed yet, not
+because traffic collapsed — a window entirely inside the lag is refused rather
+than answered with zero.
 
 This is also the **only free source of real, absolute demand data for this
 domain** — impressions are actual counts, not estimates. On a site with any
@@ -1056,7 +1086,7 @@ the same "free SEO API" shortlist does not get re-litigated every few months.
 
 | Skill | Use it for |
 |---|---|
-| `search-console` | index status, sitemaps, real impressions/clicks/position, striking distance |
+| `gsc.py` | index status, sitemaps, real impressions/clicks/position, striking distance |
 | `browser-automation` | real Google SERPs, AI Overview reads, filling directory submission forms |
 | `seo-audit` / `seo-audit-full` | on-page technical audit of a single URL — this skill's `build-guide` handles new pages, those two handle existing ones |
 | `adsense` | monetizing the content the pipeline publishes (placement, CLS, consent, ads.txt, and reading the earnings back) |

@@ -272,6 +272,72 @@ Three things in the fix are the reusable part:
   `YandexFavicons` and `YandexUserproxy` (all sitting unnamed in `other-bot`)
   would otherwise have broken it.
 
+### ✅ #13 — Search Console was a sibling SKILL, and three instruments could not reach it — **BUILT 2026-09-01 (`gsc.py`, `postdeploy.py`)**
+
+Not a survey finding. It came from the owner asking why the post-deploy step was
+a per-project shell script plus a different skill, and the answer was that this
+file had explicitly ruled the integration out: `references/data-sources.md`
+carried a section headed *"Search Console — use the skill, not a new
+integration"* ending **"Do not build a second GSC integration here."**
+
+That was right about the second integration and wrong about where the first one
+belonged. The cost had been visible for months without being named:
+
+- **`decay.py`** — the instrument that finds the highest-return work on any site
+  older than a few months — opened with *"INPUT: rows, from the `search-console`
+  skill"* and made the operator export two JSON files by hand and remember which
+  was which. That is exactly the shape that produced this skill's fake "100%
+  page-1 churn".
+- **`indexnow.py`** pinged four engines automatically and printed a manual
+  checklist for Google — including the one Google step that IS automatable, the
+  sitemap re-submit.
+- The **post-deploy sequence** therefore could not run unattended at all.
+
+`gsc.py`: `sites`, `sitemaps`, `sitemap-submit`, `inspect`, `query`,
+`decay-export`. Still stdlib-only — the RS256 service-account JWT is signed in
+pure Python (PKCS#8 → EMSA-PKCS1-v1_5 → `pow()`), so there is not even an
+`openssl` binary to be missing, and the signer proves itself with an offline
+sign/verify round-trip rather than failing as an opaque `invalid_grant`.
+
+Three traps, each probed live before a line was written, each returning
+confident nonsense rather than an error:
+
+- **`contents[].indexed` is a stuck counter.** It reads `0` on a property with
+  thousands of demonstrably indexed URLs. Reported as `null` with a note —
+  "0 of 5,388 indexed" is the most alarming and most wrong thing the endpoint
+  can say.
+- **Every count is a STRING.** `"9" > "5388"` is `True`, so any unconverted
+  threshold silently inverts. Controlled in both directions, including a check
+  that the raw comparison really is wrong, so the coercion is not cargo cult.
+- **The data lags 2-3 days.** A window ending today comes back thin, and that is
+  the lag, not a collapse. A window entirely inside it is REFUSED with the last
+  complete day named, rather than answered with zero rows.
+
+`postdeploy.py` is the sequence: health gate → contract → IndexNow → Google,
+dry-run until `--yes`. Two things it taught while being built:
+
+- ⚠ **Retiring the project's own IndexNow client would have been a silent
+  regression, and the skill's tests would all still have passed.** The local
+  script submitted from `public/sitemap.xml`; the skill's `ping --pending` reads
+  the CONTENT QUEUE, which on a generated site is empty by construction. Measured
+  on the 5,388-URL silo: `--pending` submitted **0 and reported `ok`**. Caught by
+  running it before deleting anything. `indexnow.py` now takes `--sitemap`
+  (follows an index one level, dedupes, and treats an empty or unreadable feed as
+  an ERROR — an empty list would ping nothing and call it success), and
+  `postdeploy.py` uses that source. Parity confirmed at 5,388 URLs.
+- **The receipt exists because of a question with no answer.** "Was IndexNow
+  pinged for that deploy?" was unanswerable: Google records `lastSubmitted` so
+  its side was provable, Bing's URL-submission quota is a different channel whose
+  own tool says so, and IndexNow returns 200 and keeps no queryable history. An
+  action with no receipt cannot be audited, so every run appends to
+  `.seo/postdeploy.jsonl`.
+
+**The rule that survives, and is now written where the old one was:** do not
+build a SECOND Search Console client. `keywords.py gsc`, `decay.py`,
+`authority.py` and `rankcheck.py` all read what `gsc.py` emits, and it
+deliberately emits Google's OWN row shape so a helpfully-renamed field here
+cannot break them.
+
 ### #11 — Yandex Webmaster API v4 — **MAPPED, DEFERRED BY THE OWNER 2026-09-01**
 
 The measurement that came out of #10 is the argument for it. Net of forgery, over

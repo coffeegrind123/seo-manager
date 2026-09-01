@@ -463,7 +463,7 @@ def cmd_gsc(a):
     data = json.loads(text)
     # Both shapes are supported ON PURPOSE: the Search Console API returns
     # {"rows": [...]}, but every natural way to save it - jq '.rows', a paged
-    # fetch that concatenates, the search-console skill's own examples - hands
+    # fetch that concatenates, gsc.py's own examples - hands
     # you the bare LIST. The isinstance test has to come FIRST: the old form
     # `data.get("rows", data if isinstance(data, list) else [])` evaluated
     # .get() on the list before the default could ever be used, so a bare list

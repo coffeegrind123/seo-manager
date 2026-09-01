@@ -69,7 +69,7 @@ curated one.
 
 ## 2. Get the index evidence — mandatory, not optional
 
-Use the `search-console` skill. Sample **5–10 pages spread across the ratio
+Use `gsc.py query`. Sample **5–10 pages spread across the ratio
 range**, always including the worst.
 
 1. **URL Inspection** on each.

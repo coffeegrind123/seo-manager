@@ -98,7 +98,7 @@ python3 $SEO/seostate.py ai-visibility --days 90
 python3 $SEO/seostate.py next-actions
 ```
 
-Plus 28 days of Search Console via the `search-console` skill (clicks,
+Plus 28 days of Search Console via `gsc.py query` (clicks,
 impressions, CTR, position — by query and by page).
 
 **Success criteria**: Rankings, overview, AI visibility, next-actions and 28 days of Search Console are all in hand before anything is written.

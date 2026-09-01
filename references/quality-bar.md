@@ -17,7 +17,7 @@ than SerpApi/DataForSEO.
 |---|---|---|
 | `scripts/seostate.py` | ALL state: queue, tracked keywords, rank history, published pages, trend radar, backlink prospects, profile, run log | raw keyword/SERP research |
 | `scripts/serp.py`, `scripts/keywords.py`, `scripts/authority.py` | raw research: live SERPs, keyword expansion, volume/KD where available, domain authority | storing anything |
-| `search-console` skill | real impressions, clicks, position, index status for THIS domain | anything about other sites |
+| `gsc.py` (Search Console) | real impressions, clicks, position, index status for THIS domain | anything about other sites |
 
 **If a tool call fails, SAY SO and stop that step. Never fabricate data — no
 invented volumes, difficulties, positions, or stats, ever.** A failed call is

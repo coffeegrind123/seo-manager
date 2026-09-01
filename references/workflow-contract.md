@@ -18,6 +18,41 @@ the deploy finishes and costs one fetch per URL.
 
 ---
 
+## 0. Or run the whole post-deploy sequence at once
+
+`contract.py` is step 2 of four, and the other three are the ones that get
+skipped. `postdeploy.py` runs them in the only safe order:
+
+```bash
+python3 $SEO/postdeploy.py --root .            # checks only, announces nothing
+python3 $SEO/postdeploy.py --root . --yes      # ...and announce
+```
+
+1. **Health gate** — `/`, `/sitemap.xml`, `/robots.txt` must all return 200.
+   A deploy that swaps a release directory can 404 the entire site for
+   minutes, and announcing inside that window points every engine at a dead
+   site. It has happened: a sitemap submit landed in the window, came back
+   with errors, and the CDN then served a cached `/robots.txt` 404 for four
+   hours. A query string cannot evict that; only a purge can.
+2. **Contract check** — this document. Deliberately BEFORE the submit, so a
+   recrawl is never invited onto markup that just regressed.
+3. **IndexNow** — Bing, Yandex, Seznam, Naver, DuckDuckGo-via-Bing.
+4. **Google** — `gsc.py sitemap-submit`. The only programmatic nudge Google
+   offers, and it asks for a FEED re-read rather than for a URL to be indexed.
+
+Then it writes a line to `.seo/postdeploy.jsonl`. That receipt exists because
+the question *"was IndexNow pinged for that deploy?"* turned out to have no
+answer anywhere: Google records `lastSubmitted` so its side was provable, Bing's
+URL-submission quota is a different channel that says nothing about IndexNow,
+and IndexNow itself returns 200 and keeps no history you can query. An action
+with no receipt cannot be audited.
+
+**Submissions are a dry run until `--yes`; the checks always run.** A non-zero
+exit means something needs reading — most often an open contract warning, which
+is the gate doing its job.
+
+---
+
 ## 1. Choose the URL set
 
 Small and representative beats exhaustive. One page per template is the right

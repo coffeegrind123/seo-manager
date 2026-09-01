@@ -172,7 +172,7 @@ Worth knowing so the report is honest about its own edges:
   access log knows what the real bot fetched, how often, and what it was served
   → `workflow-crawl-log.md`.
 - **Whether a page is indexed.** Auditors read the page; only Search Console
-  knows Google's decision → the `search-console` skill.
+  knows Google's decision → `gsc.py inspect`.
 - **Whether a thin page is a problem.** `content-quality-audit` measures the
   text. Indexation decides → `workflow-programmatic.md`.
 - **Whether a fix worked.** That is `decay` and `drift`, weeks later.

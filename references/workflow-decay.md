@@ -32,7 +32,7 @@ an analytics tool.
 
 ## 1. Pull two periods
 
-Use the `search-console` skill. You need the `page` dimension; add `query` to
+Use `gsc.py decay-export` (one command, both windows) or `gsc.py query`. You need the `page` dimension; add `query` to
 unlock the cannibalisation check.
 
 Compare **equal-length, recent, non-overlapping** windows — 28 and 28 is the

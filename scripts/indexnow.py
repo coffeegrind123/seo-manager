@@ -9,8 +9,12 @@ WHAT IS AND IS NOT POSSIBLE (this matters, because the internet lies about it):
   Google Indexing API Restricted to JobPosting and BroadcastEvent pages. Using
                       it for ordinary content is against its terms and simply
                       does not work. This script will not pretend otherwise.
+  Sitemap submit      The ONE programmatic nudge Google offers, and it asks for
+                      a FEED re-read rather than for a URL to be indexed.
+                      `gsc.py sitemap-submit` does it; `postdeploy.py` runs it
+                      in sequence behind a health gate.
   URL Inspection API  READ-only. It can tell you whether Google has a page; it
-                      cannot ask Google to take one. (search-console skill.)
+                      cannot ask Google to take one. (`gsc.py inspect`.)
   "Request indexing"  The fastest legitimate accelerator for Google, and it is
                       a HUMAN clicking a button in Search Console. This script
                       batches the pending list into one paste-ready set of
@@ -33,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -41,6 +46,8 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+UA = "seo-manager/1.0 (+indexnow)"
 
 HERE = Path(__file__).resolve().parent
 ENDPOINT = "https://api.indexnow.org/IndexNow"
@@ -151,8 +158,96 @@ def run_control() -> dict:
             ENDPOINT.startswith("https://") and "indexnow" in ENDPOINT, ENDPOINT)
     c.check("success_and_failure_are_not_the_same_string",
             STATUS_MEANING[200] != STATUS_MEANING[400])
+
+    # The sitemap reader. `--pending` on a generated site resolves to zero and
+    # reports ok, so this is the source that actually announces anything - and
+    # a reader that silently returns [] would recreate the same no-op with a
+    # different name.
+    import tempfile                          # noqa: PLC0415 - control-only
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "child.xml").write_text(
+            '<?xml version="1.0"?><urlset><url><loc>https://x.test/a</loc></url>'
+            '<url><loc>https://x.test/b</loc></url>'
+            '<url><loc>https://x.test/a</loc></url></urlset>', encoding="utf-8")
+        (d / "index.xml").write_text(
+            f'<?xml version="1.0"?><sitemapindex><sitemap><loc>{d / "child.xml"}</loc>'
+            '</sitemap></sitemapindex>', encoding="utf-8")
+        urls, err = read_sitemap(str(d / "child.xml"))
+        c.check("a_flat_sitemap_yields_its_locs", urls == ["https://x.test/a",
+                                                          "https://x.test/b"] and not err,
+                f"{urls} {err}")
+        c.check("duplicate_locs_are_collapsed", len(urls) == 2,
+                "submitting the same URL twice in one batch wastes the batch")
+        idx, err = read_sitemap(str(d / "index.xml"))
+        c.check("a_sitemap_INDEX_is_followed_one_level", idx == urls and not err,
+                f"{idx} {err}")
+        (d / "empty.xml").write_text("<urlset></urlset>", encoding="utf-8")
+        urls, err = read_sitemap(str(d / "empty.xml"))
+        c.check("an_empty_sitemap_is_an_ERROR_not_an_empty_submit",
+                urls == [] and bool(err),
+                "an empty list would ping nothing and report success")
+        urls, err = read_sitemap(str(d / "does-not-exist.xml"))
+        c.check("an_unreadable_sitemap_is_an_ERROR_not_an_empty_submit",
+                urls == [] and bool(err),
+                "this is the failure that turns a broken feed into '0 URLs submitted, ok'")
+        urls, _e = read_sitemap(str(d / "child.xml"), limit=1)
+        c.check("CONTROL_the_limit_is_honoured", urls == ["https://x.test/a"])
+
     return c.verdict(known_statuses=sorted(STATUS_MEANING),
                      note="nothing was submitted; this proves the READER, not the account")
+
+
+def read_sitemap(src, limit=50000):
+    """Every <loc> in a sitemap or sitemap index. (urls, error).
+
+    Follows one level of index, which is all the spec allows. A sitemap that
+    cannot be read is an ERROR, never an empty list: submitting "no URLs" after
+    a failed fetch reads as a successful ping of nothing.
+    """
+    seen, out_urls = set(), []
+
+    def fetch(u):
+        if re.match(r"^https?://", u):
+            req = urllib.request.Request(u, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                raw = r.read()
+        else:
+            raw = Path(u).read_bytes()
+        if raw[:2] == b"\x1f\x8b":
+            import gzip                       # noqa: PLC0415 - only for .gz feeds
+            raw = gzip.decompress(raw)
+        return raw.decode("utf-8", "replace")
+
+    try:
+        body = fetch(src)
+    except Exception as exc:                  # noqa: BLE001 - reported, not raised
+        return [], f"could not read {src}: {exc}"
+    locs = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", body)
+    if "<sitemapindex" in body[:2000]:
+        for child in locs:
+            if len(out_urls) >= limit:
+                break
+            try:
+                sub = fetch(child)
+            except Exception as exc:          # noqa: BLE001
+                return [], f"could not read child sitemap {child}: {exc}"
+            for u in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", sub):
+                if u not in seen:
+                    seen.add(u)
+                    out_urls.append(u)
+                    if len(out_urls) >= limit:
+                        break
+    else:
+        for u in locs:
+            if u not in seen:
+                seen.add(u)
+                out_urls.append(u)
+                if len(out_urls) >= limit:
+                    break
+    if not out_urls:
+        return [], f"no <loc> entries found in {src}"
+    return out_urls, None
 
 
 def cmd_ping(a):
@@ -170,11 +265,30 @@ def cmd_ping(a):
     pages = state(a.root, "pages").get("pages", [])
     if a.pending:
         urls += [p["url"] for p in pages if p.get("url") and not p.get("indexnow_submitted_at")]
+    sitemap_urls = []
+    if a.sitemap:
+        # `--pending` reads the CONTENT QUEUE, which only knows pages this skill
+        # published. On a generated silo - thousands of pages emitted by a
+        # build script and never queued - it resolves to ZERO and the ping
+        # becomes a no-op that still reports ok. Measured on a 5,388-URL site:
+        # `--pending` submitted 0. A sitemap is the only complete source of
+        # what that site actually publishes.
+        sitemap_urls, sm_err = read_sitemap(a.sitemap, a.limit)
+        if sm_err:
+            print(json.dumps({"ok": False, "error": sm_err, "sitemap": a.sitemap,
+                              "note": "refusing rather than submitting a partial set"},
+                             indent=2))
+            return 1
+        urls += sitemap_urls
     urls = [u for u in dict.fromkeys(urls) if u.startswith("http")]
     if not urls:
-        print(json.dumps({"ok": True, "submitted": 0,
-                          "note": "nothing pending - every logged page has already been submitted"},
-                         indent=2))
+        note = ("nothing pending - every logged page has already been submitted"
+                if a.pending and not a.sitemap else "no URLs resolved from the given sources")
+        if a.pending and not a.sitemap:
+            note += (". ⚠ On a GENERATED site the content queue is empty by "
+                     "construction and this zero is not a statement about the "
+                     "site - pass --sitemap <url> to submit what it publishes.")
+        print(json.dumps({"ok": True, "submitted": 0, "note": note}, indent=2))
         return 0
     if a.dry_run:
         print(json.dumps({"ok": True, "would_submit": urls, "host": domain}, indent=2))
@@ -242,7 +356,7 @@ def cmd_google_steps(a):
         "browser_option": "The browser-automation skill can drive this: navigate to Search Console, "
                           "inspect each URL, click Request indexing. Watch the quota, and confirm "
                           "each toast before moving on.",
-        "verification": "The search-console skill's URL Inspection query tells you whether Google "
+        "verification": "`gsc.py inspect` tells you whether Google "
                         "actually has each page - that is the real done signal, not the click.",
     }, indent=2))
     return 0
@@ -263,6 +377,11 @@ def main():
     s = sub.add_parser("ping", help="submit URLs to IndexNow (Bing/Yandex/Seznam/Naver)")
     s.add_argument("--url", action="append")
     s.add_argument("--pending", action="store_true", help="every logged page not yet submitted")
+    # The source that works on a GENERATED site, where the content queue is
+    # empty by construction and --pending resolves to zero while still
+    # reporting ok. Accepts a sitemap index and follows one level.
+    s.add_argument("--sitemap", help="sitemap URL or file - submit every <loc> (index ok)")
+    s.add_argument("--limit", type=int, default=50000, help="cap on URLs read from a sitemap")
     s.add_argument("--domain")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(fn=cmd_ping)

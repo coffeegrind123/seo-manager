@@ -614,7 +614,7 @@ def main():
         "(up to 100 total). Competitor benchmarking: who on page 1 actually outranks you.",
     )
     p.add_argument("--source", default="auto", choices=["auto", "dataforseo", "openpagerank", "estimate"])
-    p.add_argument("--gsc-impressions", type=int, help="last 28d impressions, from the search-console skill")
+    p.add_argument("--gsc-impressions", type=int, help="last 28d impressions (gsc.py query --dimensions date)")
     p.add_argument("--gsc-clicks", type=int, help="last 28d clicks")
     p.add_argument("--save", action="store_true", help="write dr into .seo/config.json via seostate.py")
     p.add_argument("--root", help="repo root for --save")

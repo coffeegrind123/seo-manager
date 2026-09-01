@@ -22,7 +22,7 @@ python3 $SEO/seostate.py overview
 
 Look at the `guides` and `tools` arrays: every page this pipeline already
 shipped, with its age and latest position. Pull the traffic side from the
-`search-console` skill (28-day query + page report). Pages published in the last
+`gsc.py query --dimensions page,query` (28-day report). Pages published in the last
 ~3 weeks are still settling — weigh them lightly — but anything older is a graded
 answer to "did our targeting work?", and it is the only honest evidence this run
 has.

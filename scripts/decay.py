@@ -32,12 +32,20 @@ turned on the same date is a site-wide event and a different problem from one
 page ageing out - and telling them apart stops you rewriting forty pages to fix
 one core-update hit.
 
-INPUT: Search Console search-analytics rows, from the `search-console` skill.
+INPUT: Search Console search-analytics rows. `gsc.py` in this same directory
+fetches them - it used to be a separate skill, and exporting two files by hand
+is exactly the shape that produced this skill's fake "100% page-1 churn": two
+measurements gathered under different conditions and diffed as if they were one.
 You need the `page` dimension. `query` as a second dimension is optional and
 unlocks the cannibalisation check.
 
-    search-console ... --dimensions page --start A --end B  > prev.json
-    search-console ... --dimensions page --start C --end D  > cur.json
+    gsc.py decay-export --window 28            # both windows, one command
+    decay.py compare --previous gsc-previous.json --current gsc-current.json
+
+or, if you want the windows yourself:
+
+    gsc.py query --dimensions page --start A --end B > prev.json
+    gsc.py query --dimensions page --start C --end D > cur.json
     decay.py compare --previous prev.json --current cur.json
 
 Or one export carrying the date dimension, split here:

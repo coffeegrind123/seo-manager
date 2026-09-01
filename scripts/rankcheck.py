@@ -162,7 +162,7 @@ def main():
         print(json.dumps({
             "ok": False,
             "error": "this project has no SERP provider (GSC-only mode).",
-            "how": "positions come from Search Console instead - use the search-console skill's "
+            "how": "positions come from Search Console instead - use `gsc.py query`'s "
                    "search-analytics query with dimension=query, and feed it to "
                    "`keywords.py gsc`. That is a real configuration, not a failure.",
         }, indent=2))

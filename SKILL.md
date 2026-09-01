@@ -6,14 +6,14 @@ description: >-
   IS, an owner-approved queue, content shipped as pull requests, rank tracking, trend
   radar, AI-visibility (GEO) measurement, backlink prospecting. It also MEASURES what
   is already published — access-log crawl budget, Googlebot and AI-crawler ingestion,
-  Search Console decay, page-1 drift, index bloat — and GUARDS your markup:
-  post-deploy contract check, hreflang mesh and content parity, agent-readiness,
-  AI-writing tells. Use when the user says: research keywords, what should I write
-  next, build the next guide, how are we ranking, fill the content queue, do AI
-  assistants cite us, find backlink prospects, what is Googlebot crawling, which pages
-  are losing traffic, did we get hit by an update, did the deploy break anything, is
-  our hreflang right. NOT for a one-page audit (use seo-audit), raw Search Console
-  queries (use search-console), or buying ads.
+  Search Console and Bing Webmaster data, decay, page-1 drift, index bloat — and
+  GUARDS your markup: post-deploy contract check, hreflang mesh and content parity,
+  agent-readiness, AI-writing tells. Use when the user says: research keywords, what
+  should I write next, build the next guide, how are we ranking, fill the content
+  queue, do AI assistants cite us, find backlink prospects, what is Googlebot
+  crawling, which pages are losing traffic, is this page indexed, submit the sitemap,
+  did we get hit by an update, did the deploy break anything. NOT for a one-page
+  audit (use seo-audit) or buying ads.
 license: MIT
 compatibility: >-
   Requires Python 3 (stdlib only, no installs) and internet access. Optional:
@@ -366,7 +366,7 @@ well as in the quality bar:
 Not everything needs a workflow. These are fine as direct answers, using the
 scripts:
 
-- *"How are we ranking?"* → `seostate.py rankings --days 30` + the `search-console`
+- *"How are we ranking?"* → `seostate.py rankings --days 30` + `gsc.py query`
   skill, then the **report** workflow's summary shape.
 - *"What should I write next?"* → `seostate.py suggestions --status approved` —
   the top of the queue is the answer.
@@ -398,8 +398,9 @@ boundaries now live in `description`, which is the field every client reads.
 
 So `description` is doing two jobs and sits near its 1024-char ceiling. When
 editing it, keep the trigger list and the three `NOT for…` boundaries — those
-are what stop this skill firing on work that belongs to `seo-audit`,
-`search-console`, or an ads task. Re-check with:
+are what stop this skill firing on work that belongs to `seo-audit` or an ads
+task. (`search-console` was a third boundary until 2026-09-01, when `gsc.py`
+brought Search Console inside — see references/data-sources.md.) Re-check with:
 
 ```bash
 python3 ~/.claude/skills/skill-refiner/skills/anthropic-skills/skills/skill-creator/scripts/quick_validate.py \
