@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import os
 import shlex
 import subprocess
 import sys
@@ -180,6 +181,23 @@ def run_measurement(cmd: str, timeout: int = 900) -> dict:
 
 
 # ------------------------------------------------------------------- commands
+def same_experiment(cmd: str, metric: str) -> tuple:
+    """The identity of an experiment is (what it runs, what it reads).
+
+    Not the id - an id is a label somebody chooses, and two people describing
+    the same intervention choose two labels. `shlex` normalisation matters
+    because the same command differs by quoting and `~` expansion between
+    sessions: `--ssh-key ~/.ssh/k` and `--ssh-key /home/u/.ssh/k` are one
+    experiment.
+    """
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        parts = cmd.split()
+    norm = [os.path.expanduser(t) for t in parts]
+    return (tuple(norm), metric.split(".")[-1])
+
+
 def record(a) -> dict:
     days = parse_after(a.after)
     if days is None:
@@ -187,6 +205,24 @@ def record(a) -> dict:
                       f"--after {a.after!r} is not a duration (use 14d / 3w / 2m)")
     if a.expect not in DIRECTIONS:
         return refuse("remeasure-record", f"--expect must be one of {DIRECTIONS}")
+
+    # Checked BEFORE the baseline is measured: taking a measurement to register
+    # a duplicate wastes the call and, worse, produces a SECOND baseline for one
+    # intervention taken at a different moment. Two hypotheses about one change
+    # can disagree in three weeks and nothing says which to believe.
+    existing = load(a.root)["hypotheses"]
+    mine = same_experiment(a.cmd, a.metric)
+    dupes = [h for h in existing.values()
+             if h.get("state") == "open" and h["id"] != a.id
+             and same_experiment(h["cmd"], h["metric"]) == mine]
+    if dupes and not a.force:
+        return refuse("remeasure-record",
+                      f"{dupes[0]['id']!r} is already open on the same command and "
+                      "metric - two baselines for one intervention can disagree, and "
+                      "nothing would say which to believe",
+                      existing=dupes[0],
+                      hint=("re-check or close the existing one. Pass --force only if "
+                            "this really is a different question about the same numbers"))
 
     baseline, source, err = a.baseline, "given", None
     if baseline is None:
@@ -225,6 +261,31 @@ def record(a) -> dict:
             "note": ("The direction and threshold are fixed NOW, before the answer is "
                      "known. That is what makes the later check a test rather than a "
                      "narration of whatever turned up.")}
+
+
+def close(a) -> dict:
+    """Retire a hypothesis with a stated reason.
+
+    There was no way to do this, so a hypothesis registered by mistake stayed
+    open forever and turned up in every `due` list - which is how a queue stops
+    being read. A reason is REQUIRED: closing without one is indistinguishable
+    from closing because the answer was inconvenient.
+    """
+    d = load(a.root)
+    row = d["hypotheses"].get(a.id)
+    if not row:
+        return refuse("remeasure-close", f"no hypothesis {a.id!r}",
+                      known=sorted(d["hypotheses"]))
+    if row.get("state") != "open":
+        return refuse("remeasure-close",
+                      f"{a.id!r} is already {row.get('state')!r}", existing=row)
+    row["state"] = "closed"
+    row["closed_at"] = now()
+    row["closed_reason"] = a.reason
+    save(a.root, d)
+    return {"ok": True, "check": "remeasure-close", "closed": row,
+            "note": ("closed, not deleted - the record of what was asked and why it "
+                     "was dropped is the part worth keeping")}
 
 
 def _verdict(row: dict, value: float) -> tuple[str, str]:
@@ -531,6 +592,11 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("due", help="what is ready to re-check, and what is still waiting")
     sub.add_parser("list", help="every hypothesis")
+    cl = sub.add_parser("close", help="retire a hypothesis, with a stated reason")
+    cl.add_argument("--id", required=True)
+    cl.add_argument("--reason", required=True,
+                    help="why it is being dropped - required, and kept in the record")
+
     sub.add_parser("control", help="prove the verdict logic and refusals discriminate")
     return ap
 
@@ -538,7 +604,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     ap = _parser()
     a = ap.parse_args(argv)
-    fn = {"record": record, "check": check, "due": due, "list": listing,
+    fn = {"record": record, "close": close, "check": check, "due": due, "list": listing,
           "control": lambda _a: run_control()}[a.action]
     out = fn(a)
     print(json.dumps(out, indent=2, ensure_ascii=False))

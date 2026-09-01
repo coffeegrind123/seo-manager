@@ -74,6 +74,22 @@ def main() -> int:
     check("and not a zero even when missing_is_zero is on",
           R.dig(_bots, "bots.nosuchbot.hits", missing_is_zero=True)[0] is None,
           "missing_is_zero is for a sparse MAP; a named row that does not exist is a broken metric")
+    # Duplicate detection: the identity of an experiment is what it RUNS and
+    # what it READS, not the label somebody gave it.
+    a = "crawllog.py scan --ssh-key ~/.ssh/k --bot bingbot"
+    b = "crawllog.py scan --ssh-key " + __import__("os").path.expanduser("~/.ssh/k") + " --bot bingbot"
+    check("the same command written two ways is one experiment",
+          R.same_experiment(a, "bots.0.top_silos./play")
+          == R.same_experiment(b, "bots.bingbot.top_silos./play"),
+          "quoting and ~ expansion differ between sessions; the intervention does not")
+    check("CONTROL a different command is a different experiment",
+          R.same_experiment(a, "bots.0.top_silos./play")
+          != R.same_experiment(a + " --days 30", "bots.0.top_silos./play"))
+    check("CONTROL a different metric leaf is a different experiment",
+          R.same_experiment(a, "bots.0.top_silos./play")
+          != R.same_experiment(a, "bots.0.top_silos./guides"),
+          "otherwise every hypothesis over one command would collide")
+
     check("an ambiguous name is refused rather than guessed",
           R.dig({"bots": [{"key": "x", "hits": 1}, {"key": "x", "hits": 2}]},
                 "bots.x.hits")[0] is None)
