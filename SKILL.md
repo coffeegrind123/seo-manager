@@ -40,6 +40,8 @@ ladder that was measured, not assumed (`references/data-sources.md`).
 ```bash
 SEO=~/.claude/skills/seo-manager/scripts     # adjust if vendored into the repo
 python3 $SEO/seodoctor.py                    # SELF-HEAL FIRST - idempotent, ~2s warm
+python3 $SEO/controls.py audit               # can every instrument still tell a
+                                             # finding from a reader bug? offline
 python3 $SEO/seostate.py overview
 ```
 
@@ -181,6 +183,7 @@ The six you touch in almost every run:
 | Script | Job |
 |---|---|
 | `seodoctor.py` | self-healing preflight — run it first, every run |
+| `controls.py` | the control primitive, and `controls.py audit` — which instruments can currently prove they discriminate. Run it before trusting any zero |
 | `seostate.py` | all state: queue, keywords, ranks, pages, trends, profile, pacing, overview, next-actions, run log |
 | `serp.py` | live SERPs through the provider ladder, plus the weakness/authority scoring the gate needs |
 | `keywords.py` | expansion across six independent suggestion corpora, with a cross-engine agreement signal |
@@ -254,6 +257,30 @@ well as in the quality bar:
   key and so reported every page as having no structured data, and a crt.sh
   probe aimed at a domain with no certificates. Both would have shipped as
   confident findings about the web rather than bugs in the reader.
+
+  **This is now structural rather than a habit.** `controls.py` provides the
+  primitive (`Controls`, `refuse()`, `guard_zero()`, `uniform_verdict()`) and
+  **every one of the 24 instruments carries a control you can run** — `control`
+  as a subcommand, or `--control` on the five flag-style ones. `controls.py
+  audit` runs the lot (301 checks, no network) and reports `ok: false` naming
+  any instrument that cannot currently prove itself. It was built after seven
+  instruments failed their controls in a single run on 2026-09-01; each would
+  have shipped as a confident finding about the site.
+
+  Two shapes of failure it now catches by construction:
+  - **An empty control set is not a pass.** A tool that declares a control and
+    registers no checks reads exactly like a healthy one.
+  - **A uniform verdict across a population IS the tell.** `slop.py scan`
+    returned `warn` for 44 of 44 pages, and every individual verdict was
+    plausible; only the uniformity showed it was measuring the page TEMPLATE
+    rather than the prose. `uniform_verdict()` reports that suspicion with its
+    own falsifier attached, and `slop.py corpus` now emits it.
+
+  ⚠ **A control that agrees with the code proves nothing.** Two written during
+  this pass had to be corrected because they asserted a value copied out of the
+  implementation's own docstring, and one because its robots.txt fixture put an
+  "orphan" directive where it was a legitimate continuation. Derive the expected
+  value independently, or the control is a mirror.
 - **Every position claim names its ENGINE and its EXIT COUNTRY.** "We rank #2" is
   not a finding; "#2 on DuckDuckGo from a US exit" is. A read through a residential
   proxy on an unpinned session came from *one* exit country nobody chose, and

@@ -151,6 +151,11 @@ def autocomplete(query: str, hl="en", gl="us", source="chrome", engine=None) -> 
     return out
 
 
+import pathlib as _pl
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def classify_intent(kw: str) -> str:
     if TRANSACTIONAL_HINT.search(kw):
         return "transactional"
@@ -161,6 +166,60 @@ def classify_intent(kw: str) -> str:
     if QUESTION_HINT.search(kw):
         return "informational"
     return "informational"
+
+
+def run_control() -> dict:
+    """Prove the six suggestion parsers and the classifiers discriminate.
+
+    Six corpora answer in four different JSON shapes. A parser that returns []
+    for one of them does not error - the engine simply contributes nothing, and
+    the cross-engine agreement signal silently drops from six sources to five
+    while still calling itself six."""
+    c = Controls("keywords-control")
+
+    shapes = {
+        "google": ["seed", ["seed one", "seed two"]],
+        "bing": ["seed", ["seed alpha", "seed beta"]],
+        "youtube": ["seed", ["seed video"], [], {}],
+        "ddg": [{"phrase": "x"}],
+        "amazon": {"suggestions": [{"value": "seed product"}, {"value": "seed two"}]},
+    }
+    c.check("opensearch_pair_parses", _parse_suggestions("google", shapes["google"]) ==
+            ["seed one", "seed two"], str(_parse_suggestions("google", shapes["google"])))
+    c.check("a_longer_opensearch_array_parses",
+            _parse_suggestions("youtube", shapes["youtube"]) == ["seed video"])
+    c.check("amazons_object_form_parses",
+            _parse_suggestions("amazon", shapes["amazon"]) == ["seed product", "seed two"])
+    c.check("a_flat_string_list_parses",
+            _parse_suggestions("ddg", ["a", "b"]) == ["a", "b"])
+    c.check("an_unrecognised_shape_returns_empty_rather_than_junk",
+            _parse_suggestions("ddg", shapes["ddg"]) == [])
+    c.check("none_does_not_crash_a_parser", _parse_suggestions("google", None) == [])
+    c.check("a_parser_does_not_return_the_seed_itself",
+            "seed" not in _parse_suggestions("google", shapes["google"]))
+
+    c.check("transactional_intent_is_recognised",
+            classify_intent("download cs 1.6 setup") == "transactional",
+            classify_intent("download cs 1.6 setup"))
+    c.check("commercial_intent_is_not_folded_into_transactional",
+            classify_intent("best free cs 1.6 server") == "commercial",
+            "`free` is a commercial modifier, not an intent to act")
+    c.check("comparison_intent_is_recognised",
+            classify_intent("cs 1.6 vs cs source") == "comparison")
+    c.check("an_ordinary_query_is_informational",
+            classify_intent("how does recoil work") == "informational")
+    c.check("intent_is_not_a_constant",
+            len({classify_intent(k) for k in
+                 ("buy cs 1.6 skins", "cs 1.6 vs cs go", "what is cs 1.6")}) >= 3)
+
+    # Script detection drives market selection. A CJK seed sent to us/en-US
+    # returns nothing, which reads as absent demand rather than a wrong question.
+    c.check("cjk_is_detected", script_of("cs1.6网页版") == "cjk", script_of("cs1.6网页版"))
+    c.check("arabic_is_detected", script_of("كونتر سترايك") == "arabic", script_of("كونتر سترايك"))
+    c.check("latin_is_the_default", script_of("counter strike") == "latin")
+    c.check("script_detection_is_not_a_constant",
+            len({script_of(k) for k in ("cs1.6网页版", "counter strike")}) == 2)
+    return c.verdict()
 
 
 def _resolve_engines(a) -> list[str]:
@@ -741,6 +800,9 @@ def cmd_cluster(a):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("control", help="prove the six suggestion parsers discriminate").set_defaults(
+        fn=lambda a: print(json.dumps(run_control(), indent=2, ensure_ascii=False)))
 
     s = sub.add_parser("expand", help="autocomplete sweep -> candidate keywords")
     s.add_argument("--seed", action="append", required=True, help="repeatable")

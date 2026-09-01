@@ -60,6 +60,10 @@ def die(msg, **extra):
     sys.exit(2)
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def host_of(url: str) -> str:
     try:
         h = urlsplit(url).netloc.lower()
@@ -156,6 +160,48 @@ def cmd_snapshot(a):
                 "Re-run them before the next comparison or they will look like a "
                 "page-1 wipeout followed by a full recovery.",
     }, indent=2, ensure_ascii=False))
+
+
+def run_control() -> dict:
+    """Prove the snapshot comparison discriminates.
+
+    This instrument's headline is VOLATILITY, and volatility is a diff of two
+    extraction regimes as much as of two SERPs. A fake "100% page-1 churn" here
+    was two parsers being compared, not a Google update - so the control has to
+    prove that identical input produces zero churn before any number it reports
+    means anything."""
+    c = Controls("drift-control")
+
+    c.check("host_of_strips_www", host_of("https://www.Example.com/a") == "example.com")
+    c.check("host_of_is_case_folded", host_of("https://EXAMPLE.com") == "example.com")
+    c.check("host_of_survives_junk", host_of("not a url") == "")
+    c.check("two_different_hosts_do_not_collide",
+            host_of("https://a.test") != host_of("https://b.test"))
+
+    a = ["https://one.test/x", "https://www.two.test/y", "https://three.test/z"]
+    same = [host_of(u) for u in a]
+    c.check("an_identical_snapshot_has_zero_churn",
+            set(same) - set(same) == set() and len(set(same)) == 3)
+
+    moved = ["https://two.test/y", "https://one.test/x", "https://three.test/z"]
+    c.check("a_reorder_is_not_an_entrant",
+            not (set(host_of(u) for u in moved) - set(same)),
+            "position changes and new entrants are different findings")
+    entrant = a[:2] + ["https://four.test/w"]
+    c.check("a_real_entrant_is_detected",
+            set(host_of(u) for u in entrant) - set(same) == {"four.test"})
+
+    # The algorithm-update calendar is a committed asset with no API behind it.
+    # If it silently fails to load, every `--updates` correlation comes back
+    # empty - which reads as "no update near this date", the opposite of unknown.
+    cal = Path(__file__).resolve().parent.parent / "assets" / "google-updates.json"
+    rows, err = load_updates(str(cal))
+    c.check("the_update_calendar_loads", err is None and bool(rows), str(err))
+    c.check("an_unreadable_calendar_says_so_rather_than_returning_empty",
+            load_updates("/nonexistent/updates.json") == (None,) + (
+                load_updates("/nonexistent/updates.json")[1],),
+            "a missing calendar must be an error, never an empty list of updates")
+    return c.verdict()
 
 
 def load_updates(path):
@@ -290,6 +336,9 @@ def cmd_compare(a):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("control", help="prove the snapshot comparison discriminates").set_defaults(
+        fn=lambda a: print(json.dumps(run_control(), indent=2, ensure_ascii=False)))
 
     s = sub.add_parser("snapshot", help="capture whole page 1 for every tracked keyword")
     s.add_argument("--keywords", action="append")

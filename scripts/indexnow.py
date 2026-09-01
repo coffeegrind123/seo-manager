@@ -46,6 +46,10 @@ HERE = Path(__file__).resolve().parent
 ENDPOINT = "https://api.indexnow.org/IndexNow"
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def state(root, *args) -> dict:
     cmd = [sys.executable, str(HERE / "seostate.py")]
     if root:
@@ -122,6 +126,33 @@ STATUS_MEANING = {
     422: "URLs do not belong to the host, or the key does not match",
     429: "too many requests - slow down",
 }
+
+
+def run_control() -> dict:
+    """Prove the status reader discriminates - offline, submitting nothing.
+
+    A submitter that reports success on every code is worse than none: it turns
+    "the key file is not being served" into "5,388 URLs submitted", and nobody
+    looks again for weeks."""
+    c = Controls("indexnow-control")
+    c.check("200_is_accepted", "accepted" in STATUS_MEANING.get(200, ""))
+    c.check("202_is_also_a_success",
+            "accepted" in STATUS_MEANING.get(202, ""),
+            "a 202 is a success; treating only 200 as one under-reports every submit")
+    c.check("403_names_the_key_file_specifically",
+            "key" in STATUS_MEANING.get(403, "").lower(),
+            "403 means exactly one thing - say which, do not print a number")
+    c.check("422_is_distinguished_from_403", STATUS_MEANING.get(422) != STATUS_MEANING.get(403))
+    c.check("429_is_rate_limiting_not_failure", "429" in str(sorted(STATUS_MEANING)))
+    c.check("an_unknown_status_is_not_silently_a_success",
+            STATUS_MEANING.get(500) is None,
+            "unmapped codes must fall through to 'unexpected status', never to accepted")
+    c.check("the_endpoint_is_the_shared_indexnow_one",
+            ENDPOINT.startswith("https://") and "indexnow" in ENDPOINT, ENDPOINT)
+    c.check("success_and_failure_are_not_the_same_string",
+            STATUS_MEANING[200] != STATUS_MEANING[400])
+    return c.verdict(known_statuses=sorted(STATUS_MEANING),
+                     note="nothing was submitted; this proves the READER, not the account")
 
 
 def cmd_ping(a):
@@ -221,6 +252,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--root", help="repo root (defaults to the nearest .seo/)")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("control", help="prove the status reader discriminates (submits nothing)").set_defaults(
+        fn=lambda a: (print(json.dumps(run_control(), indent=2, ensure_ascii=False)), 0)[1])
 
     s = sub.add_parser("key", help="generate the IndexNow key and print placement steps")
     s.add_argument("--domain")

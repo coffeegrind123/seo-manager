@@ -63,6 +63,10 @@ CATEGORY_MEANING = {
 }
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def _finding(sev, rule, detail, fix=None, **extra):
     f = {"severity": sev, "rule": rule, "detail": detail}
     if fix:
@@ -136,6 +140,82 @@ def allowed(groups: list[dict], ua: str, path: str = "/") -> dict:
                 "reason": "group has no matching rule"}
     return {"allowed": win, "matched_group": best["agents"],
             "reason": f"{win_dir}: matched {win_len} chars"}
+
+
+CONTROL_ROBOTS = """\
+# a comment line
+Disallow: /orphan-directive-before-any-agent/
+User-agent: *
+Disallow: /g/
+Allow: /g/public/
+
+User-agent: GPTBot
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: Bingbot
+Allow: /
+
+"""
+
+
+def run_control() -> dict:
+    """Prove the robots reader still discriminates.
+
+    The whole `policy` verdict rests on `parse_robots` + `allowed`. If either
+    over- or under-matches, the output is a confident statement about who may
+    read the site that is simply wrong - and it looks identical either way.
+
+    ⚠ This deliberately does NOT use `urllib.robotparser`. Behind a CDN,
+    `RobotFileParser.read()` turns a 403 of the default Python UA into
+    `disallow_all`, so it reports every path blocked for every agent - a value
+    indistinguishable from a real site-wide Disallow. Measured 2026-09-01 on a
+    site whose supposedly-blocked page had 4,106 Googlebot hits."""
+    c = Controls("agentcheck-control")
+    g = parse_robots(CONTROL_ROBOTS)
+
+    c.check("comments_are_stripped", not any("#" in a for grp in g for a in grp["agents"]))
+    c.check("consecutive_user_agents_share_one_block",
+            any(set(grp["agents"]) == {"gptbot", "claudebot"} for grp in g),
+            str([grp["agents"] for grp in g]))
+    c.check("a_directive_before_any_agent_is_ignored",
+            not any(v.startswith("/orphan") for grp in g for _f, v in grp["rules"]))
+
+    c.check("star_group_applies_to_an_unlisted_agent",
+            allowed(g, "SomeUnknownBot", "/g/x")["allowed"] is False)
+    c.check("longest_match_wins_over_the_shorter_disallow",
+            allowed(g, "SomeUnknownBot", "/g/public/x")["allowed"] is True)
+    c.check("a_named_group_beats_the_star_group",
+            allowed(g, "GPTBot", "/anything")["allowed"] is False)
+    c.check("a_named_allow_group_is_not_dragged_down_by_star",
+            allowed(g, "Bingbot", "/g/x")["allowed"] is True)
+    # THE 2026-09-01 FINDING: a named group carrying a bare `Allow: /` escapes
+    # every exclusion the `*` group set. It must be visible, not silently right.
+    c.check("named_group_escapes_default_exclusion_is_detectable",
+            allowed(g, "Bingbot", "/g/x")["allowed"] is not
+            allowed(g, "SomeUnknownBot", "/g/x")["allowed"])
+
+    c.check("empty_pattern_never_matches", _match_len("", "/anything") == -1)
+    c.check("wildcard_matches_across_a_segment", _match_len("/a/*/c", "/a/b/c") >= 0)
+    c.check("dollar_anchors_the_end", _match_len("/a$", "/a/b") == -1)
+    c.check("dollar_still_matches_the_exact_path", _match_len("/a$", "/a") >= 0)
+
+    # The taxonomy is imported from crawllog, so this instrument and the log
+    # reader agree on who a bot IS. A silently-empty import would make `policy`
+    # report zero AI crawlers - which reads as "none are blocked".
+    cats = {b[2] for b in BOTS}
+    ai = [b for b in BOTS if str(b[2]).startswith("ai_")]
+    c.check("shared_bot_taxonomy_is_populated", len(ai) >= 8, f"got {len(ai)} of {len(BOTS)}")
+    c.check("all_three_ai_categories_are_present",
+            cats >= set(CATEGORY_MEANING), str(sorted(cats)))
+    c.check("search_bots_are_not_miscounted_as_ai",
+            any(b[2] == "search" for b in BOTS) and "search" not in CATEGORY_MEANING)
+
+    empty = parse_robots("")
+    c.check("an_empty_robots_allows_rather_than_denies",
+            allowed(empty, "GPTBot", "/")["allowed"] is True,
+            "an empty or unreachable robots.txt must never read as a site-wide block")
+    return c.verdict(groups_parsed=len(g))
 
 
 def check_policy(origin: str, path: str = "/") -> dict:
@@ -531,12 +611,16 @@ def main():
     lm = sub.add_parser("llms", help="/llms.txt and /llms-full.txt")
     lm.add_argument("origin")
 
+    sub.add_parser("control", help="prove the robots reader discriminates")
+
     al = sub.add_parser("all", help="policy + llms + one page")
     al.add_argument("origin")
     al.add_argument("--page", help="page to sample (default: the origin itself)")
 
     a = p.parse_args()
-    if a.cmd == "policy":
+    if a.cmd == "control":
+        out = run_control()
+    elif a.cmd == "policy":
         out = check_policy(a.origin, a.path)
     elif a.cmd == "page":
         out = check_page(a.url)

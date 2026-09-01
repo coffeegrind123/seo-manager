@@ -55,6 +55,11 @@ BLOCK_NOTES = {
 }
 
 
+import pathlib as _pl
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def normalize_prefs(raw) -> dict:
     raw = raw if isinstance(raw, dict) else {}
     return {
@@ -265,6 +270,60 @@ def queue_sort_key(row: dict):
     """Build order: front-placed items first (queue_position), then oldest."""
     pos = row.get("queue_position")
     return (0 if pos is not None else 1, pos if pos is not None else 0, row.get("created_at") or "")
+
+
+def run_control() -> dict:
+    """Prove the row resolver and the queue ordering discriminate - no state needed.
+
+    `find_row` is the single point at which every mutating subcommand decides
+    WHICH row it is about. A resolver that is too greedy edits the wrong row and
+    reports success; one that is too strict reports "not found" for a row that
+    is sitting right there. Both look like a data problem rather than a lookup
+    bug."""
+    c = Controls("seostate-control")
+    rows = [
+        {"id": "a1b2c3d4", "slug": "how-to-aim", "title": "How To Aim", "created_at": "2026-01-01"},
+        {"id": "e5f6a7b8", "slug": "map-callouts", "title": "Map Callouts",
+         "created_at": "2026-02-01", "queue_position": 1},
+        {"id": "c9d0e1f2", "keyword": "cs 1.6 online", "domain": "example.com",
+         "created_at": "2026-03-01"},
+    ]
+
+    c.check("an_exact_id_resolves", (find_row(rows, "a1b2c3d4") or {}).get("slug") == "how-to-aim")
+    c.check("an_id_prefix_resolves", (find_row(rows, "a1b2") or {}).get("slug") == "how-to-aim")
+    c.check("a_short_prefix_is_refused",
+            find_row(rows, "a1") is None,
+            "a 2-char prefix would match several rows; guessing edits the wrong one")
+    c.check("a_slug_resolves", (find_row(rows, "map-callouts") or {}).get("id") == "e5f6a7b8")
+    c.check("a_title_resolves_case_insensitively",
+            (find_row(rows, "hOw tO aIm") or {}).get("id") == "a1b2c3d4")
+    c.check("a_keyword_resolves", (find_row(rows, "cs 1.6 online") or {}).get("id") == "c9d0e1f2")
+    c.check("an_unknown_identifier_is_none_not_the_first_row",
+            find_row(rows, "not-a-thing") is None,
+            "falling back to row 0 would silently edit an unrelated item")
+    c.check("an_empty_identifier_is_none", find_row(rows, "") is None
+            and find_row(rows, None) is None)
+    c.check("an_exact_id_beats_a_prefix_of_another",
+            (find_row(rows, "e5f6a7b8") or {}).get("id") == "e5f6a7b8")
+
+    order = [r["id"] for r in sorted(rows, key=queue_sort_key)]
+    c.check("front_placed_items_come_first", order[0] == "e5f6a7b8", str(order))
+    c.check("the_rest_are_oldest_first", order[1:] == ["a1b2c3d4", "c9d0e1f2"], str(order))
+    c.check("sorting_is_stable_and_total", len(order) == len(rows) == len(set(order)))
+
+    c.check("a_json_arg_parses", parse_json_arg('{"a": 1}', "x") == {"a": 1})
+    c.check("an_absent_json_arg_is_none", parse_json_arg("", "x") is None
+            and parse_json_arg(None, "x") is None)
+    c.check("an_already_decoded_value_passes_through", parse_json_arg({"a": 1}, "x") == {"a": 1})
+
+    c.check("slugify_is_url_safe", slugify("How To Aim: The Basics!") ==
+            slugify("How To Aim: The Basics!").lower().strip("-")
+            and " " not in slugify("How To Aim: The Basics!"),
+            slugify("How To Aim: The Basics!"))
+    c.check("slugify_does_not_collapse_distinct_titles",
+            slugify("map callouts") != slugify("map tactics"))
+    return c.verdict(note="the resolver and ordering are proven; project STATE is a "
+                          "separate question - `seostate.py overview` reads it")
 
 
 # --------------------------------------------------------------- commands
@@ -1071,6 +1130,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root", help="repo root (defaults to nearest .seo/ or .git/, else cwd)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("control", help="prove the row resolver and queue order discriminate")
+
     s = sub.add_parser("init", help="create/update .seo/ for this repo")
     s.add_argument("--name")
     s.add_argument("--domain")
@@ -1259,6 +1320,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    # Before Store(): the control is pure and must run where there is no .seo/
+    # at all. A preflight that needs the state it is checking is not a preflight.
+    if getattr(args, "cmd", None) == "control":
+        out(run_control())
+        return
     store = Store(Path(args.root) if args.root else None)
     args.fn(store, args)
 

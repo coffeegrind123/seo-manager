@@ -94,6 +94,47 @@ Checked, not assumed — worth knowing before copying anything.
 
 ## Ranked gaps
 
+### ✅ #0 — A shared control primitive — **BUILT 2026-09-01 (`controls.py`)**
+
+Not on the original list, and it is the one the research itself argued for
+without naming. The teardown's own closing claim was "the fail-closed control
+discipline throughout" — measured, it was **five scripts of twenty**. The other
+fifteen could return a zero that nothing in the code could distinguish from a
+broken reader, including `slop.py`, which had failed exactly that way (44 of 44
+pages `warn`) the same week.
+
+Seven instruments failed their controls in one run on 2026-09-01. Every one was
+caught by a human noticing; nothing in the code required a control to exist.
+
+`controls.py` makes it structural: `Controls` / `refuse()` / `guard_zero()` /
+`uniform_verdict()`, plus `controls.py audit`, which runs every instrument's own
+control and reports `ok: false` naming any that cannot prove itself. **24 of 24
+instruments, 301 checks, no network, 0 broken.**
+
+Three findings came out of the retrofit itself, which is the argument for it:
+
+- **`backlinks.py` counted a hotlinked root asset as a backlink.** `ASSET_PREFIXES`
+  is site-tuned and had no rule for `/favicon.ico` or any asset by extension, so
+  a hotlink was classified `genuine` — an overcount of the single number that
+  instrument exists to produce. Fixed with a deliberately narrow suffix list
+  (an extension list that grew to cover `.html` would DISCARD real backlinks,
+  the costlier direction) plus its own controls in both directions.
+- **`bing.py`'s `--days` refusal set was a local inside `main()`.** A control
+  checking a copy of a literal proves nothing, so it was hoisted to module
+  scope and the control now reads the real constant.
+- **`rankcheck.py`'s domain matcher was inline in `main()`** and therefore
+  unprovable. Extracted to `position_of()` and controlled: a lookalike domain
+  must not match, a subdomain must, and absent must be `None` rather than 0.
+
+⚠ **Three of the controls written in that pass were themselves wrong**, and each
+had to be corrected against the code rather than the other way round: two
+asserted a value copied out of the implementation's own docstring (a control
+that agrees with the code by construction), and one put an "orphan" robots.txt
+directive where it was a legitimate group continuation. Derive the expected
+value independently, or the control is a mirror.
+
+
+
 ### ✅ #1 — Site crawler with a link graph — **BUILT 2026-08-31 (`sitegraph.py`)**
 
 The one that was proven by failure rather than argued for. Finding "the guides

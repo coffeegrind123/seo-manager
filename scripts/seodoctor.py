@@ -245,9 +245,67 @@ def check_project(root: Path) -> dict:
     }
 
 
+
+def run_control() -> dict:
+    """Prove the preflight's own readers discriminate - repairing nothing.
+
+    A preflight that cannot tell a healthy daemon from a dead one is worse than
+    absent: it reports green, every later refusal looks like a data problem, and
+    the one instrument whose job is to say "the tooling is broken" is the
+    instrument that is broken.
+
+    Two specific traps are pinned here. `pgrep -f <pattern>` matches the
+    WATCHING shell's own command line, so it reports a finished job as still
+    running and `pkill -f` kills the shell that ran it - which is why this
+    module scans /proc directly. And a port that answers is not a working
+    daemon: serpd can be up with dead chrome, in which case every query fails
+    while /health returns 200."""
+    from controls import Controls
+    c = Controls("seodoctor-control")
+
+    # The /proc scanner must find a process that certainly exists (this one, by
+    # a distinctive substring of its own argv) and must NOT invent one.
+    me = _cmdline(os.getpid())
+    c.check("proc_cmdline_is_readable", bool(me), "cannot read /proc - every pid check is blind")
+    c.check("the_scanner_excludes_itself", os.getpid() not in _pids_matching("python"),
+            "a scanner that counts itself reports a daemon that is not there")
+    c.check("the_scanner_invents_nothing",
+            _pids_matching("zzq-no-such-process-9f2b") == [],
+            "if this is non-empty the needle is matching everything")
+    c.check("a_missing_pid_reads_empty_rather_than_raising", _cmdline(999999) == "")
+
+    # SEMANTIC health. Each of these shapes has to produce a distinct verdict,
+    # or "up" silently absorbs "up but useless".
+    real = serpd_health
+    try:
+        for shape, want_ok, why in (
+            (None, False, "no server"),
+            ({"ok": False}, False, "server says not-ok"),
+            ({"ok": True, "chrome_alive": False, "tabs": 4}, False, "chrome dead"),
+            ({"ok": True, "chrome_alive": True, "tabs": 0, "tab_pool": 0}, False, "no tabs"),
+            ({"ok": True, "chrome_alive": True, "tabs": 4}, True, "healthy"),
+        ):
+            globals()["serpd_health"] = lambda _s=shape: _s
+            got, detail = serpd_usable()
+            c.check(f"health_verdict_{why.replace(' ', '_')}", got is want_ok,
+                    f"got ok={got} ({detail})")
+    finally:
+        globals()["serpd_health"] = real
+
+    dep = check_deps()
+    c.check("dependency_check_returns_a_per_dep_verdict",
+            isinstance(dep, dict) and bool(dep) and all(isinstance(v, bool) for v in dep.values()),
+            str(dep)[:160])
+    c.check("dependency_check_names_the_daemons_own_deps",
+            {"websockets", "chrome"} <= set(dep), str(sorted(dep)))
+    return c.verdict(note="nothing was repaired; this proves the READERS. Run "
+                          "`seodoctor.py` itself for the repair pass.")
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--control", action="store_true",
+                   help="prove the preflight's own readers discriminate; repairs nothing")
     p.add_argument("--check", action="store_true", help="report only, repair nothing")
     p.add_argument("--hard", action="store_true", help="force-restart the daemon even if healthy")
     p.add_argument("--root", default=".", help="repo root holding .seo/")
@@ -255,6 +313,11 @@ def main() -> int:
                    help="LIVE-probe every data source (network, ~30s) instead of just "
                         "reporting which credentials exist")
     a = p.parse_args()
+
+    if a.control:
+        out = run_control()
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0 if out.get("ok") else 1
 
     report = {
         "ok": True,

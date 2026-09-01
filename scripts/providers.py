@@ -27,6 +27,7 @@ import gzip
 import hashlib
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -509,14 +510,66 @@ def _run_probe(p):
             "ms": int((time.time() - t0) * 1000), "note": note}
 
 
+
+def run_control() -> dict:
+    """Prove the REGISTRY discriminates - the three states, and the shape.
+
+    `providers.py status` is already a live control sweep. This is the layer
+    beneath it: proof that the registry can still REPRESENT the distinction it
+    exists for. A state machine that collapsed `control_failed` into `failing`,
+    or `unconfigured` into either, would report a plausible table forever while
+    "cannot ask" and "the answer is no" quietly became the same thing."""
+    from controls import Controls
+    c = Controls("providers-control")
+
+    def state_of(ok, control_ok):
+        return _run_probe(("t", "test", "free", False,
+                           lambda: (ok, "d", control_ok), "n"))["state"]
+
+    c.check("a_working_source_is_usable", state_of(True, True) == "usable")
+    c.check("a_source_that_answered_but_failed_its_control_is_not_usable",
+            state_of(True, False) == "control_failed",
+            "answering is not the same as answering correctly")
+    c.check("an_unkeyed_source_is_unconfigured_not_failing",
+            state_of(None, None) == "unconfigured",
+            "'cannot ask' must never share a state with 'the answer is no'")
+    c.check("a_broken_source_is_failing", state_of(False, True) == "failing")
+    c.check("the_four_states_are_all_distinct",
+            len({state_of(True, True), state_of(True, False),
+                 state_of(None, None), state_of(False, True)}) == 4)
+
+    boom = _run_probe(("t", "test", "free", False,
+                       lambda: (_ for _ in ()).throw(RuntimeError("nope")), "n"))
+    c.check("an_exception_becomes_a_state_not_a_crash", boom["state"] == "failing")
+    c.check("the_exception_text_survives_into_detail", "RuntimeError" in boom["detail"])
+
+    c.check("a_source_without_a_control_is_visible_as_such",
+            _run_probe(("t", "test", "free", False, lambda: (True, "d", None), "n"))
+            ["control_ok"] is None,
+            "a source with no control can only say it answered, never that it is right")
+
+    c.check("the_registry_is_populated", len(PROVIDERS) >= 15)
+    c.check("every_entry_has_the_full_shape", all(len(p) == 6 for p in PROVIDERS))
+    c.check("provider_names_are_unique",
+            len({p[0] for p in PROVIDERS}) == len(PROVIDERS))
+    c.check("every_probe_is_callable", all(callable(p[4]) for p in PROVIDERS))
+    return c.verdict(providers=len(PROVIDERS),
+                     note="this proves the registry; `providers.py status` is the LIVE sweep")
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("cmd", nargs="?", default="status", choices=["status", "list"])
+    p.add_argument("cmd", nargs="?", default="status",
+                   choices=["status", "list", "control"])
     p.add_argument("--category", action="append",
                    help="expansion|authority|trends|entities|facts|technical|history|serp|volume")
     p.add_argument("--json", action="store_true", help="JSON only, no table")
     a = p.parse_args()
+
+    if a.cmd == "control":
+        out = run_control()
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(0 if out.get("ok") else 1)
 
     if a.cmd == "list":
         print(json.dumps([{"provider": n, "category": c, "cost": cost, "needs_key": k, "note": note}

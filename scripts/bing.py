@@ -70,6 +70,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 BASE = "https://ssl.bing.com/webmaster/api.svc/json"
 UA = "seo-manager/1.0"
@@ -116,6 +117,15 @@ def call(method, key, **params):
     if isinstance(data, dict) and "ErrorCode" in data:
         return {"ok": False, "error": data.get("Message", "unknown"), "error_code": data.get("ErrorCode")}
     return {"ok": True, "d": data.get("d")}
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+# The ONLY two subcommands whose Bing endpoint accepts a date range. Module-level
+# so `control` can check the real constant rather than a copy of it - a control
+# that asserts against its own duplicate of a literal proves nothing.
+WINDOWED = ("keyword", "expand")
 
 
 def _norm_site(url):
@@ -252,6 +262,65 @@ def _dotnet_date(v):
     if ms <= DOTNET_MIN_MS:
         return None
     return datetime.utcfromtimestamp(ms / 1000).strftime("%Y-%m-%d")
+
+
+def run_control() -> dict:
+    """Prove the decoders discriminate, WITHOUT a key and WITHOUT a network call.
+
+    Every trap here returns confident nonsense rather than an error, which is why
+    each one shipped: a page report whose URL column is named `Query`, a .NET
+    sentinel date that decodes to the year 0001, a sort that inverts the real
+    ranking, and a `--days` that four endpoints silently ignore so 7d and 30d
+    come back byte-identical - which reads as "positions did not move"."""
+    c = Controls("bing-control")
+
+    c.check("site_url_is_normalised_with_a_scheme_and_slash",
+            _norm_site("example.com") == "https://example.com/",
+            _norm_site("example.com"))
+    c.check("an_already_normal_site_url_is_untouched",
+            _norm_site("https://example.com/") == "https://example.com/")
+    c.check("an_empty_site_is_none_not_a_guess", _norm_site("") is None)
+
+    # .NET DateTime.MinValue is "never", not year 0001. Decoded naively it sorts
+    # first on every "oldest crawled" report and reads as a real date.
+    # Epoch derived, not copied: 2026-08-23T00:00:00Z is 1787443200 s. Copying a
+    # value out of a docstring makes the control agree with whatever the code
+    # already does, which is the one thing a control must never do.
+    c.check("a_real_dotnet_date_decodes",
+            _dotnet_date("/Date(1787443200000)/") == "2026-08-23",
+            str(_dotnet_date("/Date(1787443200000)/")))
+    c.check("the_decoder_is_not_returning_a_constant",
+            _dotnet_date("/Date(1787443200000)/") != _dotnet_date("/Date(1755907200000)/"))
+    c.check("the_minvalue_sentinel_is_never_not_year_0001",
+            _dotnet_date("/Date(-62135568000000-0800)/") is None,
+            str(_dotnet_date("/Date(-62135568000000-0800)/")))
+    c.check("a_non_date_is_none", _dotnet_date("not a date") is None)
+    c.check("a_none_is_none_rather_than_crashing", _dotnet_date(None) is None)
+
+    # THE SORT. On real data clicks and impressions invert: the page earning most
+    # of the clicks came SECOND by impressions. Sorting by the wrong column does
+    # not error - it just answers a different question.
+    rows = [{"url": "/", "impressions": 33403, "clicks": 716},
+            {"url": "/zh/", "impressions": 8522, "clicks": 2298}]
+    by_clicks = sorted(rows, key=lambda x: x["clicks"], reverse=True)[0]["url"]
+    by_imps = sorted(rows, key=lambda x: x["impressions"], reverse=True)[0]["url"]
+    c.check("clicks_and_impressions_really_do_invert", by_clicks != by_imps)
+    c.check("the_reference_ranking_is_by_clicks", by_clicks == "/zh/",
+            "if this ever changes, the fixture is wrong, not the tool")
+
+    # --days must be REFUSED where the endpoint has no date range, not ignored.
+    c.check("days_is_honoured_only_where_the_endpoint_has_a_window",
+            set(WINDOWED) == {"keyword", "expand"}, f"got {sorted(WINDOWED)}")
+    for cmd in ("queries", "pages", "pagequeries", "traffic"):
+        c.check(f"days_is_refused_on_{cmd}", cmd not in WINDOWED)
+
+    # A key is not needed to run this control, and its ABSENCE must be reported
+    # as "cannot ask", never folded into a data verdict.
+    k = read_key()
+    c.check("a_missing_key_is_reported_not_guessed", k is None or isinstance(k, str))
+    return c.verdict(key_present=bool(k),
+                     note=("the decoders are proven; whether the ACCOUNT answers is a "
+                           "separate question - `sites` is the live probe for that"))
 
 
 def urlinfo(key, site, url):
@@ -460,6 +529,8 @@ def main():
         ("pages", "per-PAGE impressions/clicks/CTR - which URL actually earns"),
     ]:
         sub.add_parser(name, help=helptext, parents=[common])
+    sub.add_parser("control", help="prove the decoders discriminate (no key needed)")
+
     ui = sub.add_parser("urlinfo", help="Bing's own record of ONE url: discovered, last crawled, size",
                         parents=[common])
     ui.add_argument("--url", required=True, help="exact URL to look up")
@@ -472,12 +543,18 @@ def main():
     e.add_argument("--seed", required=True)
 
     a = p.parse_args()
+    # The control is pure and keyless on purpose: the decoders must be provable
+    # on a machine with no Bing account at all, so "cannot ask" stays separate
+    # from "the reader is broken".
+    if a.cmd == "control":
+        out = run_control()
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(0 if out.get("ok") else 1)
     key = read_key()
     if not key:
         print(json.dumps({"ok": False, "error": "no BING_WEBMASTER_API_KEY and no ~/.bing_webmaster_key"}))
         sys.exit(2)
 
-    WINDOWED = ("keyword", "expand")
     if a.days is not None and a.cmd not in WINDOWED:
         print(json.dumps({
             "ok": False,

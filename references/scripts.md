@@ -29,6 +29,7 @@ separately, or write the path out in full.
 | `indexnow.py` | get published pages crawled: IndexNow ping (free, keyless, Bing/Yandex) + the batched Google "Request indexing" follow-up |
 | `test_guards.py` | regression tests for the SERP guards, against real captured responses |
 | `test_providers.py` | regression tests for the free-provider integrations — chiefly that Open PageRank's `found: false` can never become a DR of 0 |
+| `controls.py` | **the control primitive, and the audit that proves every instrument carries one**. A negative result is only as good as its control: "nothing found" and "the reader is broken" serialise to the same JSON unless something separately proves the reader can still find a thing that is known to be there. Exports `Controls` (accumulate named checks, emit one verdict), `refuse()` (the standard shape for "cannot ask", which must never share a code path with "the answer is no"), `guard_zero()` (gate a zero on a passing control) and `uniform_verdict()` (a whole population agreeing IS the tell - `slop.py` once returned `warn` for 44 of 44 pages because it was counting `<title>`, JSON-LD and comments as prose). `controls.py audit` runs every instrument's own control and reports which can currently prove they discriminate |
 | `seodoctor.py` | **self-healing preflight** - idempotent check+repair of the daemon, its Chrome, deps and project state. Run it first, every run. `--providers` adds a live sweep of every data source |
 | `providers.py` | **the provider registry**: every data source declared once, each with a live probe and its own control. `providers.py status` answers "what can I use right now?" by measuring, not by reading a table |
 | `factcheck.py` | **information gain, sourced**: OpenAlex + Crossref papers with citation counts and DOIs, Wikidata entities, the Wikipedia neighbourhood of a topic, and a draft-vs-neighbourhood coverage gap |
@@ -46,6 +47,7 @@ separately, or write the path out in full.
 | `test_backlinks.py` | the controls for referrer classification: attack probes vs real links from the same host (`wordpress.org` → `/wp-login.php` vs → `/`), a second owned domain at any subdomain/port, bare-IP and cPanel-port referrer spam, hotlinked assets, and a structural check that **every `referrers` flag survives the `--remote` argv reconstruction** — a flag added to the parser and forgotten there is silently dropped, and only on remote runs |
 | `test_bing.py` | the controls for the Bing page dimension: `GetPageStats` returning the page URL in a field literally named `Query`, per-date rows that only total after aggregation, click-sorting vs impression-sorting (which invert on real data), CTR on a zero-impression page, and an empty result that must name BOTH "no data yet" and "you typed the URL wrong" rather than implying the page is dead. Also the `urlinfo` decoder — .NET `DateTime.MinValue` (`/Date(-62135568000000-0800)/`) is "never", not year 0001 — and the refusal of `--days` on the four subcommands whose endpoints have no date range, with controls that `keyword`/`expand` still accept it |
 | `test_sitegraph.py` | the controls for the link graph: the `<p class="silonav">` case that defeats tag-based boilerplate detection, self-referential hreflang counted as an inbound link, the island silo whose inlink counts look healthy, a `--start` that was never crawled reporting mass unreachability, a zero-edge graph refusing a verdict instead of calling every page an orphan, a global-nav hub being kept out of the orphan count while staying visible for review, section-scoped furniture (a locale nav on 100% of its locale and 1.5% of the site) being caught WITHOUT swallowing the island silo whose share is almost identical, and a canonical naming a URL the tree does not serve being told apart from one naming a different real page |
+| `test_controls.py` | the controls for the control audit itself: that it recognises BOTH invocation shapes, and - fired at a real fixture tree containing one controlled and one uncontrolled script - that an uncontrolled instrument makes the verdict not-ok and is NAMED rather than merely counted. An audit whose only failure mode is untestable is the instrument it exists to catch |
 | `test_hreflang.py` / `test_contract.py` / `test_agentcheck.py` / `test_slop.py` / `test_crawllog.py` / `test_competitors.py` | the controls for the above: every rule is fired against synthetic input, so a clean pass on a real site means something. `test_crawllog` covers the UA-spoofing detector (including the control that a single operator's many crawlers are NOT flagged) and the no-input refusal. `test_competitors` fires every guarantee of the page-1 profiler against synthetic input - robots.txt obedience by the HTTP fetcher, injection-shape defanging, that every unread result is offered for browser escalation WITH its reason, and that platform chrome never becomes a 'subtopic page 1 covers' |
 
 Also `assets/google-updates.json` — Google's published algorithm-update calendar,
@@ -85,6 +87,20 @@ python3 $SEO/factcheck.py coverage --draft new.md --topic "<Article Title>"
 python3 $SEO/pagecheck.py schema https://rival.example/page
 python3 $SEO/pagecheck.py history https://rival.example/page --since 2026-05-01
 python3 $SEO/pagecheck.py vitals https://oursite.example/page         # lab + real-user CWV
+
+# is every instrument still able to tell a finding from a reader bug?
+# Run this BEFORE trusting any zero. 24 instruments, 301 checks, no network.
+python3 $SEO/controls.py audit          # ok:false names the ones that cannot
+python3 $SEO/controls.py audit --static # detect declarations only, run nothing
+python3 $SEO/<any>.py control           # one instrument (serp/serpd/seodoctor/
+python3 $SEO/serp.py --control          # rankcheck/authority take --control)
+# ⚠ Two invocation shapes, because two argument styles exist. Scripts with
+# subparsers take `control`; flag-style ones take `--control`. A detector that
+# knew only the first reported SIX controlled instruments as uncontrolled - the
+# same class of error as the tools it audits.
+# ⚠ An `absent` row is not a bug report about that script's ANSWERS. It means
+# nothing in it can distinguish "found nothing" from "the reader is broken", so
+# its zeros are not evidence. That is why `absent` counts against the verdict.
 
 # what data sources actually work right now (measured, not assumed)
 python3 $SEO/providers.py status

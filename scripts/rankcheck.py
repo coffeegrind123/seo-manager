@@ -33,6 +33,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 
+import pathlib as _pl
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
+
+
 def run_json(cmd: list[str]) -> dict:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if not proc.stdout.strip():
@@ -61,8 +65,59 @@ def registrable(host: str) -> str:
     return ".".join(parts[-2:]) if len(parts) >= 2 else host
 
 
+def position_of(results: list[dict], domain: str) -> tuple:
+    """(position, url) of the first result belonging to `domain`, or (None, None).
+
+    Extracted from main() so it can be CONTROLLED. The distinction it carries is
+    the whole point of a rank check: "not in the results we saw" is not a
+    position, and `notexample.com` is not `example.com`."""
+    for r in results or []:
+        u = r.get("url") or ""
+        host = registrable(u.split("/")[2] if "://" in u else "")
+        if host == domain or host.endswith("." + domain):
+            return r.get("position"), r.get("url")
+    return None, None
+
+
+def run_control() -> dict:
+    """Prove the domain matcher discriminates - offline, no SERP call.
+
+    A matcher that is too loose records a competitor's position as yours; one
+    that is too tight records "not ranking" for a page sitting at #3. Both are
+    silent, and both survive every subsequent report."""
+    from controls import Controls
+    c = Controls("rankcheck-control")
+    rows = [
+        {"position": 1, "url": "https://notexample.com/a"},
+        {"position": 2, "url": "https://blog.example.com/b"},
+        {"position": 3, "url": "https://example.com/c"},
+    ]
+    c.check("a_lookalike_domain_does_not_match",
+            position_of([rows[0]], "example.com") == (None, None),
+            "notexample.com must never be recorded as example.com")
+    c.check("a_subdomain_matches", position_of([rows[1]], "example.com")[0] == 2)
+    c.check("the_apex_matches", position_of([rows[2]], "example.com")[0] == 3)
+    c.check("the_FIRST_match_wins", position_of(rows, "example.com")[0] == 2,
+            "a rank check reports the best position, not the last one seen")
+    c.check("the_url_is_returned_with_the_position",
+            position_of(rows, "example.com")[1] == "https://blog.example.com/b")
+    c.check("absent_is_none_not_zero", position_of(rows, "other.test") == (None, None),
+            "position 0 would sort first on every report")
+    c.check("an_empty_result_set_is_absent_not_a_crash",
+            position_of([], "example.com") == (None, None))
+    c.check("a_malformed_url_does_not_crash",
+            position_of([{"position": 1, "url": "not a url"}], "example.com") == (None, None))
+    c.check("registrable_folds_www", registrable("www.example.com") == "example.com")
+    c.check("registrable_does_not_over_fold",
+            registrable("notexample.com") == "notexample.com")
+    return c.verdict(note="the matcher is proven offline; whether the PROVIDER answers is a "
+                          "separate question - `serp.py --control` proves the SERP guards")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--control", action="store_true",
+                   help="prove the domain matcher discriminates, offline")
     p.add_argument("--root", help="repo root (defaults to the nearest .seo/)")
     p.add_argument("--all", action="store_true", help="check every tracked keyword")
     p.add_argument("--keyword", action="append", help="check just these (repeatable)")
@@ -79,6 +134,11 @@ def main():
     p.add_argument("--no-proxy", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
+
+    if a.control:
+        out = run_control()
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(0 if out.get("ok") else 1)
 
     cfg = state(a.root, "config")
     if not cfg.get("ok"):
@@ -144,12 +204,7 @@ def main():
                        "position off somebody else's SERP")
             failures.append({"keyword": kw, "error": err})
         else:
-            pos, url = None, None
-            for r in data.get("results", []):
-                host = registrable((r.get("url") or "").split("/")[2] if "://" in (r.get("url") or "") else "")
-                if host == domain or host.endswith("." + domain):
-                    pos, url = r.get("position"), r.get("url")
-                    break
+            pos, url = position_of(data.get("results", []), domain)
             rows.append({
                 "keyword": kw,
                 "position": pos,

@@ -219,6 +219,10 @@ OPERATORS = [
 ]
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def operator_of(bot_key: str) -> str | None:
     for frag, owner in OPERATORS:
         if frag in bot_key:
@@ -306,6 +310,72 @@ def classify_ua(ua: str):
     if "bot" in low or "crawler" in low or "spider" in low or "http" in low:
         return "other-bot", "other-bot", "unknown"
     return None, None, None
+
+
+def run_control() -> dict:
+    """Prove the log reader, the UA taxonomy and the spoof detector discriminate.
+
+    A log parser that returns None for every line reports ZERO crawl activity,
+    which reads as "the bots have stopped coming" - the single most alarming and
+    most wrong thing this instrument can say. Measured 2026-09-01: a grep for
+    `GET /path` returned 0 for every path on this exact log format, because the
+    logs are JSON."""
+    c = Controls("crawllog-control")
+
+    line = json.dumps({
+        "ts": 1756684800.0, "status": 200, "size": 5120, "duration": 0.03,
+        "request": {"method": "GET", "uri": "/maps/de_dust2", "host": "x.test",
+                    "client_ip": "127.0.0.1:44322", "remote_ip": "127.0.0.1",
+                    "headers": {"User-Agent": ["Mozilla/5.0 (compatible; Googlebot/2.1)"],
+                                "Cf-Connecting-Ip": ["203.0.113.9"],
+                                "X-Forwarded-For": ["198.51.100.7, 203.0.113.9"],
+                                "Referer": ["https://example.org/a"]}}})
+    r = parse_caddy(line)
+    c.check("json_log_line_parses", r is not None,
+            "a parser that returns None for every line reports zero crawl activity")
+    if r:
+        c.check("uri_is_read", r["uri"] == "/maps/de_dust2", str(r.get("uri")))
+        c.check("real_client_ip_beats_the_proxy_hop", r["ip"] == "203.0.113.9",
+                f"got {r['ip']} - 127.0.0.1 means every per-IP figure is one bucket")
+        c.check("status_is_an_int", r["status"] == 200)
+        c.check("referer_is_read", r["referer"] == "https://example.org/a")
+        c.check("timestamp_is_parsed", r["ts"] is not None)
+    c.check("a_non_json_line_is_skipped_not_crashed",
+            parse_caddy("203.0.113.9 - - [01/Sep/2026:00:00:00 +0000] \"GET / HTTP/1.1\" 200 12") is None)
+
+    # THE UA REGISTRY ORDERING. Both of these have shipped as bugs elsewhere.
+    c.check("googlebot_image_is_not_swallowed_by_googlebot",
+            classify_ua("Googlebot-Image/1.0")[0] == "googlebot-image",
+            str(classify_ua("Googlebot-Image/1.0")))
+    c.check("chatgpt_user_is_not_matched_by_gptbot",
+            classify_ua("Mozilla/5.0 ChatGPT-User/1.0")[0] not in (None, "gptbot"),
+            str(classify_ua("Mozilla/5.0 ChatGPT-User/1.0")))
+    c.check("a_plain_browser_is_not_a_bot", classify_ua(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120 Safari/537.36")[0] is None,
+        str(classify_ua("Mozilla/5.0 (Windows NT 10.0) Chrome/120 Safari/537.36")))
+    c.check("an_unknown_crawler_is_still_recognised_as_one",
+            classify_ua("SomeNewCrawler/1.0 (+http://x)")[0] == "other-bot")
+
+    # SPOOF DETECTION, with its own control: one operator's several crawlers
+    # from one address are LEGITIMATE and must never be flagged.
+    legit = [{"key": "googlebot", "bot": "Googlebot", "_all_ips": {"66.249.66.1": 50}},
+             {"key": "googlebot-image", "bot": "Googlebot-Image", "_all_ips": {"66.249.66.1": 20}},
+             {"key": "google-extended", "bot": "Google-Extended", "_all_ips": {"66.249.66.1": 5}}]
+    forged = legit + [{"key": "gptbot", "bot": "GPTBot", "_all_ips": {"66.249.66.1": 9}},
+                      {"key": "claudebot", "bot": "ClaudeBot", "_all_ips": {"66.249.66.1": 7}}]
+    c.check("one_operators_many_crawlers_are_not_flagged",
+            detect_ua_spoofing(legit)["flagged_ip_count"] == 0,
+            str(detect_ua_spoofing(legit)["flagged_ips"]))
+    c.check("an_ip_claiming_three_companies_is_flagged",
+            detect_ua_spoofing(forged)["flagged_ip_count"] == 1,
+            str(detect_ua_spoofing(forged)["flagged_ips"]))
+    c.check("spoofed_hits_are_counted_for_subtraction",
+            detect_ua_spoofing(forged)["spoofed_hits"] == 91,
+            str(detect_ua_spoofing(forged)["spoofed_hits"]))
+    c.check("operator_lookup_resolves", operator_of("googlebot") == operator_of("googlebot-image")
+            and operator_of("googlebot") is not None)
+    return c.verdict(bots_in_registry=len(BOTS))
 
 
 def bot_verify_suffixes(key: str):
@@ -1167,6 +1237,9 @@ def add_input_args(s):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("control", help="prove the log reader and UA taxonomy discriminate").set_defaults(
+        fn=lambda a: print(json.dumps(run_control(), indent=2, ensure_ascii=False)))
 
     s = sub.add_parser("scan", help="full bot report: budget by silo, statuses, AI ingestion")
     add_input_args(s)

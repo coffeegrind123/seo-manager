@@ -60,6 +60,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def load_rows(path: str):
     raw = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
     try:
@@ -183,6 +187,57 @@ def updates_in_window(updates, start: str, end: str):
         if not (e < start or d > end):
             hits.append(u)
     return hits
+
+
+def run_control() -> dict:
+    """Prove the folder and the split still discriminate.
+
+    This instrument's product is one distinction: a page that LOST RANK versus a
+    page whose DEMAND fell. Those have opposite fixes, and both look like
+    "clicks went down"."""
+    c = Controls("decay-control")
+
+    # Dimension order must not matter. GSC returns keys in whatever order the
+    # request asked for, and a positional reader silently mislabels every row.
+    a1 = split_keys({"keys": ["https://x.test/a", "some query", "2026-08-01"]})
+    a2 = split_keys({"keys": ["2026-08-01", "https://x.test/a", "some query"]})
+    c.check("dimension_order_does_not_matter", a1 == a2, f"{a1} vs {a2}")
+    c.check("page_is_found_by_scheme", a1[0] == "https://x.test/a")
+    c.check("day_is_found_by_shape", a1[2] == "2026-08-01")
+    c.check("query_is_whatever_is_left", a1[1] == "some query")
+
+    c.check("trailing_slash_is_normalised",
+            norm_page("https://x.test/a/") == norm_page("https://x.test/a") == "/a")
+    c.check("root_survives_normalisation", norm_page("https://x.test/") == "/")
+
+    # THE WEIGHTING. One obscure query at position 90 must not move a page whose
+    # real traffic sits at position 3. Averaging the averages gives 46.5.
+    rows = [
+        {"keys": ["https://x.test/a", "big query"], "clicks": 100,
+         "impressions": 1000, "position": 3.0},
+        {"keys": ["https://x.test/a", "obscure query"], "clicks": 0,
+         "impressions": 1, "position": 90.0},
+    ]
+    pos = aggregate(rows)[("/a", None)]["position"]
+    c.check("position_is_impression_weighted", pos < 4.0, f"got {pos}; unweighted mean is 46.5")
+    c.check("totals_are_summed", aggregate(rows)[("/a", None)]["impressions"] == 1001)
+
+    zero = aggregate([{"keys": ["https://x.test/z", "q"], "clicks": 0,
+                       "impressions": 0, "position": 0}])
+    c.check("a_zero_impression_page_has_no_position",
+            zero[("/z", None)]["position"] is None,
+            "position 0 would rank it first on every report")
+
+    c.check("by_query_splits_the_key", len(aggregate(rows, by_query=True)) == 2)
+    c.check("without_by_query_it_folds", len(aggregate(rows)) == 1)
+
+    c.check("pct_is_signed", pct(50, 100) == -0.5 and pct(150, 100) == 0.5)
+    c.check("pct_of_zero_refuses_rather_than_dividing", pct(5, 0) is None,
+            "a page that had no impressions did not fall by infinity percent")
+
+    c.check("a_row_with_no_page_is_dropped_not_crashed",
+            aggregate([{"keys": ["just a query"], "impressions": 5}]) == {})
+    return c.verdict()
 
 
 def cmd_compare(a):
@@ -411,6 +466,9 @@ def main():
     s.add_argument("--max-position", type=float, default=30.0)
     s.add_argument("--top", type=int, default=20)
     s.set_defaults(fn=cmd_cannibal)
+
+    sub.add_parser("control", help="prove the folder and the decay split discriminate").set_defaults(
+        fn=lambda a: print(json.dumps(run_control(), indent=2, ensure_ascii=False)))
 
     s = sub.add_parser("split", help="one date-dimensioned export -> two period files")
     s.add_argument("--file", required=True)

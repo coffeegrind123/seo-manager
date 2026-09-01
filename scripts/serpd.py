@@ -1035,9 +1035,63 @@ def api_alive() -> dict | None:
         return None
 
 
+
+def run_control() -> dict:
+    """Prove the daemon's own readers discriminate - starting nothing.
+
+    Two things here fail SILENTLY and in the direction that costs most.
+
+    The proxy resolver: serp.py has always honoured `~/.seo-proxy`; the daemon
+    once read the environment alone, so the file was configured, `serp.py` went
+    out on the residential exit, and the DAEMON - the fast path doing the actual
+    volume - kept using the datacenter IP. Nothing reported the difference.
+
+    The health reader: a port that answers is not a working daemon. serpd can be
+    up with dead chrome, and then every query fails while /health returns 200.
+    """
+    from controls import Controls
+    c = Controls("serpd-control")
+
+    c.check("proxy_state_is_reported_as_a_string_never_a_guess",
+            isinstance(resolve_proxy_url(), str))
+    c.check("an_unproxied_install_reports_empty_rather_than_a_default",
+            resolve_proxy_url() == "" or resolve_proxy_url().startswith(("http://", "https://",
+                                                                        "socks5://")),
+            resolve_proxy_url()[:40])
+
+    import tempfile as _tf
+    home = os.path.expanduser("~")
+    with _tf.TemporaryDirectory() as td:
+        os.environ["HOME"] = td
+        try:
+            c.check("a_missing_proxy_file_is_empty_not_an_error", _proxy_file_url() == "")
+            Path(td, ".seo-proxy").write_text(
+                "# a comment\nSEO_PROXY_URL=\"http://u:p@exit.test:8080\"\n"
+                "UNRELATED=x\n", encoding="utf-8")
+            got = _proxy_file_url()
+            c.check("the_proxy_file_is_read", got == "http://u:p@exit.test:8080", got)
+            c.check("quotes_are_stripped", '"' not in got and "'" not in got)
+            c.check("comments_and_other_keys_are_ignored", "UNRELATED" not in got
+                    and "comment" not in got)
+            Path(td, ".seo-proxy").write_text("SERPD_PROXY=http://alt.test:1080\n",
+                                              encoding="utf-8")
+            c.check("the_legacy_key_is_honoured_too",
+                    _proxy_file_url() == "http://alt.test:1080", _proxy_file_url())
+        finally:
+            os.environ["HOME"] = home
+
+    c.check("chrome_binary_resolution_answers", isinstance(_chrome_binary(), str))
+    c.check("a_free_port_is_a_real_port", 1024 < _free_port() < 65536)
+    c.check("the_proc_scanner_invents_nothing", _cmdline(999999) == "")
+    return c.verdict(proxied=bool(resolve_proxy_url()),
+                     note="nothing was started; this proves the READERS. `serpd.py --status` "
+                          "is the live health probe.")
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--control", action="store_true",
+                   help="prove the daemon's readers discriminate; starts nothing")
     g.add_argument("--start", action="store_true", help="detach and run (idempotent)")
     g.add_argument("--foreground", action="store_true", help="run here (debugging)")
     g.add_argument("--stop", action="store_true")
@@ -1045,6 +1099,11 @@ def main():
     p.add_argument("--force", action="store_true",
                    help="with --stop: also SIGKILL any chrome on the profile and clear the portfile")
     a = p.parse_args()
+
+    if a.control:
+        out = run_control()
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(0 if out.get("ok") else 1)
 
     if a.status:
         health = api_alive()

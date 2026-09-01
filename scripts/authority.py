@@ -77,6 +77,11 @@ def fetch(url, *, data=None, headers=None, timeout=25):
         return 0, str(exc)
 
 
+import pathlib as _pl
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def clean_domain(d: str) -> str:
     d = (d or "").strip().lower()
     d = re.sub(r"^https?://", "", d).split("/")[0]
@@ -545,9 +550,64 @@ def from_estimate(domain: str, gsc_impressions=None, gsc_clicks=None):
 # --------------------------------------------------------------------- main
 
 
+
+def run_control() -> dict:
+    """Prove the DR reader and the reconciler discriminate - offline.
+
+    The one that matters: `found: false` must NEVER become a DR of 0. Absent
+    from a link graph and "measured as worthless" are different states, and
+    collapsing them makes an unmeasured competitor look beatable."""
+    c = Controls("authority-control")
+
+    c.check("a_real_opr_decimal_becomes_a_dr", _opr_dr("3.5") == 35, str(_opr_dr("3.5")))
+    c.check("a_missing_value_is_none_not_zero", _opr_dr(None) is None,
+            "found:false rendered as DR 0 makes an unmeasured domain look beatable")
+    c.check("a_junk_value_is_none_not_zero", _opr_dr("n/a") is None)
+    c.check("a_genuine_zero_is_still_zero", _opr_dr("0") == 0,
+            "the guard must not swallow a real measured zero either")
+
+    # THE RECONCILER. The API omits rows and silently normalises subdomains, so
+    # a caller zipping request to response by index credits one domain with
+    # another's authority - a wrong number that looks entirely plausible.
+    req = ["a.test", "b.test", "search.marginalia.nu"]
+    ret = [{"domain": "a.test", "page_rank_decimal": 4.1},
+           {"domain": "marginalia.nu", "page_rank_decimal": 6.0}]
+    rows = _reconcile(req, ret)
+    # A row is identified by what was ASKED, not by what the API answered about -
+    # `domain` holds the answered name so a substitution stays visible.
+    asked = [r.get("requested", r.get("domain")) for r in rows]
+    c.check("one_row_per_requested_domain_in_order", asked == req, str(asked))
+    c.check("no_requested_domain_is_dropped", len(rows) == len(req))
+    c.check("an_omitted_row_is_not_found_rather_than_zero",
+            any(r.get("domain") == "b.test" and r.get("found") is False for r in rows),
+            str(rows))
+    c.check("an_omitted_row_is_marked_no_data",
+            any(r.get("domain") == "b.test" and r.get("no_data") for r in rows))
+    sub_row = next((r for r in rows if r.get("requested") == "search.marginalia.nu"), None)
+    c.check("a_substituted_apex_answer_is_recorded_not_assumed",
+            bool(sub_row) and sub_row.get("domain") == "marginalia.nu"
+            and sub_row.get("answered_for") == "marginalia.nu", str(sub_row))
+    c.check("the_substitution_is_visible_rather_than_silent",
+            bool(sub_row) and sub_row.get("requested") != sub_row.get("domain"),
+            "crediting a subdomain with its apex's authority is an enormous overestimate")
+    c.check("the_reconciler_does_not_zip_by_index",
+            not any(r.get("domain") == "b.test" and r.get("page_rank_decimal") == 6.0
+                    for r in rows),
+            "b.test must not inherit marginalia's score")
+
+    c.check("kd_zones_move_with_dr", kd_zones(5) != kd_zones(70))
+    c.check("volume_band_moves_with_dr", volume_band(5) != volume_band(70))
+    c.check("clean_domain_strips_scheme_and_www",
+            clean_domain("https://www.Example.com/a") == "example.com",
+            clean_domain("https://www.Example.com/a"))
+    return c.verdict(note="the readers are proven offline; whether OPR/Radar/Tranco "
+                          "ANSWER is a separate question - `providers.py status` probes that")
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--domain", required=True)
+    p.add_argument("--control", action="store_true",
+                   help="prove the DR reader and reconciler discriminate, offline")
+    p.add_argument("--domain")
     p.add_argument(
         "--bulk",
         help="comma-separated EXTRA domains to score alongside --domain in one Open PageRank call "
@@ -559,6 +619,15 @@ def main():
     p.add_argument("--save", action="store_true", help="write dr into .seo/config.json via seostate.py")
     p.add_argument("--root", help="repo root for --save")
     a = p.parse_args()
+
+    if a.control:
+        out = run_control()
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(0 if out.get("ok") else 1)
+    if not a.domain:
+        print(json.dumps({"ok": False, "error": "--domain is required (or use --control)"},
+                         indent=2))
+        sys.exit(2)
 
     domain = clean_domain(a.domain)
     attempts = []

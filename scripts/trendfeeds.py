@@ -48,6 +48,11 @@ BROWSER_UA = (
 HT_NS = "{https://trends.google.com/trending/rss}"
 
 
+import pathlib as _pl
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def fetch(url, *, headers=None, timeout=30):
     req = urllib.request.Request(url, headers={"User-Agent": TOOL_UA, "Accept": "*/*", **(headers or {})})
     try:
@@ -122,6 +127,35 @@ def trending(geo="US", limit=25):
 
 
 # ----------------------------------------------------------------- pageviews
+
+
+def run_control() -> dict:
+    """Prove the keyless feeds are reachable AND that a miss is reported as a miss.
+
+    Every source here is keyless, so "nothing came back" is ambiguous in the
+    worst way: it can mean no demand, a 429, or a changed feed shape. The
+    control asks for something that MUST exist and something that must NOT, so
+    an empty answer is interpretable."""
+    c = Controls("trendfeeds-control")
+
+    # POSITIVE: an article with guaranteed traffic. If this is empty, the reader
+    # is broken - not the topic.
+    pv = pageviews("Counter-Strike", days=14)
+    c.check("a_known_article_returns_pageviews",
+            pv.get("ok") is True and (pv.get("total") or pv.get("days") or 0),
+            str(pv)[:200])
+    # NEGATIVE: a title that cannot exist must be a NAMED 404, not an empty series.
+    miss = pageviews("Zzq_No_Such_Article_9f2b", days=14)
+    c.check("a_nonexistent_article_is_a_named_miss",
+            miss.get("ok") is False and miss.get("status") == 404, str(miss)[:200])
+    c.check("the_two_are_distinguishable", pv.get("ok") != miss.get("ok"),
+            "if a real article and an impossible one answer alike, every zero is noise")
+
+    ws = wiki_search("Counter-Strike", limit=3)
+    c.check("title_resolution_returns_candidates",
+            bool(ws.get("results") or ws.get("titles") or ws.get("ok")), str(ws)[:200])
+    return c.verdict(note="these are LIVE probes of keyless sources; a failure here is "
+                          "usually reachability or a changed feed shape, not your site")
 
 
 def wiki_search(topic, limit=5, lang="en"):
@@ -360,6 +394,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("control", help="live probe of the keyless feeds, with a negative control")
+
     t = sub.add_parser("trending", help="Google Trends 'trending now' RSS (keyless)")
     t.add_argument("--geo", default="US", help="US, GB, DE, ... (default US)")
     t.add_argument("--limit", type=int, default=25)
@@ -389,7 +425,9 @@ def main():
     g.add_argument("--gl", default="US")
 
     a = p.parse_args()
-    if a.cmd == "trending":
+    if a.cmd == "control":
+        out = run_control()
+    elif a.cmd == "trending":
         out = trending(a.geo, a.limit)
     elif a.cmd == "wiki":
         out = wiki_search(a.topic, lang=a.lang)

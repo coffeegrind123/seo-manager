@@ -48,6 +48,10 @@ from providers import http  # noqa: E402
 MAILTO = "seo-manager@example.com"   # OpenAlex asks for a contact; it gets the polite pool
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def _fail(where, r, extra=None):
     return {"ok": False, "source": where, "status": r.get("status"),
             "error": f"{where}: HTTP {r.get('status')}",
@@ -102,6 +106,58 @@ def crossref(query, limit=8):
     } for i in items]
     rows.sort(key=lambda x: -(x.get("cited_by") or 0))
     return {"ok": True, "source": "crossref", "query": query, "count": len(rows), "results": rows}
+
+
+def _coverage(draft_text: str, titles: list[str]) -> dict:
+    """The pure half of `coverage`, extracted so it can be controlled offline.
+
+    Kept identical in behaviour - `cmd_coverage` now calls it - because a
+    control that exercises a REIMPLEMENTATION of the logic proves nothing about
+    the logic that actually runs."""
+    draft_words = set(WORD.findall(draft_text.lower()))
+    covered, gaps = [], []
+    for title in titles:
+        toks = [w for w in WORD.findall((title or "").lower())
+                if w not in STOP and len(w) > 3]
+        if not toks:
+            continue
+        present = sum(1 for w in toks if w in draft_words)
+        row = {"concept": title, "matched_tokens": present, "tokens": len(toks)}
+        (covered if present else gaps).append(row)
+    return {"covered": covered, "gaps": gaps}
+
+
+def run_control() -> dict:
+    """Prove the coverage matcher discriminates, offline.
+
+    The failure that matters is a matcher that returns ZERO gaps - which reads
+    as "the draft covers the whole topic" and is exactly what an empty
+    neighbourhood or a broken tokeniser produces."""
+    c = Controls("factcheck-control")
+    draft = ("The bomb site is covered from the doors. Recoil resets between "
+             "bursts, and the defuse kit halves the timer.")
+    titles = ["Bomb defusal", "Recoil control", "Economy management", "Smoke grenade"]
+
+    r = _coverage(draft, titles)
+    names = {g["concept"] for g in r["gaps"]}
+    c.check("a_concept_the_draft_names_is_covered",
+            "Recoil control" in {x["concept"] for x in r["covered"]}, str(r["covered"]))
+    c.check("a_concept_the_draft_never_names_is_a_gap",
+            "Economy management" in names, str(names))
+    c.check("the_matcher_is_not_returning_everything_as_a_gap",
+            0 < len(r["gaps"]) < len(titles), f"{len(r['gaps'])} of {len(titles)}")
+    c.check("an_empty_neighbourhood_yields_no_false_coverage",
+            _coverage(draft, []) == {"covered": [], "gaps": []},
+            "zero gaps from zero input must never read as full coverage")
+    c.check("stopwords_alone_do_not_make_a_concept",
+            _coverage(draft, ["the and of"])["gaps"] == [])
+    c.check("an_empty_draft_makes_everything_a_gap",
+            len(_coverage("", titles)["gaps"]) == len(titles))
+    c.check("matching_is_case_insensitive",
+            _coverage("RECOIL", ["Recoil control"])["gaps"] == [])
+    return c.verdict(note="the matcher is proven offline; whether OpenAlex/Crossref/"
+                          "Wikipedia ANSWER is a separate question - `providers.py status` "
+                          "is the live probe for that")
 
 
 def cmd_sources(a):
@@ -193,16 +249,8 @@ def cmd_coverage(a):
         return {"ok": False, "error": "no article neighbourhood for this topic",
                 "hint": "resolve the exact title first: trendfeeds.py wiki --topic '<topic>'"}
 
-    draft_words = set(WORD.findall(draft))
-    covered, gaps = [], []
-    for h in hits:
-        title = h.get("title") or ""
-        toks = [w for w in WORD.findall(title.lower()) if w not in STOP and len(w) > 3]
-        if not toks:
-            continue
-        present = sum(1 for w in toks if w in draft_words)
-        row = {"concept": title, "matched_tokens": present, "tokens": len(toks)}
-        (covered if present else gaps).append(row)
+    r = _coverage(draft, [h.get("title") or "" for h in hits])
+    covered, gaps = r["covered"], r["gaps"]
     return {
         "ok": True, "topic": a.topic, "draft": a.draft,
         "neighbourhood": len(hits),
@@ -222,6 +270,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("control", help="prove the coverage matcher discriminates (offline)").set_defaults(
+        fn=lambda a: run_control())
 
     s = sub.add_parser("sources", help="OpenAlex + Crossref - citable work on a topic")
     s.add_argument("--query", required=True)

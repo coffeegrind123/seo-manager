@@ -36,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from providers import http, read_secret, cache_get, cache_put  # noqa: E402
+from controls import Controls  # noqa: E402
 
 GSC_SA = os.environ.get("GSC_SERVICE_ACCOUNT", str(Path.home() / ".gsc_service_account.json"))
 
@@ -183,6 +184,42 @@ def schema_gate(types: dict) -> list[dict]:
                         "guidance": "Leave it in place."})
     out.sort(key=lambda r: (r["retired"] or "", r["type"]))
     return out
+
+
+def run_control() -> dict:
+    """Prove the schema gate and the credential resolver discriminate.
+
+    The gate's answers matter more than they look: a RETIRED rich-result type is
+    a reason not to ADD it, and only sometimes a reason to remove it. A gate that
+    flagged everything, or nothing, would turn that judgement into noise."""
+    c = Controls("pagecheck-control")
+
+    c.check("a_retired_type_is_flagged",
+            len(schema_gate({"FAQPage": 1})) == 1, str(schema_gate({"FAQPage": 1})))
+    c.check("a_current_type_is_not_flagged",
+            schema_gate({"Article": 1}) == [], str(schema_gate({"Article": 1})))
+    c.check("a_fully_qualified_type_is_recognised",
+            len(schema_gate({"https://schema.org/FAQPage": 1})) == 1,
+            "the extractor returns fully-qualified URIs, not bare names")
+    c.check("an_empty_page_produces_no_findings", schema_gate({}) == [])
+    c.check("a_retired_finding_carries_its_retirement_date",
+            (schema_gate({"FAQPage": 1})[0].get("retired") or "") != "")
+    c.check("a_retired_finding_is_never_a_hard_failure",
+            all(r["severity"] == "info" for r in schema_gate({"FAQPage": 1, "HowTo": 1})))
+    c.check("the_gate_discriminates_rather_than_flagging_everything",
+            len(schema_gate({"FAQPage": 1, "Article": 1, "VideoGame": 1})) == 1)
+    c.check("the_registry_is_populated", len(DEPRECATED_TYPES) >= 3)
+
+    # CREDENTIALS. "No key" must be an explanation, never a score. A vitals
+    # check that silently returned zeros would read as a catastrophically slow
+    # page rather than as an unasked question.
+    tok, why = psi_token()
+    c.check("credential_resolution_always_explains_itself", bool(why))
+    c.check("a_missing_credential_is_none_not_an_empty_string",
+            tok is None or isinstance(tok, str))
+    return c.verdict(psi_credential=why if not tok else "present",
+                     note="the gate is proven offline; whether PSI/CrUX ANSWERS is a "
+                          "separate question and is reported per-call")
 
 
 def check_schema(url: str) -> dict:
@@ -407,8 +444,13 @@ def main():
         if name in ("history", "all"):
             s.add_argument("--since", help="YYYY-MM-DD - count versions after this date")
             s.add_argument("--limit", type=int, default=20000, help="max CDX rows")
+    sub.add_parser("control", help="prove the schema gate discriminates (no network)")
     a = p.parse_args()
 
+    if a.cmd == "control":
+        out = run_control()
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0 if out.get("ok") else 1
     if a.cmd == "html":
         out = check_html(a.url)
     elif a.cmd == "schema":

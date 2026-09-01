@@ -72,6 +72,7 @@ import string
 import subprocess
 import sys
 import time
+from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -155,6 +156,10 @@ EU_COUNTRIES = VERIFIED_COUNTRIES
 # the refusal can say why, instead of the generic "unverified".
 LYING_COUNTRIES = {"fr": "gb"}
 
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls, refuse  # noqa: E402
 
 def verify_exit_countries(codes, tries=3, timeout=35):
     """Ask the pool for an exit in each country on FRESH sessions and report where
@@ -1009,9 +1014,75 @@ def score(results: list[dict], target_domain: str | None = None) -> dict:
 # --------------------------------------------------------------------- main
 
 
+
+def run_control() -> dict:
+    """Fire the relevance and shape guards at REAL captured responses.
+
+    Not synthetic. `assets/fixtures/bing-{fr,de}.json` are genuine Bing reads
+    captured 2026-07-30 that returned HTTP 200, ten clean parseable rows, and
+    results about a completely different subject. The naive rule - "does any
+    query token appear" - PASSES both of them, which is why coverage is measured
+    over distinct tokens instead.
+
+    A guard proven only against good data proves nothing. Both directions are
+    exercised here: the wrong-query reads must be REFUSED and the good reads of
+    the same query must be ACCEPTED."""
+    c = Controls("serp-control")
+    fixtures = Path(__file__).resolve().parent.parent / "assets" / "fixtures"
+    query = "self hosted rank tracker"
+
+    def rows_of(name):
+        data = json.loads((fixtures / name).read_text(encoding="utf-8"))
+        if isinstance(data, str):                 # execute_js hands back a string
+            data = json.loads(data)
+        return data["results"]
+
+    if not fixtures.is_dir():
+        return refuse("serp-control", f"no fixture directory at {fixtures} - the guards "
+                                      f"cannot be proven without the captured responses")
+
+    for name in ("bing-fr.json", "bing-de.json"):
+        try:
+            rows = rows_of(name)
+        except Exception as e:                                   # noqa: BLE001
+            c.check(f"{name}_loads", False, f"{type(e).__name__}: {e}")
+            continue
+        rel = verify_relevance(query, rows)
+        c.check(f"wrong_query_read_{name}_is_refused", not rel["pass"],
+                f"coverage={rel['coverage']} hit_rate={rel['hit_rate']} rows={len(rows)}")
+        naive = any(any(t in (r.get("title", "") + r.get("url", "")).lower()
+                        for t in query.split()) for r in rows)
+        c.check(f"{name}_would_fool_an_any_token_rule", naive,
+                "if this is False the fixture no longer exercises the trap")
+
+    for name in ("ddg-good.json", "browser-google.json"):
+        try:
+            rows = rows_of(name)
+        except Exception as e:                                   # noqa: BLE001
+            c.check(f"{name}_loads", False, f"{type(e).__name__}: {e}")
+            continue
+        rel = verify_relevance(query, rows)
+        c.check(f"good_read_{name}_is_accepted", rel["pass"],
+                f"coverage={rel['coverage']} hit_rate={rel['hit_rate']}")
+        c.check(f"good_read_{name}_passes_the_shape_guard", shape_ok(rows))
+
+    c.check("an_empty_result_set_is_refused", not shape_ok([]))
+    c.check("a_result_with_no_url_is_refused", not shape_ok([{"title": "x", "url": ""}]))
+    c.check("registrable_folds_a_subdomain", registrable("www.example.com") == "example.com")
+    c.check("registrable_handles_a_multi_part_tld",
+            registrable("a.b.example.co.uk") == "example.co.uk")
+    c.check("registrable_does_not_over_fold",
+            registrable("notexample.com") == "notexample.com")
+    c.check("the_thresholds_are_real_numbers",
+            0 < MIN_COVERAGE <= 1 and 0 < MIN_HIT_RATE <= 1,
+            f"coverage>={MIN_COVERAGE} hit_rate>={MIN_HIT_RATE}")
+    return c.verdict(thresholds={"min_coverage": MIN_COVERAGE, "min_hit_rate": MIN_HIT_RATE})
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("query", nargs="?", help="the search query")
+    p.add_argument("--control", action="store_true",
+                   help="fire the relevance/shape guards at the captured fixtures and exit")
     p.add_argument("--provider", default=os.environ.get("SEO_SERP_PROVIDER", "ddg"),
                    choices=["ddg", "serpd", "searxng", "brave", "serper", "serpapi", "dataforseo", "browser"])
     p.add_argument("--count", type=int, default=10)
@@ -1034,6 +1105,14 @@ def main():
     p.add_argument("--country", action="append", default=[],
                    help="extra country code to include in --verify-countries")
     a = p.parse_args()
+
+    # Offline, needs no provider and no network: the guards must be provable on
+    # a machine where every SERP source is refusing, which is exactly when you
+    # most need to know whether a refusal is real.
+    if getattr(a, "control", False):
+        out = run_control()
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(0 if out.get("ok") else 1)
 
     if a.verify_countries is not None:
         codes = [c.lower() for c in (a.verify_countries or [])] + [c.lower() for c in a.country]

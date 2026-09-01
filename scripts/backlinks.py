@@ -134,10 +134,29 @@ PROBE_PATHS = (
 )
 
 # Landing paths that are an embed or a hotlink rather than a page visit.
+# ⚠ These are SITE-TUNED. They say nothing about a hotlink that lands on a
+# generic root asset, and a referrer arriving on `/favicon.ico` was therefore
+# classified `genuine` and counted as a backlink - an overcount of the one
+# number this instrument exists to produce. Caught 2026-09-01 by the control.
 ASSET_PREFIXES = (
     "/frontend/", "/api/", "/mi/", "/g/", "/gr/", "/e/", "/sounds/", "/dl/",
     "/game/", "/map-images/", "/sm/", "/m/",
 )
+
+# Site-independent, and kept deliberately narrow: an extension list that grew to
+# include `.html` or `.php` would start discarding real pages, which is the
+# opposite and more expensive error. Only file types that a browser fetches as a
+# SUBRESOURCE, never as a destination someone linked to.
+ASSET_SUFFIXES = (
+    ".ico", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".svg",
+    ".css", ".js", ".mjs", ".map", ".woff", ".woff2", ".ttf", ".eot",
+    ".mp3", ".ogg", ".wav", ".mp4", ".webm",
+)
+# Root files a crawler or a browser requests on its own initiative. A Referer on
+# one of these is never an editorial link.
+ASSET_EXACT = ("/favicon.ico", "/robots.txt", "/sitemap.xml", "/manifest.json",
+               "/apple-touch-icon.png", "/browserconfig.xml", "/ads.txt",
+               "/.well-known/")
 
 # Ports that appear on shared-hosting/cPanel referrer spam. A referrer arriving
 # on one of these is a spam bot advertising itself in the log, not a link.
@@ -146,6 +165,10 @@ SPAM_PORTS = {"2052", "2053", "2082", "2083", "2086", "2087", "2095", "2096",
 
 # Free throwaway hosts used for referrer spam and scraping.
 THROWAWAY_SUFFIXES = (".workers.dev", ".pages.dev", ".herokuapp.com", ".vercel.app")
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
 
 
 def _registrable(host: str) -> str:
@@ -174,9 +197,73 @@ def classify_referrer(host: str, landing: str, own: set[str]) -> str:
         return "spam"
     if bare.endswith(THROWAWAY_SUFFIXES):
         return "spam"
-    if landing.startswith(ASSET_PREFIXES):
+    path = landing.split("?", 1)[0].split("#", 1)[0]
+    if (path.startswith(ASSET_PREFIXES) or path.startswith(ASSET_EXACT)
+            or path.lower().endswith(ASSET_SUFFIXES)):
         return "asset"
     return "genuine"
+
+
+def run_control() -> dict:
+    """Prove the referrer classifier still discriminates.
+
+    A referring domain is NOT a backlink. On a live run 40 of 52 were the site's
+    own second domain, an attack probe whose forged `Referer` made
+    `wordpress.org -> /wp-login.php` look editorial, a hotlinked favicon, or
+    referrer spam on a cPanel port. A classifier that called everything
+    `genuine` would have reported 52 backlinks - a 4x overcount of the single
+    number this instrument exists to produce."""
+    c = Controls("backlinks-control")
+    own = {"example.com", "example.net"}
+
+    def cls(host, landing="/"):
+        return classify_referrer(host, landing, own)
+
+    c.check("a_real_editorial_link_is_genuine", cls("news.site.test", "/guides/x") == "genuine")
+    c.check("own_domain_is_self", cls("www.example.com", "/") == "self")
+    c.check("own_domain_at_a_subdomain_is_self", cls("cdn.example.net", "/") == "self")
+    c.check("own_domain_on_a_port_is_self", cls("example.com:8443", "/") == "self")
+
+    # The one that inverts the finding: a forged Referer on an attack path.
+    c.check("an_attack_probe_is_not_editorial",
+            cls("wordpress.org", "/wp-login.php") == "probe",
+            "this exact row read as an editorial link from wordpress.org")
+    c.check("the_same_host_linking_to_a_real_page_is_still_genuine",
+            cls("wordpress.org", "/guides/x") == "genuine",
+            "the probe rule must key on the PATH, not on the host")
+
+    c.check("a_bare_ip_is_spam", cls("203.0.113.9", "/") == "spam")
+    c.check("a_cpanel_port_is_spam", cls("someshop.test:2083", "/") == "spam")
+    c.check("a_site_tuned_asset_prefix_is_not_a_backlink",
+            cls("blog.test", "/mi/de_dust2.jpg") == "asset")
+    c.check("a_hotlinked_root_asset_is_not_a_backlink",
+            cls("blog.test", "/favicon.ico") == "asset")
+    c.check("an_asset_by_extension_is_not_a_backlink",
+            cls("blog.test", "/img/hero.png?v=2") == "asset",
+            "the query string must not defeat the suffix match")
+    # The narrowness matters more than the rule: an extension list that grew to
+    # cover pages would DISCARD real backlinks, which is the costlier direction.
+    c.check("a_real_page_is_never_mistaken_for_an_asset",
+            cls("blog.test", "/guides/how-to-aim.html") == "genuine")
+    c.check("a_directory_page_is_never_mistaken_for_an_asset",
+            cls("blog.test", "/maps/de_dust2") == "genuine")
+
+    c.check("precedence_self_beats_probe",
+            cls("example.com", "/wp-login.php") == "self",
+            "an own-domain hit on a probe path is still self, not an inbound attack")
+
+    c.check("registrable_folds_a_subdomain",
+            _registrable("a.b.example.com") == "example.com")
+    c.check("registrable_leaves_a_bare_name_alone", _registrable("localhost") == "localhost")
+
+    c.check("localhost_is_local", is_local("localhost") is True)
+    c.check("private_ranges_are_local", is_local("192.168.1.5") is True
+            and is_local("10.0.0.1") is True)
+    c.check("a_public_host_is_not_local", is_local("news.site.test") is False)
+
+    c.check("host_of_strips_www", host_of("https://www.Site.test/a") == "site.test")
+    c.check("host_of_survives_junk", host_of("not a url") == "")
+    return c.verdict()
 
 
 def is_local(host: str) -> bool:
@@ -568,6 +655,9 @@ def cmd_footprint(a):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("control", help="prove the referrer classifier discriminates").set_defaults(
+        fn=lambda a: print(json.dumps(run_control(), indent=2, ensure_ascii=False)))
 
     s = sub.add_parser("referrers", help="real, traffic-sending backlinks from your access log")
     s.add_argument("-f", "--file", action="append")

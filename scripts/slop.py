@@ -231,6 +231,39 @@ HTML_STRIP = [
 _HTML_HINT = re.compile(r"(?i)<!doctype\s+html|<(?:html|head|body|div|section|h[1-6]|p)\b")
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls, uniform_verdict  # noqa: E402
+
+
+CONTROL_CLEAN = """\
+The AWP fires once and reloads. A hit above the waist kills at any range, which
+is why the rifle costs 4750 and why buying one early ends a round if it misses.
+Most players learn the angle before they learn the recoil.
+"""
+
+CONTROL_SLOPPY = """\
+It's not just a rifle - it's a game-changer. In today's fast-paced landscape of
+competitive shooters, this isn't merely about aim; it's about unlocking your
+true potential. Let's dive in and explore the ever-evolving tapestry of tactics
+that seamlessly elevate your gameplay to the next level. The bottom line? It's
+not about luck - it's about mastery.
+"""
+
+# Markup whose NON-PROSE carries the tells and whose visible body does not.
+# This is the 2026-09-01 bug in one file: read as prose it fires; masked it must
+# not, and the word count must reflect the body rather than the markup.
+CONTROL_HTML = """<!doctype html><html><head>
+<title>It's not just a map - it's a game-changer</title>
+<style>.x{content:"delve into the ever-evolving tapestry"}</style>
+<script type="application/ld+json">{"desc":"unlock your true potential, seamlessly"}</script>
+<!-- let's dive in and explore: this isn't merely about aim, it's about mastery -->
+</head><body>
+<p>Dust2 has two bomb sites and a mid corridor. The T spawn is closer to B,
+which is why most rounds open with a smoke at the double doors.</p>
+</body></html>
+"""
+
+
 def looks_like_html(text: str) -> bool:
     """Cheap sniff on the head of the input. Override with --html/--no-html."""
     return bool(_HTML_HINT.search(text[:4000]))
@@ -424,6 +457,10 @@ def corpus(paths, *, share_ratio: float = 0.6) -> dict:
                       "verdict": "warn" if over else "pass",
                       "hits": {r: hs[:6] for r, hs in uniq.items() if r in over}})
 
+    # A whole tier agreeing is the tell that produced this function in the first
+    # place. Now the tool says so itself instead of waiting for someone to notice.
+    tell = uniform_verdict([p["verdict"] for p in pages], subject="pages")
+
     flagged_pages = [p for p in pages if p["rules_over_tolerance"]]
     flagged_pages.sort(key=lambda p: -(p["page_hits"] / max(p["words"], 1)))
 
@@ -439,6 +476,7 @@ def corpus(paths, *, share_ratio: float = 0.6) -> dict:
                       "every_file": c == n,
                       "shared_matches": sum(1 for (rr, _m) in shared if rr == r)}
                      for r, c in files_hit.most_common()],
+        "uniform_verdict_tell": tell,
         "pages_over_tolerance": len(flagged_pages),
         "pages_clean": n - len(flagged_pages),
         "worst": flagged_pages[:15],
@@ -455,6 +493,50 @@ def corpus(paths, *, share_ratio: float = 0.6) -> dict:
             "value defeats identical-string matching - read that as layout, not prose."
         ),
     }
+
+
+def run_control() -> dict:
+    """Prove the reader still discriminates, on THIS run.
+
+    Every check here is a way the scanner has actually been wrong, or a way it
+    would be wrong without anyone being able to tell from the output."""
+    c = Controls("slop-control")
+
+    clean = scan_text(CONTROL_CLEAN, html=False)
+    sloppy = scan_text(CONTROL_SLOPPY, html=False)
+    c.check("clean_prose_passes", clean["verdict"] == "pass",
+            f"got {clean['verdict']}, flagged {[f['rule'] for f in clean['flagged']]}")
+    c.check("sloppy_prose_does_not_pass", sloppy["verdict"] != "pass")
+    c.check("the_two_are_separated", sloppy["total_hits"] > clean["total_hits"])
+
+    # THE 44-of-44 BUG. Read as prose the markup fires; masked it must not.
+    as_prose = scan_text(CONTROL_HTML, html=False)
+    as_html = scan_text(CONTROL_HTML, html=True)
+    c.check("markup_read_as_prose_does_fire", as_prose["total_hits"] > 0,
+            "if this is false the control is not exercising the masker at all")
+    c.check("html_mode_masks_title_style_jsonld_and_comments",
+            as_html["total_hits"] == 0,
+            f"still firing: {[f['rule'] for f in as_html['flagged']]}")
+    c.check("html_word_count_is_the_body_not_the_markup",
+            as_html["words"] < as_prose["words"] / 2,
+            f"html={as_html['words']} prose={as_prose['words']}")
+    c.check("html_is_sniffed_without_a_flag", looks_like_html(CONTROL_HTML) is True)
+    c.check("prose_is_not_sniffed_as_html", looks_like_html(CONTROL_SLOPPY) is False)
+
+    # Markdown code must not be scanned as prose - a fenced block full of tells
+    # must leave the verdict where the surrounding prose put it.
+    fenced = scan_text(CONTROL_CLEAN + "\n```\n" + CONTROL_SLOPPY + "\n```\n", html=False)
+    c.check("fenced_code_is_excluded", fenced["verdict"] == "pass",
+            f"got {fenced['verdict']}")
+
+    c.check("uniform_tell_fires_on_a_uniform_tier",
+            (uniform_verdict(["warn"] * 44, subject="pages") or {}).get("population") == 44)
+    c.check("uniform_tell_stays_quiet_on_a_mixed_tier",
+            uniform_verdict(["warn"] * 30 + ["pass"] * 14, subject="pages") is None)
+
+    c.check("every_rule_has_a_tolerance", all(r in TOLERANCE for r, *_ in RULES))
+    c.check("catalog_is_not_empty", len(RULES) >= 20)
+    return c.verdict(rules=len(RULES))
 
 
 def scan_file(path: str, *, html=None) -> dict:
@@ -490,9 +572,12 @@ def main():
                    help="a match in >= this fraction of files is template (default 0.6)")
 
     sub.add_parser("rules", help="print the catalog")
+    sub.add_parser("control", help="prove the reader still discriminates")
 
     a = ap.parse_args()
-    if a.cmd == "scan":
+    if a.cmd == "control":
+        out = run_control()
+    elif a.cmd == "scan":
         out = scan_file(a.file, html=a.html)
     elif a.cmd == "corpus":
         out = corpus(a.files, share_ratio=a.share_ratio)

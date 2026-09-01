@@ -47,6 +47,10 @@ CORPUS_SIZE = 8            # recent guides to compare against
 WORD = re.compile(r"[a-z0-9']+")
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def tokenize(text: str) -> list[str]:
     return WORD.findall((text or "").lower())
 
@@ -306,6 +310,69 @@ def pair_score(a: dict, b: dict) -> float:
 # ------------------------------------------------------------------- main
 
 
+def run_control() -> dict:
+    """Prove the extractor and the similarity metric still discriminate.
+
+    Every check is a way this gate has been, or would be, silently wrong. The
+    expensive direction here is a false PASS - a gate that reports "nothing is
+    converging" because its extractor read nothing at all."""
+    c = Controls("sameness-control")
+
+    same_a = "the bomb site is covered from the doors and from the ramp above it"
+    doc_a = {"opening": tokenize(same_a), "headings": ["setup", "timings"],
+             "words": tokenize(same_a * 3)}
+    doc_b = dict(doc_a)
+    doc_c = {"opening": tokenize("recoil resets after a short pause between bursts"),
+             "headings": ["recoil", "spray"],
+             "words": tokenize("recoil resets after a short pause between bursts " * 3)}
+
+    c.check("identical_docs_score_high", pair_score(doc_a, doc_b) > 0.8,
+            f"got {pair_score(doc_a, doc_b)}")
+    c.check("unrelated_docs_score_low", pair_score(doc_a, doc_c) < 0.2,
+            f"got {pair_score(doc_a, doc_c)}")
+    c.check("the_two_are_separated", pair_score(doc_a, doc_b) > pair_score(doc_a, doc_c) * 3)
+
+    c.check("jaccard_identical_is_one", jaccard({"a", "b"}, {"a", "b"}) == 1.0)
+    c.check("jaccard_disjoint_is_zero", jaccard({"a"}, {"b"}) == 0.0)
+    c.check("empty_shingles_do_not_crash", jaccard(shingles([], 5), shingles([], 5)) == 0.0)
+
+    # THE EXTRACTOR. A reader that returns nothing makes every draft unique,
+    # which is a PASS - the direction that costs the most to be wrong in.
+    html = ("<html><head><style>.x{}</style></head><body>"
+            "<nav><a href='/g/1'>Other guide title here</a></nav>"
+            "<h2>Holding the site</h2>"
+            "<p>The bomb site is covered from the doors and from the ramp above "
+            "it, so one player can watch both without moving.</p>"
+            "<!-- a comment that is not prose -->"
+            "<footer><a href='/g/2'>Another guide title</a></footer></body></html>")
+    ex = extract_html(html, set())
+    c.check("extractor_reads_paragraph_prose", len(ex["words"]) >= 15,
+            f"got {len(ex['words'])} words - an empty extractor passes every draft")
+    c.check("extractor_reads_h2", ex["headings"] == ["holding the site"], str(ex["headings"]))
+    c.check("extractor_drops_nav_and_footer_anchors",
+            "another" not in ex["words"] and "other" not in ex["words"], str(ex["words"])[:200])
+    c.check("extractor_drops_comments", "comment" not in ex["words"])
+    c.check("extractor_takes_an_opening", len(ex["opening"]) >= 5)
+
+    # The &#x27; bug: an entity that does not decode splits a contraction and
+    # silently fails to match the same word on the markdown side.
+    ent = extract_html("<p>it &#x27;s the same phrase repeated across guides here</p>", set())
+    c.check("entities_decode_rather_than_shatter_words",
+            "x27" not in ent["words"], str(ent["words"]))
+
+    # An anchor must be stripped inside its chunk, never across the document.
+    wide = extract_html("<p>first real paragraph of prose here <a href='#'>link</a></p>"
+                        "<p>second real paragraph of prose here too</p>", set())
+    c.check("anchor_strip_does_not_swallow_later_paragraphs",
+            "second" in wide["words"], str(wide["words"]))
+
+    c.check("empty_corpus_passes_and_says_why",
+            compare_to_corpus(doc_a, [])["pass"] is True)
+    hit = compare_to_corpus(doc_a, [dict(doc_b, label="published")])
+    c.check("a_repeated_opening_is_flagged", len(hit["flags"]) > 0)
+    return c.verdict()
+
+
 def cmd_check(a):
     keyword_tokens = set(tokenize(a.keyword or ""))
     draft_path = Path(a.draft)
@@ -543,6 +610,8 @@ def main():
     s.add_argument("--pages", help=".seo/pages.json (per-page keyword stripping)")
     s.add_argument("--threshold", type=float, default=0.35)
     s.set_defaults(fn=cmd_audit)
+
+    sub.add_parser("control", help="prove the extractor and the metric discriminate").set_defaults(fn=lambda a: print(json.dumps(run_control(), indent=2)))
 
     s = sub.add_parser("tiers", help="O(n) index-bloat analysis across a whole generated corpus")
     s.add_argument("--corpus", required=True, help="directory of generated pages")

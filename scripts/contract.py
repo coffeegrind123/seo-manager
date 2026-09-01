@@ -65,6 +65,10 @@ from hreflang import parse_page, _norm  # noqa: E402
 SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls  # noqa: E402
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -295,6 +299,62 @@ def apply_lifecycle(store: dict, current: list[dict], checked_at: str) -> dict:
     return {"opened": opened, "still_open": still_open, "resolved": resolved}
 
 
+def run_control() -> dict:
+    """Prove the differ and the lifecycle discriminate.
+
+    This is a DEPLOY GUARD. Its whole value is that a clean run means the
+    markup did not regress - so a differ that reports nothing because it cannot
+    read a snapshot is worse than no guard at all: it converts an unchecked
+    deploy into a green one."""
+    c = Controls("contract-control")
+    base = {"url": "https://x.test/a", "status": 200, "title": "A title",
+            "canonical": "https://x.test/a", "meta_robots": "", "header_robots": "",
+            "h1": ["A heading"], "description": "A description", "schema_types": {"Article": 1}}
+
+    c.check("an_unchanged_snapshot_produces_no_findings",
+            diff_snapshot(base, dict(base)) == [],
+            "a differ that fires on identity cries wolf on every deploy")
+
+    def rules(old, new):
+        return {f["rule"] for f in diff_snapshot(old, new)}
+
+    c.check("a_200_becoming_a_404_is_caught", bool(rules(base, dict(base, status=404))))
+    c.check("a_new_noindex_is_caught",
+            bool(rules(base, dict(base, meta_robots="noindex"))),
+            "the single most damaging thing a deploy can ship silently")
+    c.check("a_noindex_in_the_HEADER_is_caught_too",
+            bool(rules(base, dict(base, header_robots="noindex"))),
+            "X-Robots-Tag is invisible to anyone reading the HTML")
+    c.check("a_rewritten_canonical_is_caught",
+            bool(rules(base, dict(base, canonical="https://x.test/b"))))
+    c.check("a_dropped_schema_block_is_caught",
+            bool(rules(base, dict(base, schema_types={}))))
+
+    c.check("indexable_reads_the_meta_tag", _indexable(dict(base, meta_robots="noindex")) is False)
+    c.check("indexable_reads_the_header", _indexable(dict(base, header_robots="none")) is False)
+    c.check("a_clean_page_is_indexable", _indexable(base) is True)
+
+    # LIFECYCLE. A finding must survive across runs without duplicating, and
+    # must auto-resolve when it stops tripping - otherwise the store grows a
+    # backlog nobody reads and a fixed problem stays "open" forever.
+    f1 = {"severity": "high", "rule": "noindex_added", "path": "/a",
+          "url": "https://x.test/a", "detail": "d"}
+    store = {}
+    r1 = apply_lifecycle(store, [f1], "2026-09-01T00:00:00Z")
+    c.check("a_new_finding_opens", len(r1["opened"]) == 1 and not r1["still_open"])
+    r2 = apply_lifecycle(store, [f1], "2026-09-02T00:00:00Z")
+    c.check("the_same_finding_does_not_duplicate",
+            len(r2["opened"]) == 0 and len(r2["still_open"]) == 1)
+    c.check("seen_count_increments", r2["still_open"][0]["seen_count"] == 2)
+    r3 = apply_lifecycle(store, [], "2026-09-03T00:00:00Z")
+    c.check("a_finding_that_stops_tripping_auto_resolves", len(r3["resolved"]) == 1)
+    r4 = apply_lifecycle(store, [], "2026-09-04T00:00:00Z")
+    c.check("a_resolved_finding_is_not_resolved_twice", len(r4["resolved"]) == 0)
+    c.check("findings_are_keyed_by_path_and_rule",
+            _key(f1) != _key(dict(f1, path="/b")) and _key(f1) != _key(dict(f1, rule="other")))
+    return c.verdict()
+
+
 # ------------------------------------------------------------------ commands
 
 
@@ -465,6 +525,8 @@ def main():
     p.add_argument("--state-dir", help="default <repo>/.seo/contract")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("control", help="prove the differ and the lifecycle discriminate")
+
     b = sub.add_parser("baseline", help="snapshot the contract")
     b.add_argument("--url", action="append")
     b.add_argument("--sitemap")
@@ -489,6 +551,12 @@ def main():
     rs.add_argument("--rule", required=True)
 
     a = p.parse_args()
+    # Before state_dir(): the control is pure and must run on a machine that has
+    # no project state at all - that is where a preflight is most needed.
+    if a.cmd == "control":
+        out = run_control()
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0 if out.get("ok") else 1
     sd = state_dir(a.state_dir)
 
     if a.cmd == "baseline":
