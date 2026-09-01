@@ -733,11 +733,32 @@ def provider_serpapi(query: str, count: int, *, gl="us", hl="en", proxy=None, **
                for r in (data.get("organic_results") or [])[:count]]
     ai = data.get("ai_overview")
     if ai:
+        # ⚠ SerpApi returns the AI Overview in TWO STAGES. The first response
+        # carries only `page_token` + `serpapi_link`; `references` and
+        # `text_blocks` are absent until that link is followed. Reading
+        # references off the first response therefore always yielded [], so
+        # `present: true, references: []` was reported for every AI Overview on
+        # earth - and any "are we cited by AI" reading built on it answers no,
+        # forever, with no error anywhere. Measured 2026-09-01: the follow-up
+        # call for "how to play counter strike 1.6 in browser" returned 7
+        # references and 1,450 characters of text.
+        refs = ai.get("references") or []
+        if not refs and ai.get("serpapi_link"):
+            try:
+                st2, t2 = fetch(f"{ai['serpapi_link']}&api_key={key}", timeout=45, proxy=proxy)
+                if st2 == 200:
+                    ai2 = (json.loads(t2) or {}).get("ai_overview") or {}
+                    refs = ai2.get("references") or []
+            except Exception:
+                refs = []                      # a failed follow-up is not "no citations"
         results_meta["ai_overview"] = {
             "present": True,
             "references": [{"domain": host_of(r.get("link", "")), "url": r.get("link"),
                             "title": r.get("title") or r.get("source")}
-                           for r in (ai.get("references") or [])],
+                           for r in refs],
+            "references_resolved": bool(refs),
+            "note": ("references_resolved:false means the second-stage fetch did not "
+                     "run or failed - that is UNKNOWN citation, never zero citations"),
         }
     return results
 
