@@ -124,6 +124,83 @@ def main() -> int:
           "quoting a 60-word sentence means quoting a paragraph")
     check("it discriminates rather than passing or failing everything",
           e["liftable"] == 1 and e["not_liftable"] == 2, str(e))
+    print("\nthe subject check must not be ASCII-only - it flagged /zh/, the page")
+    print("earning 68% of this site's clicks, on a rule that never executed:")
+    zh_h1 = "CS1.6 网页版 — 在线玩反恐精英 1.6"
+    check("a CJK heading matched by its own sentence passes",
+          G._names_subject(zh_h1, "Combat Skirmish 把真正的反恐精英 1.6 带进浏览器。") == (True, "cjk-bigrams"))
+    check("a CJK heading NOT matched still fails",
+          G._names_subject(zh_h1, "完全无关的一句话关于别的东西。")[0] is False,
+          "the bigram path has to discriminate, not just say yes")
+    check("Cyrillic goes down the word path",
+          G._names_subject("Играть в Counter-Strike онлайн",
+                           "Counter-Strike запускается в браузере.") == (True, "words"))
+    check("Cyrillic can still fail",
+          G._names_subject("Играть в Counter-Strike онлайн", "Совершенно другая тема.")[0] is False)
+    check("Latin is unaffected",
+          G._names_subject("Bunny hopping", "Bunny hopping is a technique.") == (True, "words"))
+    check("no h1 is not-evaluable rather than a failure",
+          G._names_subject("", "A sentence.")[1] == "not-evaluable",
+          "a check that could not run must not vote")
+
+    print("\nsentence boundaries and word counts are not ASCII either:")
+    check("a Japanese sentence splits on 。",
+          len([x for x in G._SENT.split("これは一文です。これは二文目です。") if x.strip()]) == 2)
+    check("a Hindi sentence splits on the danda",
+          len([x for x in G._SENT.split("यह एक वाक्य है। यह दूसरा है।") if x.strip()]) == 2)
+    check("an Urdu sentence splits on ۔",
+          len([x for x in G._SENT.split("یہ ایک جملہ ہے۔ یہ دوسرا ہے۔") if x.strip()]) == 2)
+    check("English is unaffected",
+          len([x for x in G._SENT.split("One sentence. Two sentences.") if x.strip()]) == 2)
+    check("a dot inside a DOMAIN does not end a sentence",
+          len([x for x in G._SENT.split("Combatskirmish.net runs it.") if x.strip()]) == 1,
+          "relaxing the ASCII rule to \\s* splits on every domain and abbreviation")
+    n, unit, ok_ = G._sentence_length("Combat Skirmishは本物のCounter-Strike 1.6をブラウザに届けます")
+    check("a Japanese sentence is measured in characters", unit == "chars",
+          f"got {n} {unit} - by whitespace this reads as 3 'words'")
+    check("and a real Japanese sentence is within bounds", ok_ is True, f"{n} chars")
+    n2, unit2, _ = G._sentence_length("Bunny hopping is the technique of chaining jumps.")
+    check("English is still measured in words", unit2 == "words")
+    nj, uj, okj = G._sentence_length(
+        "Combat Skirmishは本物のCounter-Strike 1.6をWebAssemblyでブラウザに届けます")
+    check("a mostly-Latin Japanese sentence is STILL measured in characters",
+          uj == "chars" and okj is True,
+          f"got {nj} {uj} - it is only 28% kana/kanji, so a ratio threshold "
+          f"measures it as 3 'words'")
+    _n3, _u3, ok3 = G._sentence_length("Too short.")
+    check("a too-short lead still fails", ok3 is False)
+
+    check("a single-sentence paragraph ending in a period IS structured",
+          bool(G._TERM_END.search("Bunny hopping and more words ends here.")),
+          "the split rule finds no boundary here, and using IT to detect structure "
+          "waives the length check on most paragraphs on a real site")
+    check("a paragraph with no sentence punctuation is NOT structured",
+          not G._TERM_END.search("Combat Skirmish ส่ง Counter-Strike 1.6 เข้าเบราว์เซอร์"),
+          "the dot in `Counter-Strike 1.6` makes a bare terminator search say yes")
+    check("a trailing quote or bracket does not hide the terminator",
+          bool(G._TERM_END.search('He called it "the technique."')))
+
+    print("\nthe subject rule tests whether the SENTENCE stands alone, not whether")
+    print("it agrees with the h1's vocabulary:")
+    check("a stylish headline does not sink a well-written lead",
+          G._names_subject("A Retro Shooter That Never Needed Replacing",
+                           "Counter-Strike started life in 1999 as a mod for Half-Life.")[0] is True,
+          "matching only h1 tokens flagged this real page")
+    check("an all-caps abbreviation counts as naming the subject",
+          G._names_subject("Play Counter-Strike 1.6 With Friends",
+                           "Organising a game of CS 1.6 meant everyone owning it.")[0] is True)
+    check("a lead that names nothing still fails",
+          G._names_subject("Play Counter-Strike 1.6 Free",
+                           "There is no purchase, no subscription and no account.")[0] is False,
+          "this is what the rule exists to catch")
+    check("an ordinary capitalised opener is not a proper noun",
+          not G._PROPER.search("Organising a game meant everyone owning it"),
+          "otherwise every sentence passes and the rule measures nothing")
+    check("an existential opener is caught like a pronoun",
+          bool(__import__("re").match(
+              r"(?i)^(it|this|that|they|these|those|he|she|there\s+(is|are|was|were))\b",
+              "There is no purchase.")))
+
     check("a missing directory refuses",
           G.extractable("/no/such/dir").get("control_failed") is True)
 

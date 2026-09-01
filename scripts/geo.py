@@ -202,7 +202,36 @@ def engines_status() -> dict:
 
 
 # ------------------------------------------------------------------- the ask
-_SENT = re.compile(r"(?<=[.!?])\s+")
+# ⚠ SENTENCE BOUNDARIES ARE NOT ASCII. `(?<=[.!?])\s+` never fires on Japanese
+# (which ends sentences with 。 and uses no spaces), on Hindi/Bengali (danda ।)
+# or on Urdu (۔). Measured 2026-09-01 across 21 locale homes: it returned the
+# WHOLE paragraph as "one sentence" for hi and ur - 55 and 57 words - and a
+# 3-"word" fragment for ja, producing three confident findings about the site
+# that were entirely artefacts of this regex.
+# ⚠ TWO ALTERNATIVES, not one relaxed rule. An ASCII terminator must be
+# FOLLOWED BY WHITESPACE or the dot in `Combatskirmish.net` ends a sentence -
+# which is precisely what a first attempt at this did, silently breaking the
+# "which sentences name us" extraction. CJK and Indic terminators carry no
+# trailing space, so they match zero-width.
+_SENT = re.compile(r"(?<=[.!?])\s+|(?<=[。！？।॥۔])\s*")
+
+# Scripts that do not delimit words with spaces. A whitespace word count is
+# meaningless for these - the same sentence reads as 3 "words" in Japanese and
+# 20 in English - so they are measured in CHARACTERS against their own bounds.
+_NOSPACE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0e7f]")
+# Does the paragraph HAVE sentence structure? Three attempts got this wrong, so
+# the reasoning is worth keeping:
+#   1. "did the split fire" - no. The split needs whitespace after an ASCII
+#      terminator, so a paragraph that is exactly ONE sentence ending at the end
+#      of the string has no split point, and the length check gets waived on
+#      most paragraphs on the site.
+#   2. "is a terminator present anywhere" - no. The dot in `Counter-Strike 1.6`
+#      is a terminator by that test, so a Thai paragraph with no sentence
+#      punctuation at all still counted as structured.
+#   3. What actually answers it: either the split produced more than one piece,
+#      or the paragraph ENDS on a terminator. Thai satisfies neither, English
+#      and Japanese satisfy one or both.
+_TERM_END = re.compile(r"[.!?。！？।॥۔][\"'\u2019\u201d)\]]*\s*$")
 
 
 def _mentions(text: str, domain: str, brand: str | None) -> list[str]:
@@ -394,9 +423,99 @@ def sweep(domain: str, questions: list[str], *, brand=None, engines=None,
 
 # ------------------------------------------------------- extractable answers
 _TAG = re.compile(r"<[^>]+>")
+# ⚠ SCRIPT-AWARE ON PURPOSE. The first version tokenised headings with
+# `[a-z0-9]{4,}`, which extracts NOTHING from a pure-CJK heading - so the
+# "does the lead sentence name its own subject" test could not run, and
+# returned False. Measured 2026-09-01: that flagged `/zh/`, the page earning
+# 68% of this site's clicks, as not liftable, on a check that never executed.
+# "Cannot evaluate" reported as "fails" is the exact error this skill exists to
+# prevent, reproduced from scratch in new code.
+#
+# \w with re.UNICODE covers Cyrillic, Arabic, Devanagari, Greek and Latin.
+# CJK and Thai have no word boundaries at all, so a token rule cannot work
+# there: those fall back to CHARACTER BIGRAMS, which is what a reader matching
+# a Chinese title against a Chinese sentence is actually doing.
+_WORD = re.compile(r"\w{3,}", re.UNICODE)
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0e7f]")
 _BLOCK = re.compile(r"(?is)<(script|style|nav|header|footer|aside)[^>]*>.*?</\1>")
 _P = re.compile(r"(?is)<p[^>]*>(.*?)</p>")
 _H1 = re.compile(r"(?is)<h1[^>]*>(.*?)</h1>")
+
+
+def _sentence_length(sentence: str) -> tuple[int, str, bool]:
+    """(size, unit, within_bounds). A liftable sentence is one a reader could be
+    quoted; how that is measured depends on the script."""
+    stripped = re.sub(r"\s+", "", sentence)
+    # ANY CJK/Thai presence switches to characters. A ratio threshold looks
+    # principled and is not: the real Japanese lead here is 28% kana/kanji
+    # because the product and engine names stay in Latin, so a 0.3 cutoff
+    # measured it as 3 "words" and flagged the page.
+    if _NOSPACE.search(sentence):
+        n = len(stripped)
+        return n, "chars", 12 <= n <= 120
+    n = len(sentence.split())
+    return n, "words", 6 <= n <= 45
+
+
+# A capitalised multi-word or hyphenated name - "Counter-Strike", "Combat
+# Skirmish", "Half-Life". Used as a FALLBACK subject signal.
+# Two shapes, because products are named both ways. `Counter-Strike`,
+# `Combat Skirmish`, `Half-Life` - and the all-caps abbreviation with an
+# optional version, `CS 1.6`, which the first pattern misses entirely and which
+# is how half this site's own prose refers to the game.
+# ⚠ The all-caps branch needs TWO capitals, so an ordinary sentence-initial word
+# ("There", "Organising") cannot satisfy it.
+_PROPER = re.compile(
+    r"\b[A-Z][a-z]{2,}(?:[-\u2011][A-Z][a-z]+|\s+[A-Z][a-z]{2,})+"
+    r"|\b[A-Z]{2,}(?:\s*\d+(?:\.\d+)*)?\b"
+    # Model names: M3, AK47, AWP, USP. One capital plus digits is a name, and
+    # `The M3 is a corner weapon` was flagged for lacking a subject because
+    # neither the 3-character word rule nor the two-capital rule reaches it.
+    r"|\b[A-Z][0-9]+\b")
+
+
+def _names_subject(h1: str, sentence: str, *, extra: tuple[str, ...] = ()) -> tuple[bool, str]:
+    """Does the lead sentence stand on its own - does it name what it is about?
+
+    ⚠ THE H1 IS EVIDENCE, NOT THE DEFINITION. A first version matched only
+    against h1 tokens and flagged `/landers/retro-shooter` - h1 "A Retro Shooter
+    That Never Needed Replacing", lead "Counter-Strike started life in 1999 as a
+    mod for Half-Life" - which names its subject about as clearly as a sentence
+    can. The h1 was a stylish headline; the rule was measuring vocabulary
+    agreement between two elements rather than whether the SENTENCE is
+    self-contained, which is the thing an assistant cares about.
+
+    So: h1/title/slug tokens first, then a proper-noun fallback. What still
+    fails is a lead that names nothing at all - "There is no purchase, no
+    subscription and no account" - which is exactly what should fail.
+
+    Returns (verdict, basis); `not-evaluable` is NOT `False`."""
+    if not sentence:
+        return False, "not-evaluable"
+    if not h1 and not extra:
+        return (bool(_PROPER.search(sentence)), "proper-noun") if _PROPER.search(sentence) \
+            else (False, "not-evaluable")
+    low_h, low_s = h1.lower(), sentence.lower()
+    # ⚠ CJK IS CHECKED FIRST, and this ordering is the fix. `\w` with re.UNICODE
+    # DOES match CJK - it tokenises a Chinese heading into whole runs between
+    # punctuation ("在线玩反恐精英"), which are far too long to appear verbatim in
+    # a sentence. So the word branch does not fail to find tokens, it finds
+    # useless ones, and a bigram fallback placed after it never runs.
+    if _CJK.search(h1):
+        bigrams = {h1[i:i + 2] for i in range(len(h1) - 1)
+                   if _CJK.match(h1[i]) and _CJK.match(h1[i + 1])}
+        if bigrams:
+            return any(b in sentence for b in bigrams), "cjk-bigrams"
+    sources = " ".join([h1, *extra]).lower()
+    words = [w for w in _WORD.findall(sources)
+             if not w.isdigit() and not _CJK.search(w)]
+    if words and any(w in low_s for w in words):
+        return True, "words"
+    # FALLBACK: the sentence names a proper entity of its own. This is what
+    # rescues a well-written lead under a headline-style h1.
+    if _PROPER.search(sentence):
+        return True, "proper-noun"
+    return (False, "words") if words else (False, "not-evaluable")
 
 
 def extractable(root: str, limit: int = 400) -> dict:
@@ -423,23 +542,51 @@ def extractable(root: str, limit: int = 400) -> dict:
         h1 = _TAG.sub("", (_H1.search(body) or [None, ""])[1]).strip() if _H1.search(body) else ""
         paras = [re.sub(r"\s+", " ", _TAG.sub(" ", m)).strip() for m in _P.findall(body)]
         lead = next((x for x in paras if len(x) > 60), "")
-        first = _SENT.split(lead)[0] if lead else ""
-        words = len(first.split())
+        pieces = [t.strip() for t in _SENT.split(lead) if t.strip()] if lead else []
+        first = pieces[0] if pieces else ""
+        words, unit, len_ok = _sentence_length(first)
+        # ⚠ If the paragraph carries NO sentence terminator, "the first sentence"
+        # IS the whole paragraph and its length says nothing. Thai writes without
+        # sentence-ending punctuation at all, so this fires there every time -
+        # and reporting 270 chars as "too long to quote" is a statement about
+        # Thai orthography, not about the page. Not evaluable, so it does not vote.
+        has_terminator = len(pieces) > 1 or bool(lead and _TERM_END.search(lead))
+        if not has_terminator:
+            len_ok = True
         # A liftable sentence names its subject and stands alone. The two ways it
         # fails are opening on a pronoun with no antecedent, and being so long
         # that quoting it means quoting a paragraph.
-        starts_pronoun = bool(re.match(r"(?i)^(it|this|that|they|these|those|he|she)\b", first))
-        names_subject = bool(h1 and any(
-            w for w in re.findall(r"[a-z0-9]{4,}", h1.lower()) if w in first.lower()))
-        ok = bool(first) and 6 <= words <= 45 and not starts_pronoun and names_subject
+        # ⚠ A PRONOUN AND AN EXISTENTIAL ARE NOT THE SAME FAULT.
+        # "It does not mean a stripped-down clone" dangles: the quote carries
+        # nothing to resolve `It` against. But "There are three ways to get
+        # Counter-Strike 1.6 running on a Chromebook" is a perfectly quotable
+        # sentence - the existential opener is a construction, not a defect,
+        # and it fails only when the sentence ALSO names nothing. Treating the
+        # two alike flagged a genuinely good lead on /guides/chromebook.
+        slug_words = p.stem.replace("-", " ").replace("_", " ")
+        names_subject, subject_basis = _names_subject(h1, first, extra=(slug_words,))
+        bare_pronoun = bool(re.match(
+            r"(?i)^(it|this|that|they|these|those|he|she)\b", first))
+        existential = bool(re.match(r"(?i)^there\s+(is|are|was|were)\b", first))
+        starts_pronoun = bare_pronoun or (existential and not names_subject)
+        # A subject test that could not run must not vote. `evaluable` is False
+        # only when there is no h1 at all, and then the page is judged on the
+        # rules that DID run rather than failed on the one that did not.
+        ok = (bool(first) and len_ok and not starts_pronoun
+              and (names_subject or subject_basis == "not-evaluable"))
         rows.append({"file": str(p.relative_to(d)), "h1": h1[:80],
-                     "lead_sentence": first[:200], "words": words,
-                     "liftable": ok,
+                     "lead_sentence": first[:200], "length": words, "unit": unit,
+                     "liftable": ok, "subject_check": subject_basis,
+                     "length_check": "words/chars" if has_terminator else "not-evaluable",
                      "why": None if ok else ", ".join(filter(None, [
                          "no lead paragraph" if not first else "",
-                         f"{words} words" if first and not (6 <= words <= 45) else "",
-                         "opens on a pronoun with no antecedent" if starts_pronoun else "",
-                         "does not name its own subject" if first and not names_subject else "",
+                         f"{words} {unit}" if first and not len_ok and has_terminator else "",
+                         ("opens on a pronoun with no antecedent" if bare_pronoun else
+                          "opens on `there is/are` and names no subject" if starts_pronoun
+                          else ""),
+                         ("does not name its own subject"
+                          if first and not names_subject
+                          and subject_basis != "not-evaluable" else ""),
                      ]))})
     bad = [r for r in rows if not r["liftable"]]
     return {
