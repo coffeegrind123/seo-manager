@@ -204,6 +204,42 @@ def check_policy(origin: str, path: str = "/") -> dict:
             + ", ".join(blocked),
             "Each blocked ai_search bot is one assistant that can never cite the site."))
 
+    # ROBOTS.TXT GROUPS DO NOT INHERIT, and this is the trap that costs bandwidth
+    # rather than visibility. A crawler obeys ONLY the most specific group naming
+    # it, so a named `User-agent: GPTBot` group whose whole body is `Allow: /`
+    # silently grants every path the `*` group closes. Nothing in the file looks
+    # wrong: the exclusions are right there, a few lines above, in a group that
+    # does not apply.
+    #
+    # MEASURED 2026-09-01 on combatskirmish.net: GPTBot, Amazonbot and
+    # OAI-SearchBot were all permitted on /g/ (tokenised game binaries), /api/ and
+    # /dl/, every one of which the default group disallows. Over the six days
+    # 2026-08-26..09-01 Amazonbot made 5,035 requests, 839/day.
+    star_disallows = [r[1] for g in groups if "*" in g["agents"]
+                      for r in g["rules"] if r[0] == "disallow" and r[1]]
+    escapes = []
+    for r_ in rows:
+        if not r_["explicit_rule"]:
+            continue
+        got = [d for d in star_disallows
+               if allowed(groups, r_["bot"], d)["allowed"]]
+        if got:
+            escapes.append({"bot": r_["bot"], "category": r_["category"],
+                            "reaches": sorted(got)[:8], "count": len(got)})
+    if escapes:
+        worst = max(e["count"] for e in escapes)
+        findings.append(_finding(
+            "high", "named_group_escapes_default_exclusions",
+            f"{len(escapes)} named agent group(s) reach paths the `*` group disallows "
+            f"(up to {worst} each): "
+            + ", ".join(f"{e['bot']} -> {', '.join(e['reaches'][:3])}" for e in escapes[:4]),
+            "robots.txt groups do NOT inherit - an agent obeys only the most specific "
+            "group that names it, so a named group whose body is just `Allow: /` "
+            "overrides every Disallow in the default group. Repeat the exclusions "
+            "inside each named group. This is usually a bandwidth and crawl-budget "
+            "bug rather than a visibility one, and it is invisible on a `/` check "
+            "because the paths involved are never the homepage."))
+
     if search_total and search_open == 0 and train_open > 0:
         findings.append(_finding(
             "critical", "farmed_not_read",

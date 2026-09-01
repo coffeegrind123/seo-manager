@@ -152,3 +152,38 @@ source and a date rather than a bare assertion.
 **Re-check this file when:** any major AI search system documents `llms.txt`
 consumption; Google renames or adds `agentic-browsing` audits; WebMCP leaves
 origin trial; or a follow-up log study shows `/llms.txt` request rates moving.
+
+## robots.txt groups do NOT inherit — the exclusion bypass
+
+**The trap.** A crawler obeys only the **most specific group that names it**. So a
+named `User-agent: GPTBot` group whose whole body is `Allow: /` grants that agent
+every path the `*` group closes. Nothing in the file looks wrong: the exclusions
+are right there, a few lines above, in a group that does not apply to it.
+
+**Measured on combatskirmish.net, 2026-09-01.** The file allowed AI crawlers
+deliberately and correctly — and 18 named agent groups reached up to 11 disallowed
+paths each, including `/g/` (tokenised game binaries), `/api/` and `/dl/`. Over
+the six days 2026-08-26..09-01 Amazonbot made 5,035 requests (839/day), the
+largest crawler on the site by a factor of two. The file's own header stated the
+intent — *"keep them out of the API and
+tokenized/binary/internal paths that have no content value"* — and it had simply
+never been applied to the named groups.
+
+`agentcheck.py policy` now reports this as `named_group_escapes_default_exclusions`
+(high). ⚠ **It cannot be seen on a `/` check**, because the paths involved are never
+the homepage — which is why `policy` returned a confident `pass` for as long as it
+did.
+
+**The fix is repetition, not restructuring:** copy the `Disallow` lines into each
+named group. It costs no content access — every page, image and text surface stays
+open — and it is the only mechanism, since there is no inheritance to rely on.
+
+**Two adjacent robots.txt facts that bit the same file on the same day**, both
+worth checking whenever you touch one:
+
+- **`Allow: /` placed FIRST in a group kills every `Disallow` below it** for
+  first-match parsers. RFC 9309, Google and Bing resolve by most-specific match and
+  are unaffected, but the ordering costs nothing to get right. Put it last.
+- **A blank line ends a record** in legacy parsers (Python's `urllib.robotparser`
+  among them), orphaning every rule after it. Keep a group contiguous — a bare `#`
+  gives the same visual separation without the break.

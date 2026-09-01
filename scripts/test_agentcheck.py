@@ -255,6 +255,34 @@ check("a missing llms.txt is LOW, never critical",
 check("the framing never claims a ranking benefit",
       "never as a ranking or citation signal" in r["framing"])
 
+# robots.txt groups DO NOT INHERIT. A named group whose body is just `Allow: /`
+# grants every path the `*` group closes, and nothing in the file looks wrong -
+# the exclusions are right there, a few lines up, in a group that does not apply.
+# Measured 2026-09-01: 18 named agent groups reached up to 11 disallowed paths
+# each, including /g/ (game binaries) and /api/, while `policy` on `/` said PASS.
+def _escapes(text):
+    groups = ac.parse_robots(text)
+    star = [r[1] for g in groups if "*" in g["agents"]
+            for r in g["rules"] if r[0] == "disallow" and r[1]]
+    named = {a for g in groups for a in g["agents"] if a != "*"}
+    return {b: len([d for d in star if ac.allowed(groups, b, d)["allowed"]])
+            for b in named
+            if any(ac.allowed(groups, b, d)["allowed"] for d in star)}
+
+BROKEN = "User-agent: *\nDisallow: /api/\nDisallow: /g/\nAllow: /\n\nUser-agent: GPTBot\nAllow: /\n"
+REPEATED = ("User-agent: *\nDisallow: /api/\nDisallow: /g/\nAllow: /\n\n"
+            "User-agent: GPTBot\nDisallow: /api/\nDisallow: /g/\nAllow: /\n")
+NO_NAMED = "User-agent: *\nDisallow: /api/\nAllow: /\n"
+
+check("a named group with a bare Allow:/ is caught escaping", _escapes(BROKEN))
+check("and the count is the number of paths it reaches",
+      _escapes(BROKEN).get("gptbot") == 2)
+check("repeating the exclusions inside the named group clears it",
+      not _escapes(REPEATED))
+check("CONTROL: a file with no named group cannot escape", not _escapes(NO_NAMED))
+check("CONTROL: the probe finds nothing when `*` disallows nothing",
+      not _escapes("User-agent: *\nAllow: /\n\nUser-agent: GPTBot\nAllow: /\n"))
+
 print()
 if FAILS:
     print(f"FAILED {len(FAILS)}: {', '.join(FAILS)}")
