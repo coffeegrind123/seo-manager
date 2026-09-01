@@ -20,6 +20,7 @@ separately, or write the path out in full.
 | `keywords.py` | expansion across **six independent suggestion corpora** (Google, Bing, DuckDuckGo, YouTube, Yandex, Amazon) with a cross-engine agreement signal and observed video/product intent, plus tool-intent sweeps, DataForSEO volume/KD, and Search Console → candidates |
 | `competitors.py` | **reads page 1 instead of guessing from titles**: fetches each result and returns the depth you are matching (median words/headings), which results are thin/UGC/stale, and the subtopics most of them cover. The HTTP fetcher honours robots.txt (that is what RFC 9309 governs) and treats every fetched byte as inert data; anything it cannot read is listed as `browser_candidates` to be read through the browser-automation MCP - a bounded one-pass read of ten page-1 URLs, which is normal research practice, not crawling |
 | `sameness.py` | the corpus sameness gate + a pairwise drift audit |
+| `sitegraph.py` | **the internal link graph** — build it from a LOCAL generated tree (no network, works on an undeployed build) or by live BFS, then ask it for orphans, click depth, broken links and `silos`. That last one is the point: it ranks silos by EXTERNAL-silo inbound links and flags **islands** — a silo whose pages cross-link each other so every naive inlink count looks healthy while nothing outside points in. Counts `<link rel=alternate hreflang>` as a discovery edge, ignores self-loops, and detects site furniture by FREQUENCY rather than by tag, because a nav rendered as `<p class="silonav">` defeats a tag-based rule. `orphans --contextual` splits out pages that are THEMSELVES global-nav furniture into `nav_hub_urls` — a hub with 12,070 inbound links is the most reachable page on the site, and counting it as an orphan pads the number until the real orphan hides in the list |
 | `authority.py` | DR-equivalent, and the KD zones / volume band that follow from it. Also `--bulk` competitor scoring, free referring-domain counts, a 12-month authority trend, and two independent popularity reads (Cloudflare Radar + **Tranco**, which is keyless and carries 40 days of rank history) |
 | `bing.py` | **the only free source of real search volume AND backlinks** — Bing Webmaster Tools for a site you own. Impressions per query, related-keyword expansion with numbers, inbound links, query stats |
 | `trendfeeds.py` | **keyless demand signals**: Google Trends' RSS feed (works where the 429-ing JSON API does not), Wikimedia pageviews as absolute topic demand, HN + StackExchange chatter, **GDELT's per-topic news-volume timeline**, and Google News (who is covering the topic now) |
@@ -41,6 +42,8 @@ separately, or write the path out in full.
 | `agentcheck.py` | **can an AI agent read, understand and act on this site, and is it allowed to**: robots.txt resolved per AI crawler in the ai_search/ai_user/ai_training taxonomy, agent-UX semantics, token budget, JS-dependence, WebMCP, and `llms.txt` well-formedness |
 | `slop.py` | **AI writing tells, detected mechanically** — 20 patterns with per-rule tolerances, located hits and line numbers. Code fences, inline code and link targets excluded. No score, on purpose. |
 | `test_measure.py` | the controls for the **measurement** scripts (`crawllog` / `backlinks` / `decay`). Every case is a bug that shipped and was caught against live data, or a distinction that silently produces a confident wrong answer — UA registry ordering (`Googlebot-Image` contains "googlebot"; `ChatGPT-User` does not contain "gptbot"), and the three-state verification that keeps "cannot ask" out of the same code path as "the answer is no" |
+| `test_keywords.py` | the controls for the band analysers, chiefly `keywords.py bing`: Bing returns one row PER MARKET, so a plain mean over rows lets a 3-impression market move the headline position as much as a 3,000-impression one (the position must be impression-weighted); script segmentation, because a blended CTR hid a segment earning 73% of clicks at 12x the average rate; and `ctr_underperformer`, which must fire on a top-10 page with <2% CTR but NOT on a deep ranking, where low CTR is expected |
+| `test_sitegraph.py` | the controls for the link graph: the `<p class="silonav">` case that defeats tag-based boilerplate detection, self-referential hreflang counted as an inbound link, the island silo whose inlink counts look healthy, a `--start` that was never crawled reporting mass unreachability, a zero-edge graph refusing a verdict instead of calling every page an orphan, and a global-nav hub being kept out of the orphan count while staying visible for review |
 | `test_hreflang.py` / `test_contract.py` / `test_agentcheck.py` / `test_slop.py` / `test_crawllog.py` / `test_competitors.py` | the controls for the above: every rule is fired against synthetic input, so a clean pass on a real site means something. `test_crawllog` covers the UA-spoofing detector (including the control that a single operator's many crawlers are NOT flagged) and the no-input refusal. `test_competitors` fires every guarantee of the page-1 profiler against synthetic input - robots.txt obedience by the HTTP fetcher, injection-shape defanging, that every unread result is offered for browser escalation WITH its reason, and that platform chrome never becomes a 'subtopic page 1 covers' |
 
 Also `assets/google-updates.json` — Google's published algorithm-update calendar,
@@ -86,6 +89,12 @@ python3 $SEO/providers.py status
 
 # real numbers (Bing Webmaster - needs a verified property)
 python3 $SEO/bing.py sites                          # auth control; run first if anything looks odd
+python3 $SEO/bing.py traffic --days 90              # IS Bing bigger than Google here? check, do not assume
+python3 $SEO/bing.py queries --limit 400 > bq.json  # real impressions AND real positions
+python3 $SEO/keywords.py bing bq.json               # band them; READ by_script FIRST
+# ⚠ Chinese/Japanese/Arabic seeds return NOTHING on the default us/en-US market.
+#   That is the wrong question, not absent demand:
+python3 $SEO/bing.py expand --seed "cs1.6网页版" --country cn --language zh-CN
 python3 $SEO/bing.py keyword --q "<kw>" --days 90   # impressions, NOT Google volume
 python3 $SEO/bing.py expand  --seed "<kw>" --limit 25
 python3 $SEO/bing.py backlinks
@@ -106,6 +115,17 @@ python3 $SEO/drift.py snapshot --keywords-from .seo/keywords.json --out .seo/dri
 python3 $SEO/backlinks.py referrers --remote root@<host> --site example.com
 python3 $SEO/backlinks.py footprint --domain example.com
 python3 $SEO/sameness.py tiers --corpus public/seo/maps        # O(n) index-bloat
+
+# the internal link graph - offline against a generated tree, no network at all
+python3 $SEO/sitegraph.py crawl --root public/seo=/ --root public/legal=/ \
+  --rewrite '/landers/=/' --out .seo/graph/site.json     # 3,981 pages in ~30s
+python3 $SEO/sitegraph.py silos   --graph .seo/graph/site.json   # READ THIS FIRST
+python3 $SEO/sitegraph.py inlinks --graph .seo/graph/site.json /guides/bunny-hop
+python3 $SEO/sitegraph.py orphans --graph .seo/graph/site.json --contextual
+python3 $SEO/sitegraph.py depth   --graph .seo/graph/site.json --start /maps
+python3 $SEO/sitegraph.py broken  --graph .seo/graph/site.json --ignore '^/servers/'
+# live instead, obeying robots.txt per origin:
+python3 $SEO/sitegraph.py crawl --url https://example.com/ --max-pages 500 --out g.json
 python3 $SEO/keywords.py cluster --file kws.txt                # one page or five?
 
 # guards on your OWN markup (run contract after every deploy - see the note above)

@@ -138,6 +138,12 @@ Supporting references:
 - `references/data-sources.md` — every provider, what it costs, and **what was
   measured to actually work** from a container. Read it when a data call fails or
   before adding a provider.
+- `references/prior-art.md` — **the open-source landscape and the roadmap that
+  follows from it**: what the sibling projects (claude-seo, open-seo, geolook,
+  advertools, LibreCrawl) actually cover, where this skill is ahead, the ranked
+  gaps, and the one constraint that decides every integration — no serious
+  library in this space is stdlib, so the script layer is cleanroom by
+  necessity, not by licence. Read it before adding a dependency or a script.
 - `references/backlink-playbook.md` — the curated directory list, ordered by
   value, with an explicit do-not-buy section.
 - `references/agent-readiness.md` — the three AI-crawler classes and why
@@ -159,7 +165,7 @@ Supporting references:
 
 ## The scripts
 
-25 scripts, all stdlib Python 3, no installs. Every one prints JSON; `--help`
+26 scripts, all stdlib Python 3, no installs. Every one prints JSON; `--help`
 lists the subcommands.
 
 ```bash
@@ -170,7 +176,7 @@ SEO=~/.claude/skills/seo-manager/scripts    # adjust if vendored into the repo
 fresh shell, so re-declare that line at the top of any block you run separately.
 Every command in every reference file assumes it.
 
-The five you touch in almost every run:
+The six you touch in almost every run:
 
 | Script | Job |
 |---|---|
@@ -179,6 +185,7 @@ The five you touch in almost every run:
 | `serp.py` | live SERPs through the provider ladder, plus the weakness/authority scoring the gate needs |
 | `keywords.py` | expansion across six independent suggestion corpora, with a cross-engine agreement signal |
 | `sameness.py` | the corpus sameness gate + a pairwise drift audit |
+| `sitegraph.py` | the internal link graph, offline or live — orphans, click depth, broken links, and the ISLAND silos that look well-linked and are reachable from nowhere |
 
 **Read `references/scripts.md` before running anything else** — it carries the
 full table (research, measurement, guards, tests), the command cookbook, and the

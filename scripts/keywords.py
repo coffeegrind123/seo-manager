@@ -467,6 +467,119 @@ def cmd_gsc(a):
     }, indent=2, ensure_ascii=False))
 
 
+# --------------------------------------------------------------- bing bands
+_SCRIPT_RANGES = [
+    ("cjk", "\u4e00-\u9fff\u3400-\u4dbf"), ("kana", "\u3040-\u30ff"),
+    ("hangul", "\uac00-\ud7af"), ("cyrillic", "\u0400-\u04ff"),
+    ("arabic", "\u0600-\u06ff"), ("thai", "\u0e00-\u0e7f"),
+    ("devanagari", "\u0900-\u097f"), ("hebrew", "\u0590-\u05ff"),
+]
+_SCRIPT_RE = [(n, re.compile(f"[{r}]")) for n, r in _SCRIPT_RANGES]
+
+
+def script_of(kw: str) -> str:
+    for name, rx in _SCRIPT_RE:
+        if rx.search(kw):
+            return name
+    return "latin"
+
+
+def cmd_bing(a):
+    """Band a `bing.py queries` export the same way cmd_gsc bands Search Console.
+
+    This exists because a program can spend months optimising against the wrong
+    engine without ever noticing. Measured on combatskirmish.net 2026-09-01:
+    Bing delivered 57,596 impressions and 4,300 clicks in 29 days while Google
+    Search Console reported 545 and 43 for the same window - about 100x - and
+    every workflow here had been reading GSC. Whichever engine actually sends
+    the traffic is the one whose half-ranked queries are worth mining.
+
+    Two things this does that the GSC path does not need:
+
+    1. AGGREGATES duplicate query rows. Bing returns one row per market, so the
+       same string appears several times with different numbers; summing the
+       impressions and taking an IMPRESSION-WEIGHTED position is the only honest
+       way to collapse them. A plain mean over rows lets a 3-impression market
+       move the headline position as much as a 3,000-impression one.
+    2. Segments by SCRIPT. That is what surfaced the finding above: Chinese
+       queries were 15% of queries and 73% of all clicks, converting at 30.3%
+       against 2.5% for everything else. A single blended CTR hides a segment
+       performing twelve times better than the average - and hides which half of
+       the site is actually earning.
+    """
+    text = sys.stdin.read() if a.file == "-" else open(a.file, encoding="utf-8").read()
+    data = json.loads(text)
+    rows = data.get("queries") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        print(json.dumps({"ok": False, "error":
+              "expected `bing.py queries` output (a dict with 'queries') or a bare list"}))
+        return
+    agg = {}
+    for r in rows:
+        kw = (r.get("query") or "").strip()
+        if not kw:
+            continue
+        imp = r.get("impressions") or 0
+        e = agg.setdefault(kw, {"impressions": 0, "clicks": 0, "wpos": 0.0, "posimp": 0})
+        e["impressions"] += imp
+        e["clicks"] += r.get("clicks") or 0
+        pos = r.get("avg_position")
+        if isinstance(pos, (int, float)):
+            e["wpos"] += pos * imp
+            e["posimp"] += imp
+    out = []
+    for kw, e in agg.items():
+        if e["impressions"] < a.min_impressions:
+            continue
+        pos = (e["wpos"] / e["posimp"]) if e["posimp"] else None
+        ctr = (e["clicks"] / e["impressions"]) if e["impressions"] else 0.0
+        if pos is None:
+            band = "unknown"
+        elif pos <= 3:
+            band = "top3"
+        elif pos <= 10:
+            band = "page1"
+        elif pos <= 20:
+            band = "striking-distance"
+        elif pos <= 50:
+            band = "page3-5"
+        else:
+            band = "deep"
+        out.append({
+            "keyword": kw, "impressions": e["impressions"], "clicks": e["clicks"],
+            "ctr": round(ctr, 4), "position": round(pos, 1) if pos is not None else None,
+            "band": band, "script": script_of(kw), "intent": classify_intent(kw),
+            "tool_shaped": bool(TOOL_VERBS.search(kw)),
+            "ctr_underperformer": bool(pos and pos <= 10 and e["impressions"] >= 100 and ctr < 0.02),
+        })
+    order = {"striking-distance": 0, "page3-5": 1, "page1": 2, "top3": 3, "deep": 4, "unknown": 5}
+    out.sort(key=lambda r: (order.get(r["band"], 9), -r["impressions"]))
+    by_script = {}
+    for r in out:
+        b = by_script.setdefault(r["script"], {"queries": 0, "impressions": 0, "clicks": 0})
+        b["queries"] += 1
+        b["impressions"] += r["impressions"]
+        b["clicks"] += r["clicks"]
+    for b in by_script.values():
+        b["ctr"] = round(b["clicks"] / b["impressions"], 4) if b["impressions"] else 0.0
+    if a.band:
+        out = [r for r in out if r["band"] in a.band]
+    if getattr(a, "script", None):
+        out = [r for r in out if r["script"] in a.script]
+    print(json.dumps({
+        "ok": True, "count": len(out),
+        "striking_distance": sum(1 for r in out if r["band"] == "striking-distance"),
+        "ctr_underperformers": sum(1 for r in out if r["ctr_underperformer"]),
+        "by_script": dict(sorted(by_script.items(), key=lambda kv: -kv[1]["clicks"])),
+        "reading": ("`by_script` first. A blended CTR can hide one language segment earning "
+                    "most of the clicks at many times the average rate - which is exactly "
+                    "what it was hiding here. `ctr_underperformer` marks a query ranking "
+                    "top-10 with real impressions and under 2% CTR: that is a title and "
+                    "snippet problem, not a ranking problem, and it is fixed differently."),
+        "results": out[: a.limit] if a.limit else out,
+    }, indent=2, ensure_ascii=False))
+
+
 # -------------------------------------------------------------------- main
 
 
@@ -675,6 +788,14 @@ def main():
     s.add_argument("file", help="search-analytics JSON, or - for stdin")
     s.add_argument("--min-impressions", type=int, default=10)
     s.add_argument("--band", nargs="*", choices=["top3", "page1", "striking-distance", "page3-5", "deep", "unknown"])
+
+    b = sub.add_parser("bing", help="band a `bing.py queries` export (the engine that may actually send your traffic)")
+    b.add_argument("file", help="bing.py queries JSON, or - for stdin")
+    b.add_argument("--min-impressions", type=int, default=10)
+    b.add_argument("--band", nargs="*", choices=["top3", "page1", "striking-distance", "page3-5", "deep", "unknown"])
+    b.add_argument("--script", nargs="*", help="filter by script: cjk, latin, cyrillic, arabic, ...")
+    b.add_argument("--limit", type=int, default=100)
+    b.set_defaults(fn=cmd_bing)
     s.add_argument("--limit", type=int)
     s.set_defaults(fn=cmd_gsc)
 

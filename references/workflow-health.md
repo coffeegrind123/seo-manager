@@ -75,7 +75,38 @@ They are the ones whose failure silently invalidates other work:
 Then the one everyone skips and shouldn't: **`internal-link-audit`**, because
 orphan pages are the cheapest fix in SEO and nothing else surfaces them.
 
-**Success criteria**: `canonical-tag-audit`, `sitemap-audit` and `redirect-audit` have all run, plus `internal-link-audit`, and each returned a read result rather than an error.
+Run that fourth one with **`sitegraph.py`**, and run it against the LOCAL
+generated tree — it needs no network, works on a build that has not shipped yet,
+and does ~4,000 pages in about 30 seconds:
+
+```bash
+python3 $SEO/sitegraph.py crawl --root <content-dir>=/ --out .seo/graph/site.json
+python3 $SEO/sitegraph.py silos --graph .seo/graph/site.json     # read this FIRST
+```
+
+⚠ **Read `external_silo_median` and `islands`, not `inlinks_median`.** A silo whose
+pages cross-link each other has healthy-looking inbound counts on every page and is
+reachable from nowhere a crawler already goes. That is not a hypothetical: on
+combatskirmish.net every page in `/guides` had **16 inbound links, all 16 from other
+guides**, and Google's URL Inspection API reported all twelve as *"URL is unknown to
+Google, never crawled"* nine days after they shipped — while the indexed control page
+sat in the same sitemap. `orphans` alone reports zero in that situation, because the
+pages are not orphans. `silos` reports `island: true`.
+
+An island silo is a **structural** finding: one queue item for the silo, not one per
+page, and the fix is contextual links INTO it from the silos that already get crawled
+(`crawllog.py` tells you which those are).
+
+⚠ **A hub page with zero contextual inlinks is not an orphan.** `orphans --contextual`
+counts body links only, so every page that lives in the global nav scores zero — and
+those are the most reachable pages you have. They are reported separately as
+`nav_hub_urls` with their true inbound count; read that field before treating one as a
+finding. Measured on combatskirmish.net 2026-09-01: of 27 zero-contextual pages, 6 were
+nav hubs carrying 3,978-12,070 inbound links each. The remaining 21 were the real
+finding — locale home pages (`/es`, `/tr`, …) reachable only through a language switcher
+present on 4% of pages, i.e. the entry point to 21 localized silos held up by furniture.
+
+**Success criteria**: `canonical-tag-audit`, `sitemap-audit` and `redirect-audit` have all run, plus the `sitegraph.py` link-graph audit, and each returned a read result rather than an error. `silos` was read for `islands` before `orphans` was believed.
 
 ---
 

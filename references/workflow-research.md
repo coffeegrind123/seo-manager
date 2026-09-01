@@ -435,12 +435,34 @@ A young site's winnable keywords are almost never the ones a head-term sweep
 surfaces. Work these seams in order — each reliably yields queries that clear the
 authority gate because nobody bothered to target them:
 
-1. **Queries you already appear for.** The single best free seam. Pull the
-   `search-console` skill's search-analytics report, then:
+1. **Queries you already appear for.** The single best free seam — proven
+   relevant, already half-ranked, free. **Mine it FIRST every run.**
+
+   ⚠ **Mine the engine that actually sends the traffic, and CHECK which one that
+   is rather than assuming Google.** On a site with a verified Bing property,
+   `bing.py traffic` answers it in one call, and the answer is not always the
+   obvious one: measured on combatskirmish.net 2026-09-01, Bing delivered
+   **57,596 impressions / 4,300 clicks** in 29 days against Search Console's
+   **545 / 43** for the same window — about 100x — after this program had spent
+   its entire history reading GSC. Every outcome steer it had derived described
+   about 1% of the site's search traffic.
+
    ```bash
+   # Google
    python3 $SEO/keywords.py gsc gsc-queries.json --band striking-distance page3-5
+   # Bing - real impressions AND real positions, free, for a verified property
+   python3 $SEO/bing.py queries --limit 400 > bing-queries.json
+   python3 $SEO/keywords.py bing bing-queries.json --band striking-distance page1
    ```
-   Proven relevant, already half-ranked, and free — **mine this FIRST every run.**
+
+   **Read `by_script` before anything else.** A blended CTR hides a language
+   segment that may be carrying the site: on the same run, Chinese queries were
+   15% of queries and **73% of all clicks**, converting at 30.3% against 2.5%
+   for everything else — invisible in every aggregate the program had looked at.
+
+   And read `ctr_underperformers` as its own class: a query ranking top-10 with
+   real impressions and under 2% CTR is a **title and snippet** problem, not a
+   ranking problem, and no amount of new content fixes it.
 2. **Error strings and failure modes.** Verbatim messages, "X not working",
    "why does X", "X keeps <failing>". Almost always thin SERPs dominated by forum
    threads, and dead-on intent.

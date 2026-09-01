@@ -819,7 +819,32 @@ BROWSER_EXTRACT = r"""(function(){
   for(var i=0;i<hs.length;i++){
     var h=hs[i], a=h.closest('a'); if(!a||!a.href) continue;
     var u=a.href;
-    if(u.indexOf('/url?')===0) u=new URLSearchParams(u.split('?')[1]).get('q')||u;
+    // Google wraps destinations two different ways and BOTH must be unwrapped,
+    // or every result reports its domain as google.com and the authority gate
+    // silently scores the wrapper instead of page 1.
+    //  1. /url?q=<real url>      - decodable here.
+    //  2. /goto?url=<protobuf>   - NOT decodable client-side; fall back to the
+    //     visible <cite>, which still shows the real host.
+    try{
+      var pu=new URL(u, location.href);
+      var gh=/(^|\.)google\.[a-z.]+$/.test(pu.hostname);
+      if(gh && /^\/(url|imgres)$/.test(pu.pathname)){
+        var q=pu.searchParams.get('q')||pu.searchParams.get('url');
+        if(q && /^https?:/i.test(q)){ u=q; pu=new URL(u); gh=false; }
+      }
+      if(gh){
+        var cbox=a.closest('div.g')||a.closest('div[data-hveid]')||a.parentElement;
+        var cite=cbox?cbox.querySelector('cite'):null;
+        var ct=cite?(cite.textContent||'').trim():'';
+        if(ct){
+          ct=ct.replace(/^https?:\/\//i,'').split(/[\s\u203a\u00bb\/?#]/)[0].toLowerCase();
+          // Must actually LOOK like a hostname. Video/social blocks put things
+          // like '10.2k+' in the same slot, and an unvalidated grab turns a
+          // view count into a page-1 'domain'.
+          if(/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(ct) && !/google\./.test(ct)) u='https://'+ct+'/';
+        }
+      }
+    }catch(e){}
     if(seen[u]) continue;
     if(/google\.[a-z.]+\/(search|preferences|advanced)/.test(u)) continue;
     seen[u]=1;
