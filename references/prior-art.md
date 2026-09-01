@@ -158,7 +158,37 @@ to skim the list. Furniture targets are now split into `nav_hub_urls` with their
 true inbound count, leaving 21 genuine findings. Controlled in `test_sitegraph.py`
 case 7.
 
-### #2 — AI answer sampling — **DEPRIORITISED 2026-09-01, on measurement**
+### ✅ #2 — AI answer sampling — **BUILT 2026-09-01 (`geo.py`)**, reversing the call below
+
+The deprioritisation was half right and the half it got wrong was the important
+one. "The sampling half needs API keys this install does not have" was true of
+the LLM engines and FALSE of the biggest answer engine in the world: **Google's
+AI Overview is reachable today through the SerpApi key this skill already
+uses.** The reasoning stopped at "answer engine = LLM API" and never checked.
+
+Measured within minutes of the tool existing, on six of the site's core queries:
+5 produced an AI Overview, **zero cite combatskirmish.net, and play-cs.com is
+cited in 4 of 5** - an 80% share of voice on our own queries, held by the DR 35
+competitor. Nothing in the program was asking this.
+
+**And `serp.py` could never have found it.** SerpApi returns the AI Overview in
+TWO STAGES: the first response carries only a `page_token`, and `references`
+does not exist until the accompanying link is followed. `serp.py` read
+references off the first response, so it reported `present: true,
+references: []` for every AI Overview on earth - a permanent silent "never
+cited". Fixed, with `references_resolved` so a failed follow-up reads UNKNOWN.
+
+Perplexity and OpenAI are wired and report `no_key`, which is the correct state
+and not a stub: the moment a key exists they work, and until then `cannot_ask`
+never touches `not_cited`.
+
+**The lesson, which generalises past this entry:** "we lack the credential" is a
+claim about a capability, and it deserves the same control discipline as any
+other negative. Three roadmap items were deprioritised on measurement in this
+file and two of those were right; this one was a remembered constraint that
+nobody re-checked against the sources actually configured.
+
+#### The original deprioritisation, kept because its second half still stands
 
 Measured before building, the same way #4 was, and with the same outcome. Two
 halves, and neither survived contact:
@@ -226,6 +256,34 @@ capability you assumed you needed.** Three roadmap items were measured and found
 not to be this site's problem; the thing that was, was a missing column in a
 source already wired up.
 
+### #5–#7, and the rest — **BUILT 2026-09-01**
+
+The additive tier turned out to be worth building, and each one found a real
+defect the moment it ran against live data:
+
+- **`vitals.py`** (was #5, whole-site CWV). Per TEMPLATE, not per URL, because
+  on a generated site 2,234 map pages share one layout and a fix is applied per
+  template. Keyless. Its first version reported **5,940ms TTFB** for a server
+  that answers in 119ms - the rest was this container's DNS - and flagged it
+  "server/CDN work", pointing at the wrong system entirely. Connect is now timed
+  separately and every sweep measures a known-fast third-party host first. It
+  also samples TTFB twice: `/leaderboard` measured 12,065ms once and 70-94ms on
+  repeat (a 5-minute cache the sweep missed), while `/servers/*` measured
+  4,188 / 4,186 / 4,307 - reproducible, bimodal `[65, 66, 4071, 4157]` across
+  1,404 indexed URLs on the tier Bing crawls most.
+- **`brief.py`** (was #6, content briefs). Assembled from measurements, and a
+  hard refusal without a readable page 1. Its cannibalisation check used jaccard,
+  which is symmetric - a real query and `zzq nonexistent topic 9f2b` both scored
+  0 against 17 real guides, i.e. a metric that could not fire.
+- **`remeasure.py`** (not on the list). Hypotheses with pre-registered directions
+  and stored argv, because the four ways "did it work" gets answered wrongly are
+  all silent. The four open questions from this session are registered with
+  measured baselines.
+- **`controls.py`** — see #0 above.
+
+**MinHash/LSH for `sameness.py` remains genuinely not needed**: shingles handled
+2,637 documents fine, and that is a scale concern rather than a correctness one.
+
 ### #3 — Schema generation — **DEPRIORITISED 2026-09-01, on measurement**
 
 Measured across 2,696 generated pages: **100% JSON-LD coverage, zero invalid
@@ -270,14 +328,16 @@ Two process notes, because both cost a step:
   does not exist here. Re-check on a site whose images are NOT generated from a
   template before promoting this back up the list.
 
-### #5–#7 — additive, not corrective
+### #5–#7 — the ORIGINAL framing, superseded above
 
-- **Whole-site CWV** (`unlighthouse`) — real gap; `pagecheck.py vitals` does one
-  URL. Not the bottleneck on any site measured so far.
+- **Whole-site CWV** (`unlighthouse`) — "not the bottleneck on any site measured
+  so far". It was: `/servers/*` runs 4.2s on 1,404 indexed URLs. The claim was
+  made without ever measuring the site's server response per template.
 - **Content briefs / competitor pages** (open-seo, claude-seo) — sits on top of
-  `competitors.py`, which deliberately returns structure only.
-- **MinHash/LSH for `sameness.py`** — shingles handled 2,637 docs fine; this is a
-  scale concern, not a correctness one.
+  `competitors.py`, which deliberately returns structure only. Still true, and
+  that is exactly how `brief.py` composes it.
+- **MinHash/LSH for `sameness.py`** — shingles handled 2,637 docs fine; a scale
+  concern, not a correctness one. **Still the right call, still not built.**
 
 ---
 
