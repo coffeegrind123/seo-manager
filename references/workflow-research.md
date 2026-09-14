@@ -105,6 +105,36 @@ oldest first.
 
 ---
 
+### 0.6 Re-read the deferred targets that are DUE
+
+```bash
+python3 $SEO/seostate.py deferred --due
+```
+
+Every candidate a past run withheld is on the deferred list with a class and a
+condition (`quality-bar.md` § "The authority gate"). `--due` returns the ones
+whose condition is now met — an `authority` deferral once the site's DR has
+reached the next band, a dated one once the date has passed. For each: run the
+SERP read again, then EITHER promote it into a proposal
+
+```bash
+python3 $SEO/seostate.py deferred-update <id> --status promoted --note "re-read 2026-..: 2/10 (was 5/10)"
+python3 $SEO/seostate.py propose ...                      # the normal step-5 shape
+```
+
+OR re-defer it on the new count (`defer --allow-duplicate` after dropping the
+old row, or simply `deferred-update <id> --status dropped --note ...` and a fresh
+`defer`). A due target is not a pass — it is a page 1 that has EARNED a
+re-read. Report the count re-read and what each became.
+
+`catalogue` and `brand_navigational` rows are never due: their action was taken
+at deferral time (prospects filed, keyword folded). They are listed so a run
+does not re-spend a SERP check re-discovering them.
+
+**Success criteria**: `deferred --due` was run; every due target was re-read this run and is now promoted or re-deferred on a measured count — none left "due" at the end.
+
+---
+
 ### 1. Read the product surface
 
 Skim, do not deep-read: the product-surface files listed in
@@ -300,14 +330,45 @@ real Google, and compact verdicts instead of 25 SERPs of prose in your context
 
 ```bash
 python3 $SEO/serpd.py --start          # once; idempotent
-curl -s -X POST localhost:8791/batch -H 'Content-Type: application/json' \
-  -d '{"queries":["kw one","kw two","..."],"depth":20,"target":"<your domain>"}'
+curl -s -m 900 -X POST localhost:8791/batch -H 'Content-Type: application/json' \
+  -d '{"id":"run-2026-09-14-a","queries":["kw one","kw two","..."],"depth":20,"target":"<your domain>"}'
+# lost the response (client timeout, tool cut-off)? it is spooled under the id:
+curl -s 'localhost:8791/batch?id=run-2026-09-14-a'          # 202 pending / 200 done
+```
+
+⚠ **Give it a long timeout and ALWAYS pass your own `id`.** A batch under a
+Google throttle takes minutes — every throttled query backs off up to four times
+before giving up — and a client that times out used to lose the whole result
+(measured 2026-09-14: 24 reads completed server-side, BrokenPipe, nothing
+returned, no way to ask for it). Every batch is now written to
+`/tmp/seo-serpd-batches/<id>.json` before the reply is sent, and `GET
+/batch?id=` returns it afterwards; `GET /batch` with no id lists what the
+daemon has run. The reply's `throttled: true` means at least one query hit
+`/sorry` — the per-query `serp.py` loop below fails over to serper for those;
+the batch endpoint does not.
+
+**When the daemon is throttled, or a batch came back with failures, use the
+per-query loop** — `serp.py` fails over across providers by default (serpd →
+serper → serpapi → ddg) and names the provider it actually used in
+`provider` / `fell_back_from`:
+
+```bash
+while IFS= read -r q; do
+  python3 $SEO/serp.py "$q" --provider serpd --count 10 --gl us --hl en \
+    --target-domain <your domain> > ".seo/tmp/serp-$(echo "$q" | tr ' /' '__').json"
+done <<'Q'
+kw one
+kw two
+Q
 ```
 
 Each verdict carries `authority_candidate_count`, `weakness_signals`,
-`strong_serp_weakness`, `relevance_coverage`, `ai_overview` and the top 3
-domains. Read the top-3 titles to turn the authority *ceiling* into the real
-authority count.
+`strong_serp_weakness`, `unresolved_wrappers`, `relevance_coverage`,
+`ai_overview` and the top 3 domains. Read the top-3 titles to turn the
+authority *ceiling* into the real authority count. `unresolved_wrappers` are
+results whose host could not be recovered from Google's redirect wrapper and
+are counted nowhere — if there are several, read their titles: they are
+usually the video/forum half of the page.
 
 **One-off check:**
 
@@ -322,7 +383,18 @@ Highest fidelity, when the free provider disagrees with itself or the call is
 close: `--provider browser` and drive the browser MCP — that is real Google,
 including the AI Overview flag and related searches.
 
-**Success criteria**: EVERY survivor has a real authority count from a successful read. There is no cap and no budget: a refused read is retried, and a survivor left unchecked means the run is unfinished. Weak spots are captured for `--serp-notes`.
+**Then classify what the read showed, before step 5.** For every survivor the
+outcome is one of: *queue it* (count 0–2, or 3 with dead-on ICP), or *defer it
+with a class*. Deciding the class is a reading of page 1, not of the count:
+
+- real competitors (brands, the vendor, publishers) → `authority`
+- aggregators / directories, and the query wants a LIST → `catalogue` (the
+  aggregators go on the prospect list; that IS the action)
+- the query names another project → `brand_navigational` (fold into the page
+  that credits them)
+- docs / dev Q&A → `dev_intent`
+
+**Success criteria**: EVERY survivor has a real authority count from a successful read. There is no cap and no budget: a refused read is retried, and a survivor left unchecked means the run is unfinished. Weak spots are captured for `--serp-notes`, and every non-queued survivor has a class ready for step 5.
 
 ---
 
@@ -339,6 +411,14 @@ python3 $SEO/seostate.py propose \
   --spec '{"angle":"...","outline":["..."],"internal_links":["..."]}'
 
 python3 $SEO/seostate.py update <id> --status approved
+
+# and EVERY survivor the gate withheld - one row each, with its class:
+python3 $SEO/seostate.py defer --keyword "browser vr games" --class catalogue \
+  --authority-count 5 --page1 heyvr.io,vrwebgames.com,viverse.com,itch.io \
+  --engine "Google via serper, US exit" --note "a 'games' query; we are one game"
+python3 $SEO/seostate.py defer --keyword "counter strike vr team beef" --class brand_navigational \
+  --fold-into <id of the page that credits them> --authority-count 3
+python3 $SEO/seostate.py defer --keyword "<kw>" --class authority --authority-count 5 --page1 ...
 ```
 
 Follow the queue policies (guides build-first, tools approve-first behind the
@@ -361,7 +441,7 @@ day setup ran, not a policy. The build-tool workflow scaffolds the tools home
 inside its first PR. Queue the ideas; note in the report that the first build
 will create the tools section.
 
-**Success criteria**: Every queued idea carries volume/KD where measured, the authority count, its intent class, and a rationale OPENING with the remit verdict. Tool ideas carry a conversion rationale and an `archetype`. A site with no tools page yet still gets tool ideas queued.
+**Success criteria**: Every queued idea carries volume/KD where measured, the authority count, its intent class, and a rationale OPENING with the remit verdict. Tool ideas carry a conversion rationale and an `archetype`. A site with no tools page yet still gets tool ideas queued. **Every survivor that was NOT queued is on the deferred list with a class** — `seostate.py deferred` after the run shows one row per withheld keyword, and `catalogue` rows have filed their prospects.
 
 ---
 
@@ -598,6 +678,13 @@ Then two markdown tables:
 
 **(a) Keyword opportunities** — keyword, volume, KD, **authority count**, intent,
 type, angle.
+
+**(a2) Withheld this run** — keyword, authority count, **class**, **action taken /
+revisit condition**. One row per `defer` call. This table may not contain the
+bare word "rejected": `authority` rows say the DR they re-open at, `catalogue`
+rows name the prospects they filed, `brand_navigational` rows name the page they
+folded into. A reader who disagrees with a class can argue with it; nobody can
+argue with "rejected — X owns it", which is what this table replaced.
 
 **(b) Recommended tools / interactive pages** — idea, target keyword, why it
 converts, status. **Table (b) is never empty-by-omission**: list the tool

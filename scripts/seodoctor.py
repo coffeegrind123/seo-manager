@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -74,6 +75,74 @@ def _pids_matching(needle: str, exclude_children: bool = True) -> list[int]:
 # ------------------------------------------------------------------ the daemon
 
 
+XVFB_DISPLAY = os.environ.get("SEO_XVFB_DISPLAY", ":99")
+
+
+def _x_socket(display: str) -> str:
+    return f"/tmp/.X11-unix/X{display.lstrip(':').split('.')[0]}"
+
+
+def display_state(display: str) -> str:
+    """What is actually behind $DISPLAY. Three distinguishable answers:
+    `up` (an X server process holds the socket), `stale` (the socket file is
+    there but no server is - the shape a dead Xvfb leaves behind, and the one
+    that presented as "chrome did not bind CDP" on 2026-09-14 until someone
+    looked), `absent` (no socket at all)."""
+    sock = _x_socket(display)
+    served = any(f" {display}" in _cmdline(pid) or _cmdline(pid).endswith(display)
+                 for pid in _pids_matching("Xvfb"))
+    if served:
+        return "up"
+    return "stale" if os.path.exists(sock) else "absent"
+
+
+def ensure_display(repair: bool = True) -> dict:
+    """serpd runs HEADED chrome on purpose (a Turnstile challenge cannot be
+    answered headless), so it needs an X server. The failure mode when there is
+    none is indirect - chrome logs "Missing X server or $DISPLAY" and exits, and
+    serpd reports "chrome did not bind CDP port ... within 60s", which reads as a
+    chrome problem. Check the display FIRST, and if the machine has Xvfb, bring
+    it back rather than reporting it."""
+    display = os.environ.get("DISPLAY") or XVFB_DISPLAY
+    state = display_state(display)
+    rep = {"display": display, "state": state, "repaired": False}
+    if state == "up":
+        os.environ["DISPLAY"] = display
+        return rep
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        rep["detail"] = "no X server and no Xvfb binary - serpd cannot run headed chrome here"
+        return rep
+    if not repair:
+        rep["detail"] = f"display {display} is {state}; run without --check to start Xvfb"
+        return rep
+    sock = _x_socket(display)
+    if state == "stale":
+        try:
+            os.unlink(sock)     # Xvfb refuses to start over a stale socket
+        except OSError:
+            pass
+    try:
+        subprocess.Popen([xvfb, display, "-screen", "0", "1280x1024x24", "-nolisten", "tcp"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        rep["detail"] = f"Xvfb failed to launch: {exc}"
+        return rep
+    for _ in range(20):
+        if display_state(display) == "up":
+            break
+        time.sleep(0.25)
+    rep["state"] = display_state(display)
+    rep["repaired"] = rep["state"] == "up"
+    if rep["repaired"]:
+        os.environ["DISPLAY"] = display      # the serpd we spawn inherits it
+        rep["detail"] = f"started Xvfb on {display} (was {state})"
+    else:
+        rep["detail"] = f"Xvfb did not come up on {display}"
+    return rep
+
+
 def serpd_health() -> dict | None:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{API_PORT}/health", timeout=4) as r:
@@ -93,6 +162,11 @@ def serpd_usable() -> tuple[bool, str]:
         return False, "server is up but its chrome is dead - every query would fail"
     if not (h.get("tabs") or h.get("tab_pool")):
         return False, "server has no tab pool"
+    if h.get("throttled"):
+        # Structurally fine, semantically useless: Google served /sorry within
+        # the last 15 min. Usable is still True (ddg/serper stay reachable
+        # through serp.py's default failover), but say it out loud.
+        return True, f"healthy but GOOGLE-THROTTLED {h.get('rate_limited_ago_s')}s ago - serp.py fails over to serper/ddg by default; --hard restarts on a fresh proxy session"
     return True, "healthy"
 
 
@@ -273,6 +347,29 @@ def run_control() -> dict:
             _pids_matching("zzq-no-such-process-9f2b") == [],
             "if this is non-empty the needle is matching everything")
     c.check("a_missing_pid_reads_empty_rather_than_raising", _cmdline(999999) == "")
+    # display_state must tell a stale socket from no socket from a live server.
+    # Expected values derived from the definition (socket file present/absent,
+    # Xvfb process present/absent), on a display number nothing uses.
+    probe = ":1337"
+    sock = _x_socket(probe)
+    had = os.path.exists(sock)
+    try:
+        if had:
+            raise RuntimeError("probe display in use")
+        c.check("no_socket_reads_absent", display_state(probe) == "absent")
+        open(sock, "w").close()
+        c.check("a_socket_with_no_server_reads_stale", display_state(probe) == "stale",
+                "a dead Xvfb leaves exactly this and it must not read as 'up'")
+    except Exception as exc:  # noqa: BLE001
+        c.check("display_probe_ran", False, str(exc))
+    finally:
+        if not had:
+            try:
+                os.unlink(sock)
+            except OSError:
+                pass
+    c.check("socket_path_is_derived_from_the_display_number", _x_socket(":99") == "/tmp/.X11-unix/X99"
+            and _x_socket(":99.0") == "/tmp/.X11-unix/X99")
 
     # SEMANTIC health. Each of these shapes has to produce a distinct verdict,
     # or "up" silently absorbs "up but useless".
@@ -324,13 +421,24 @@ def main() -> int:
         "deps": check_deps(),
         "project": check_project(Path(a.root).resolve()),
         "providers": check_providers(live=a.providers),
-        "serpd": ensure_serpd(hard=a.hard, repair=not a.check),
     }
+    # Order matters: the display is a PRECONDITION of the daemon. Repairing it
+    # after ensure_serpd() would leave a freshly-failed daemon behind.
+    report["display"] = ensure_display(repair=not a.check)
+    # A daemon Google throttled is not fixed by waiting; a restart mints a new
+    # proxy session (serpd.resolve_proxy_url), so a throttled daemon is treated
+    # as --hard unless the caller asked for report-only.
+    throttled = bool((serpd_health() or {}).get("throttled"))
+    report["serpd"] = ensure_serpd(hard=a.hard or (throttled and not a.check), repair=not a.check)
+    if throttled:
+        report["serpd"]["was_throttled"] = True
     hard_fail = []
     if not report["deps"].get("websockets"):
         hard_fail.append("websockets missing - serpd cannot run (pip install websockets)")
     if not report["deps"].get("chrome"):
         hard_fail.append("no chrome binary - serpd and the browser provider cannot run")
+    if report["display"]["state"] != "up":
+        hard_fail.append(f"no X display for headed chrome: {report['display'].get('detail')}")
     if report["serpd"]["state"] in ("repair_failed", "unhealthy"):
         hard_fail.append(f"serpd not usable: {report['serpd'].get('detail')}")
 
@@ -340,8 +448,8 @@ def main() -> int:
     # browser handoff still work, and the quality bar now forbids stopping a run
     # early. Say so explicitly so nobody reads a red preflight as permission.
     report["note"] = ("preflight clean" if not hard_fail else
-                      "serpd unavailable - fall back to `serp.py --provider ddg` and the "
-                      "`--provider browser` handoff. This is NOT grounds to end a run short.")
+                      "serpd unavailable - serp.py fails over to serper/serpapi/ddg by default, and "
+                      "the `--provider browser` handoff still works. This is NOT grounds to end a run short.")
     print(json.dumps(report, indent=2))
     return 0 if report["ok"] else 1
 

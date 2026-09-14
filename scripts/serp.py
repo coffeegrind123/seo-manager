@@ -869,15 +869,41 @@ BROWSER_EXTRACT = r"""(function(){
           // view count into a page-1 'domain'.
           if(/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(ct) && !/google\./.test(ct)) u='https://'+ct+'/';
         }
+        // Video / discussion blocks (measured 2026-09-14) put "9.4K+ views ·
+        // 8 months ago" in <cite> and carry the SOURCE as a text label two
+        // lines under the title: "YouTube · LunchAndVR", "Reddit · r/OculusQuest",
+        // "SideQuest", "AllKeyShop.com". Without this, every such result reported
+        // google.com and the authority ceiling counted the wrapper 4-7 times.
+        if(/google\./.test(new URL(u,location.href).hostname) && cbox){
+          var brands={youtube:'youtube.com',reddit:'reddit.com',facebook:'facebook.com',tiktok:'tiktok.com',
+                      instagram:'instagram.com',x:'x.com',twitter:'x.com',quora:'quora.com',linkedin:'linkedin.com',
+                      'steam community':'steamcommunity.com',github:'github.com',sidequest:'sidequestvr.com',
+                      medium:'medium.com',pinterest:'pinterest.com',threads:'threads.net',bluesky:'bsky.app'};
+          var ls=(cbox.innerText||'').split('\n').map(function(x){return x.trim()}).filter(Boolean);
+          var lab='';
+          for(var j=1;j<Math.min(ls.length,4)&&!lab;j++){
+            var cand=ls[j].split(/\s[\u00b7\u203a\u00bb|]\s/)[0].trim();
+            if(!cand||/views|comments|ago|^\d/.test(cand)) continue;
+            var key=cand.toLowerCase();
+            if(brands[key]) lab=brands[key];
+            else if(/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(key) && !/google\./.test(key)) lab=key;
+          }
+          if(!lab){
+            var mh=(cbox.innerHTML||'').match(/\b(youtube\.com|reddit\.com|facebook\.com|tiktok\.com|instagram\.com)\b/);
+            if(mh) lab=mh[1];
+          }
+          if(lab) u='https://'+lab+'/';
+        }
       }
     }catch(e){}
+    var unresolved=/(^|\.)google\.[a-z.]+$/.test((function(){try{return new URL(u,location.href).hostname}catch(e){return ''}})());
     if(seen[u]) continue;
     if(/google\.[a-z.]+\/(search|preferences|advanced)/.test(u)) continue;
     seen[u]=1;
     var box=a.closest('div.g')||a.closest('div[data-hveid]')||a.parentElement;
     var snip='';
     if(box){ var lines=(box.innerText||'').split('\n'); lines.shift(); snip=lines.join(' ').slice(0,240); }
-    out.push({position:out.length+1,title:h.textContent.trim(),url:u,snippet:snip});
+    out.push({position:out.length+1,title:h.textContent.trim(),url:u,snippet:snip,unresolved_wrapper:unresolved||undefined});
   }
   var body=document.body.innerText;
   var q0=(new URLSearchParams(location.search).get('q')||'').toLowerCase();
@@ -987,7 +1013,7 @@ def score(results: list[dict], target_domain: str | None = None) -> dict:
     "random blog with a good domain". What it CAN do reliably is spot the
     weakness signals, which is the half that gets miscounted by eye.
     """
-    weak, authorityish, target_hit = [], [], None
+    weak, authorityish, target_hit, unresolved = [], [], None, []
     for i, r in enumerate(results, 1):
         r.setdefault("position", i)
         dom = registrable(host_of(r.get("url", "")))
@@ -1003,8 +1029,15 @@ def score(results: list[dict], target_domain: str | None = None) -> dict:
         year = YEAR_IN_TITLE.search(title)
         if year:
             r["title_year"] = int(year.group(1))
+        # A result whose real host could not be recovered from Google's redirect
+        # wrapper is UNKNOWN, and unknown is not "authority". Counting it there
+        # inflated the ceiling from 3 to 7 on a SERP that was 6/9 YouTube+Reddit.
+        if r.get("unresolved_wrapper") or dom in ("google.com", "google.co.uk"):
+            tags.append("unresolved-wrapper")
         r["signals"] = tags
-        if tags and "repo/package-host" not in tags:
+        if "unresolved-wrapper" in tags:
+            unresolved.append({"position": r["position"], "title": title[:60]})
+        elif tags and "repo/package-host" not in tags:
             weak.append({"position": r["position"], "domain": dom, "why": ",".join(tags)})
         elif not tags:
             authorityish.append({"position": r["position"], "domain": dom})
@@ -1021,13 +1054,16 @@ def score(results: list[dict], target_domain: str | None = None) -> dict:
         "authority_candidates": [a for a in authorityish if a["position"] <= 10],
         "authority_candidate_count": len([a for a in authorityish if a["position"] <= 10]),
         "distinct_domains_top10": len({r.get("domain") for r in top10}),
+        "unresolved_wrappers": [u for u in unresolved if u["position"] <= 10],
         "target_position": target_hit,
         "verdict_note": (
             "authority_candidate_count is a CEILING on the real authority count, not the count "
             "itself: it counts every page-1 domain that is not obviously a forum, video, repo or "
             "listicle. Read the titles and decide which are genuinely established authority for "
             "THIS query (recognised brands, the vendor's own domain, official docs). 4+ real ones "
-            "= DROP the candidate."
+            "= DEFER the candidate (class authority) - not reject; the count is DR-relative. "
+            "unresolved_wrappers are results whose host could not be recovered and are counted "
+            "NOWHERE - if the list is long, read the titles: they are usually video/forum."
         ),
     }
 
@@ -1111,7 +1147,15 @@ def main():
     p.add_argument("--gl", default="us", help="country (serpapi/brave) or location_code (dataforseo)")
     p.add_argument("--hl", default="en")
     p.add_argument("--target-domain", help="report this domain's position if present")
-    p.add_argument("--fallback", action="store_true", help="try other configured providers on failure")
+    # Failover is the DEFAULT. Until 2026-09-14 it was opt-in, while the quality
+    # bar promised "serp.py fails over across providers automatically" - so a
+    # Google-throttled daemon came back `rate-limited` with serper configured and
+    # idle, and the research run read it as a refused SERP. A keyless provider's
+    # throttle is exactly the case a keyed one is configured FOR.
+    p.add_argument("--fallback", dest="fallback", action="store_true", default=True,
+                   help="(default) on failure try the other configured providers, real-Google first")
+    p.add_argument("--no-fallback", dest="fallback", action="store_false",
+                   help="pin the named provider; a failure is reported, not routed around")
     p.add_argument("--proxy-country", metavar="CC",
                    help=f"pin the residential exit country. Verified pool: {' '.join(EU_COUNTRIES)}")
     p.add_argument("--no-proxy", action="store_true", help="ignore SEO_PROXY_URL for this call")

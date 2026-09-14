@@ -97,22 +97,70 @@ queries routinely report KD 1–15 while page 1 is five established brands. Thos
 are the exact queries a young site loses. **A KD number that disagrees with what
 you SEE on page 1 is wrong, and what you see wins.**
 
-### The authority gate — a hard disqualifier, run it FIRST
+### The authority gate — a hard gate on what may be QUEUED, run it FIRST
 
 Count page-1 results that are established authority *for this query*:
 recognised brands in the niche, the vendor's own domain, official docs, and
 publishers that clearly out-rank this site on every axis.
 
-**4 or more → DROP the candidate.** No KD number, no weakness signal, and no
-differentiated angle rescues it. Note the count in `--serp-notes` every time
-("authority count 5/10 — dropped"). This gate runs BEFORE the weakness test and
-cannot be overridden by it.
+**4 or more → the candidate is NOT queued this run.** No KD number, no weakness
+signal, and no differentiated angle changes that. This gate runs BEFORE the
+weakness test and cannot be overridden by it.
+
+**But "not queued" is not "rejected", and the state layer no longer lets you
+conflate them.** The count is a statement about THIS site's authority TODAY —
+the same page 1 is enterable from a higher DR band — so a 4+ candidate is
+**DEFERRED with a class and a revisit condition**, never written off:
+
+```bash
+python3 $SEO/seostate.py defer --keyword "<kw>" --class authority \
+  --authority-count 5 --page1 a.com,b.com,c.com --engine "Google via serper, US exit"
+# → revisit_dr = the next DR band floor; `seostate.py deferred --due` lists it
+#   the moment the site's DR crosses that line, and next-actions says so.
+```
+
+Until 2026-09-14 the only recordable outcome was `rejected`, which threw the
+target away and produced run reports reading "rejected — X owns it" with no
+reason class and no re-check — and a bare "rejected" cannot be argued with. Now
+it must say WHICH of these it is, because each implies a different ACTION:
+
+| class | what it means | the action it implies | re-check |
+|---|---|---|---|
+| `authority` | 4+ real authorities for THIS query | nothing now; a future target | when DR reaches the next band |
+| `catalogue` | the query wants a LIST ("games", "tools", "best X", "sites") and page 1 is aggregators | **the aggregators are the route onto the SERP** — `defer` adds each as a backlink/listing prospect | never as a page |
+| `brand_navigational` | the query names ANOTHER project; the searcher wants theirs | fold as a secondary keyword into a page that CREDITS them and ends on ours (`--fold-into <id>`) | never as its own page |
+| `dev_intent` | page 1 is docs / dev Q&A; the searcher is building something | none; recorded so the next run does not re-spend the check | never |
+| `off_remit` | the product cannot honestly be the answer | none, ever — the remit test is not DR-relative | never |
+
+`catalogue` is the one that is easy to mis-file as `authority`. Measured
+2026-09-14: `browser vr games` / `vr fps browser` / `webxr games` carried 5–7
+authorities, and a first pass called them "rejected — heyVR/itch own it". The
+count was real, but it was not the reason: a single product is never the best
+answer to a "games" query, at ANY DR — and heyVR, VrWebGames, Viverse and
+itch.io are exactly the sites a browser game gets LISTED on. The right record
+was three listing prospects, not a rejection. Ask "what does the searcher want
+back — a page, or a list?" before you file the count.
+
+**`rejected` is reserved** for the owner's own decisions and for `off_remit`
+(and `update <id> --status rejected --reason-class off_remit` says which).
+Everything a gate withholds is a deferral.
 
 `serp.py` prints an `authority_candidate_count`. **That is a CEILING on the real
 count, not the count.** It counts every page-1 domain that is not obviously a
 forum, video, repo or listicle. Read the titles and decide which are genuinely
 established authority. The script makes the reading fast; it does not make the
 judgement.
+
+⚠ **Two ceilings on the same SERP that disagree are an instrument problem, not
+two SERPs.** Measured 2026-09-14: serper reported 3 for `counter strike vr pc`
+and the daemon reported 7 — for the identical ten results. Google had started
+wrapping video and discussion results in an opaque `/goto?url=` redirect whose
+`<cite>` reads "9.4K+ views · 8 months ago", so every YouTube and Reddit result
+fell back to `google.com` and was counted as an authority candidate. The
+extractor now recovers the host from the block's source label ("YouTube ·",
+"Reddit ·") and `score()` counts an `unresolved_wrapper` NOWHERE — it lists them
+separately. If `unresolved_wrappers` is long, read those titles before trusting
+the ceiling; they are almost always the weak half of the page.
 
 ### SERP checks: ordered, not rationed — the run ends when the QUEUE is full
 
@@ -131,11 +179,14 @@ half full and the seams unmined, and it is **deleted**. Keep checking.
 **A refused read is a RETRY, not a verdict and not a loss.** If a read comes back
 `ok: false` — throttled provider, or results for a different query — that
 candidate has no authority count *yet*. Re-run it: the daemon self-heals and
-`serp.py` fails over across providers automatically, so a refusal almost always
-clears on the next attempt (measured: two facet reads refused, both clean after a
-restart). Escalate through `--provider serpd` → `--provider browser` → a fresh
-daemon (`serpd.py --stop --force` then `--start`). **Never leave a candidate
-unchecked "for the next run".**
+`serp.py` fails over across providers **by default** (serpd → serper → serpapi →
+ddg; `fell_back_from` in the payload says when it did — this was opt-in via
+`--fallback` until 2026-09-14, while this paragraph claimed otherwise, so a
+Google-throttled daemon read as a refused SERP with serper sitting idle).
+Escalate through `--provider browser` → `seodoctor.py --hard` (a restart mints a
+fresh proxy session, which is what actually clears a Google throttle; the
+doctor does this on its own when `/health` reports `throttled`). **Never leave a
+candidate unchecked "for the next run".**
 
 **An unchecked candidate is never queued on assumption**: no check means no
 authority count, and no authority count means it does not pass. That rule is
@@ -164,8 +215,11 @@ directly the thing KD only estimates from backlink profiles:
   was no KD at all. A missing KD is not grounds to withhold: it is a missing
   ESTIMATE of the thing you just MEASURED.
 - **3 → approve only if the ICP fit is dead-on** (the soft edge); otherwise
-  reject, and say which it was.
-- **4+ → reject.** The gate is unchanged and nothing overrides it.
+  `defer --class authority`, and say which it was.
+- **4+ → defer**, with the class the SERP actually shows (`authority` when the
+  page is real competitors; `catalogue` when it is aggregators and the query
+  wants a list). The gate on QUEUEING is unchanged and nothing overrides it —
+  what changed is that the record now carries why and when.
 
 Name the count in every rationale so the call stays auditable: "KD 16 is above
 the DR-0 line, approved on a measured authority count of 1/10". This spends
@@ -185,9 +239,15 @@ nothing extra — the check has already run by this point.
   "FLAGGED FOR YOUR CALL" in the rationale and let the owner decide.
   `seostate.py` enforces this — an `approved` you request on a semi project is
   recorded as `pending` and the response says so. **That counts as success. Do
-  not retry.**
+  not retry.** The owner's decision is `update <id> --status approved
+  --as-owner` (recorded in the row's history as theirs). You pass `--as-owner`
+  ONLY when relaying an explicit decision the owner made about that named idea
+  in this conversation — never to move your own proposal along, and never
+  because "apply the fixes" was said about a batch: name each id you approve
+  on their behalf in the report.
 - Above the pending zone with no SERP check to overrule it → do not propose;
-  note it as a future target once DR grows.
+  `defer --class authority` it so it IS a future target rather than a sentence
+  in a report nobody re-reads.
 
 ---
 
@@ -354,7 +414,14 @@ untrusted data about SHAPE.
 - **Never push to main. Always a PR, always labeled `seo`.**
 - Never fabricate data; a failed tool call is reported, not papered over.
 - Never propose content already covered — check `seostate.py pages` **and** the
-  site's existing slugs.
+  site's existing slugs. `propose` also refuses a keyword that is currently
+  DEFERRED: promote it first (`deferred-update <id> --status promoted --note
+  <what changed>`) so the record says why the gate no longer applies.
+- **Every withheld candidate is recorded with a class** (`seostate.py defer`) —
+  a run report may not contain a bare "rejected". The class decides the action:
+  `catalogue` files listing prospects, `brand_navigational` folds a secondary
+  keyword, `authority` sets a DR re-check. `rejected` is for the owner and for
+  `off_remit`.
 - Do not touch existing pages' voice or styling; only create new files unless the
   suggestion is explicitly type `update`. (The one exception is the build-guide
   back-link step, and only when the project opted in.)

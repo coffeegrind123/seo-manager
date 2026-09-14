@@ -57,7 +57,12 @@ failure it covers presents as something else: a "throttled provider", an "empty
 page 1", a daemon that "won't start". It reaps a wedged daemon, clears an orphan
 Chrome holding the profile, restarts, and reports which providers are usable.
 `--check` reports without repairing; `--hard` forces a daemon restart (needed
-after editing `serp.py`, whose scoring `serpd` imports at startup).
+after editing `serp.py`, whose scoring `serpd` imports at startup). It also
+checks the **X display first** — serpd runs headed Chrome, and a dead Xvfb
+leaves a stale socket that presents downstream as "chrome did not bind CDP";
+the doctor restarts Xvfb — and restarts a daemon whose `/health` says
+`throttled` (Google `/sorry`), since a restart mints a fresh proxy session and
+waiting does not.
 
 **A red preflight is never permission to end a run short.** If `serpd` cannot be
 revived, `ddg` and the `--provider browser` handoff still work and the run
@@ -339,7 +344,16 @@ well as in the quality bar:
   the daemon (`seodoctor.py --hard`) and re-run again. Leaving a survivor unchecked
   is unfinished work, not a finding.
 - **The authority count on page 1 overrules KD**, always, in both directions. 4+
-  established authorities on page 1 = drop, whatever the difficulty score says.
+  established authorities on page 1 = not queued, whatever the difficulty score
+  says — **but not "rejected"**. The count is DR-relative, so a withheld
+  candidate is `seostate.py defer`red with a CLASS and a revisit condition:
+  `authority` re-opens at the next DR band, `catalogue` (a "games"/"tools"/list
+  query where page 1 is aggregators) files those aggregators as listing
+  prospects instead of fighting them, `brand_navigational` folds into a page
+  that credits the other project. A run report may not contain a bare
+  "rejected — X owns it": that sentence cannot be argued with, and on
+  2026-09-14 it was hiding three listing prospects and a future target.
+  `rejected` is for the owner's own calls and for `off_remit`.
 - **The remit test runs first and costs nothing.** If the product cannot honestly
   be the ANSWER to the query, the keyword is out — however good its numbers, and
   however perfectly your audience overlaps.

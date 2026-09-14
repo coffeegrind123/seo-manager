@@ -67,6 +67,7 @@ import signal
 import subprocess
 import sys
 import threading
+import uuid
 import time
 import urllib.error
 import urllib.parse
@@ -96,6 +97,11 @@ TAB_POOL = int(os.environ.get("SERPD_TABS", "3"))
 
 CDP_PORT: int | None = None
 STARTED_AT = time.time()
+RATE_LIMITED_AT: float | None = None   # last Google /sorry seen by serp_one
+BATCH_SPOOL_DIR = Path(os.environ.get("SERPD_BATCH_SPOOL", "/tmp/seo-serpd-batches"))
+_BATCHES: dict[str, dict] = {}
+_BATCH_LOCK = threading.Lock()
+
 
 
 def log(msg: str):
@@ -755,6 +761,8 @@ def serp_one(tab: Tab, query: str, depth: int, target: str | None,
                 time.sleep(6 * (attempt + 1))
                 navigate(tab, url)
                 continue
+            global RATE_LIMITED_AT
+            RATE_LIMITED_AT = time.time()
             return {"ok": False, "query": query, "error": "rate-limited",
                     "readiness": verdict, "retryable": True,
                     "hint": "Google rate-limited this IP after a burst. Lower SERPD_TABS, "
@@ -888,10 +896,40 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             with _REG_LOCK:
                 tabs = sorted(_TABS)
+            # A daemon Google has throttled is "up" by every structural measure
+            # and useless by the only one that matters. Report the last /sorry so
+            # the preflight can say "healthy but throttled - failover engaged"
+            # instead of "healthy". Cleared by --hard (a restart mints a fresh
+            # proxy session, which is what actually clears the throttle).
+            throttled_s = (round(time.time() - RATE_LIMITED_AT) if RATE_LIMITED_AT else None)
             self._send({"ok": True, "cdpPort": CDP_PORT, "apiPort": API_PORT,
                         "uptime_s": round(time.time() - STARTED_AT, 1),
                         "tabs": tabs, "tab_pool": TAB_POOL, "profile": PROFILE,
-                        "chrome_alive": _cdp_alive(CDP_PORT) if CDP_PORT else False})
+                        "chrome_alive": _cdp_alive(CDP_PORT) if CDP_PORT else False,
+                        "rate_limited_ago_s": throttled_s,
+                        "throttled": bool(throttled_s is not None and throttled_s < 900)})
+            return
+
+        if parsed.path == "/batch":
+            bid = one("id")
+            if not bid:
+                with _BATCH_LOCK:
+                    jobs = {k: {**v, "done": bool(v.get("done"))} for k, v in _BATCHES.items()}
+                self._send({"ok": True, "batches": jobs,
+                            "note": "GET /batch?id=<id> returns a finished batch even if the POST's client timed out"})
+                return
+            spool = BATCH_SPOOL_DIR / f"{bid}.json"
+            if spool.exists():
+                self._send(json.loads(spool.read_text(encoding="utf-8")))
+                return
+            with _BATCH_LOCK:
+                job = _BATCHES.get(bid)
+            if job:
+                self._send({"ok": False, "pending": True, "id": bid,
+                            "running_s": round(time.time() - job["started"]),
+                            "requested": job["n"]}, 202)
+                return
+            self._send({"ok": False, "error": f"no batch {bid!r} (spool {spool} absent)"}, 404)
             return
 
         if parsed.path == "/serp":
@@ -954,16 +992,37 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(queries, list) or not queries:
                 self._send({"ok": False, "error": "body needs a non-empty 'queries' list"}, 400)
                 return
+            # A batch under a Google throttle takes minutes (each query backs off
+            # up to 4x before giving up), and a client that times out drops the
+            # whole response - measured 2026-09-14: 24 reads completed server-side
+            # and were lost to a BrokenPipe. Spool every batch to disk under an
+            # id and hand the id back; GET /batch?id= returns it afterwards.
+            bid = re.sub(r"[^A-Za-z0-9_-]", "", str(body.get("id") or ""))[:40] or uuid.uuid4().hex[:12]
+            spool = BATCH_SPOOL_DIR / f"{bid}.json"
+            with _BATCH_LOCK:
+                _BATCHES[bid] = {"started": time.time(), "n": len(queries), "spool": str(spool)}
             results = serp_batch(queries, int(body.get("depth", 20)), body.get("target"),
                                  body.get("gl", "us"), body.get("hl", "en"))
             ok = sum(1 for r in results if r.get("ok"))
             view = body.get("view", "verdict")   # batch defaults to compact
             payload = results if view == "full" else [to_verdict(r) for r in results]
-            self._send({"ok": ok == len(results), "requested": len(queries),
-                        "succeeded": ok, "failed": len(results) - ok,
-                        "view": view, "results": payload,
-                        "note": ("compact verdicts - pass \"view\":\"full\" for titles, "
-                                 "URLs and snippets" if view != "full" else None)})
+            reply = {"ok": ok == len(results), "id": bid, "spool": str(spool),
+                     "requested": len(queries),
+                     "succeeded": ok, "failed": len(results) - ok,
+                     "throttled": any(r.get("error") == "rate-limited" for r in results),
+                     "view": view, "results": payload,
+                     "note": ("compact verdicts - pass \"view\":\"full\" for titles, "
+                              "URLs and snippets" if view != "full" else None)}
+            try:
+                BATCH_SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+                tmp = spool.with_suffix(".tmp")
+                tmp.write_text(json.dumps(reply), encoding="utf-8")
+                tmp.replace(spool)
+            except OSError as exc:
+                reply["spool_error"] = str(exc)
+            with _BATCH_LOCK:
+                _BATCHES[bid]["done"] = time.time()
+            self._send(reply)
             return
 
         self._send({"ok": False, "error": f"unknown path {parsed.path}"}, 404)

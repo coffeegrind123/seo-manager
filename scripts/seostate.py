@@ -36,6 +36,50 @@ from pathlib import Path
 
 SUGGESTION_STATUSES = ("pending", "approved", "rejected", "in_progress", "done")
 SUGGESTION_TYPES = ("guide", "tool", "update", "backlink")
+# A candidate the quality bar WITHHOLDS is not the same thing as one it REJECTS,
+# and until 2026-09-14 the state layer could only record the second. The
+# authority gate is DR-relative - "4+ established authorities on page 1" is a
+# statement about THIS site's authority today, not about the keyword - so a run
+# that wrote "rejected" threw away a target that a later DR band could win, and
+# a run report that printed a bare "rejected" could not be argued with because it
+# never said WHY. Every withheld candidate now carries a class, the action the
+# class implies, and the condition under which it is re-checked.
+DEFER_CLASSES = ("authority", "catalogue", "brand_navigational", "dev_intent", "off_remit")
+DEFER_CLASS_DOC = {
+    "authority": {
+        "means": "page 1 holds 4+ established authorities for THIS query and the site's DR "
+                 "cannot enter it today",
+        "action": "re-check page 1 when the site reaches the next DR band; until then it is "
+                  "a future target, not a dead one",
+        "revisit": "dr",
+    },
+    "catalogue": {
+        "means": "the query wants a LIST (\"games\", \"tools\", \"best X\", \"sites\") and "
+                 "page 1 is aggregators/directories; a single product cannot be the best "
+                 "answer however weak the SERP",
+        "action": "the page-1 aggregators are the route ONTO this SERP - each becomes a "
+                  "backlink/listing prospect; never a page targeting the query",
+        "revisit": "prospects",
+    },
+    "brand_navigational": {
+        "means": "the query names ANOTHER project or product; the searcher wants theirs",
+        "action": "fold as a secondary keyword into a page that credits them and ends on "
+                  "ours; never a page pretending to be theirs",
+        "revisit": "fold",
+    },
+    "dev_intent": {
+        "means": "page 1 is docs, dev forums, framework Q&A - the searcher is building "
+                 "something, not looking for the product",
+        "action": "none as a page; note it so the next run does not re-spend a check",
+        "revisit": "never",
+    },
+    "off_remit": {
+        "means": "the product cannot honestly be the answer to this query at all",
+        "action": "none - and never re-propose; the remit test is not DR-relative",
+        "revisit": "never",
+    },
+}
+DEFERRED_STATUSES = ("open", "promoted", "dropped")
 SUGGESTION_SOURCES = ("research", "manual", "trend-scan", "geo-scan", "backstop")
 TREND_STATUSES = ("new", "expanding", "expanded", "dismissed")
 PROSPECT_STATUSES = ("new", "contacted", "acquired", "rejected")
@@ -147,6 +191,7 @@ class Store:
         "pages": ("pages.json", list),
         "trends": ("trends.json", list),
         "backlinks": ("backlinks.json", list),
+        "deferred": ("deferred.json", list),
         "profile": ("profile.json", dict),
     }
     STREAMS = {"ranks": "ranks.jsonl", "ai": "ai.jsonl", "runs": "runs.jsonl"}
@@ -322,6 +367,28 @@ def run_control() -> dict:
             slugify("How To Aim: The Basics!"))
     c.check("slugify_does_not_collapse_distinct_titles",
             slugify("map callouts") != slugify("map tactics"))
+
+    # Deferred targets. Expected values derived from the quality bar's band table
+    # (<10, 10-19, 20-34, 35+), NOT copied from next_band_dr's body.
+    c.check("dr_2_next_band_is_10", next_band_dr(2) == 10)
+    c.check("dr_none_is_treated_as_0", next_band_dr(None) == 10)
+    c.check("dr_10_next_band_is_20", next_band_dr(10) == 20)
+    c.check("dr_34_next_band_is_35", next_band_dr(34) == 35)
+    c.check("dr_35_has_no_band_above", next_band_dr(35) is None)
+    c.check("a_dr_deferral_is_not_due_below_threshold",
+            not deferred_due({"status": "open", "revisit_dr": 10}, 9, "2026-01-01"))
+    c.check("a_dr_deferral_is_due_at_threshold",
+            deferred_due({"status": "open", "revisit_dr": 10}, 10, "2026-01-01"))
+    c.check("a_date_deferral_is_due_on_the_day",
+            deferred_due({"status": "open", "revisit_after": "2026-01-01"}, 0, "2026-01-01")
+            and not deferred_due({"status": "open", "revisit_after": "2026-01-02"}, 0, "2026-01-01"))
+    c.check("a_promoted_row_is_never_due",
+            not deferred_due({"status": "promoted", "revisit_dr": 0}, 99, "2099-01-01"))
+    c.check("a_never_class_has_no_condition_and_is_never_due",
+            not deferred_due({"status": "open"}, 99, "2099-01-01"))
+    c.check("every_class_documents_its_action", all(
+        set(DEFER_CLASS_DOC[k]) >= {"means", "action", "revisit"} for k in DEFER_CLASSES)
+        and set(DEFER_CLASS_DOC) == set(DEFER_CLASSES))
     return c.verdict(note="the resolver and ordering are proven; project STATE is a "
                           "separate question - `seostate.py overview` reads it")
 
@@ -355,7 +422,7 @@ def cmd_init(store: Store, a):
     if not cfg["name"] or not cfg["domain"]:
         die("init needs --name and --domain")
     store.save("config", cfg)
-    for name in ("queue", "keywords", "pages", "trends", "backlinks", "profile"):
+    for name in ("queue", "keywords", "pages", "trends", "backlinks", "deferred", "profile"):
         if not store.path(name).exists():
             store.save(name, store.FILES[name][1]())
     gitignore = store.dir / ".gitignore"
@@ -416,6 +483,24 @@ def cmd_propose(store: Store, a):
                 }
             )
             return
+        held = next((d for d in store.load("deferred")
+                     if (d.get("keyword") or "").lower() == kw and d.get("status") == "open"), None)
+        if held and not a.allow_duplicate:
+            # A deferred target is a decision with a reason attached. Proposing
+            # it again silently would discard that reason; promote it instead so
+            # the record says WHY the gate no longer applies.
+            out(
+                {
+                    "ok": False,
+                    "deferred": True,
+                    "message": f"'{kw}' is deferred ({held['reason_class']}) as {held['id']}: "
+                    f"{held.get('revisit_text')}. Promote it first "
+                    f"(`deferred-update {held['id']} --status promoted --note <why the gate no "
+                    "longer applies>`), or pass --allow-duplicate.",
+                    "existing": held,
+                }
+            )
+            return
     row = {
         "id": new_id(),
         "type": a.type,
@@ -455,16 +540,24 @@ def cmd_update_suggestion(store: Store, a):
     coerced = False
     note = a.note or ""
 
-    if requested == "approved" and row.get("type") == "tool" and not cfg.get("auto_approve_tools", False):
+    # The three coercions below exist so an AGENT cannot green-light its own
+    # idea. They used to fire for every caller, which left the owner of a semi
+    # project with no CLI path to approve anything - the gate had no key.
+    # `--as-owner` is that key: it records the approval as the owner's in the
+    # row's history, and the agent is told never to pass it on its own behalf.
+    owner = bool(getattr(a, "as_owner", False))
+    if owner:
+        note = (note + " | approved by the owner (--as-owner)").strip(" |")
+    if requested == "approved" and not owner and row.get("type") == "tool" and not cfg.get("auto_approve_tools", False):
         if row.get("source") != "manual":
             requested = "pending"
             coerced = True
             note = (note + " | tool approvals are gated on this project - recorded as pending for the owner").strip(" |")
-    if requested == "approved" and cfg.get("mode") == "semi" and row.get("source") in ("research", "trend-scan", "geo-scan", "backstop"):
+    if requested == "approved" and not owner and cfg.get("mode") == "semi" and row.get("source") in ("research", "trend-scan", "geo-scan", "backstop"):
         requested = "pending"
         coerced = True
         note = (note + " | semi mode: agent approvals are recorded as pending for the owner").strip(" |")
-    if requested == "approved" and row.get("source") == "trend-scan":
+    if requested == "approved" and not owner and row.get("source") == "trend-scan":
         requested = "pending"
         coerced = True
         note = (note + " | trend takes are always the owner's call").strip(" |")
@@ -484,6 +577,8 @@ def cmd_update_suggestion(store: Store, a):
         row["authority_count"] = a.authority_count
     if a.spec:
         row["spec"] = {**(row.get("spec") or {}), **(parse_json_arg(a.spec, "spec") or {})}
+    if getattr(a, "reason_class", None):
+        row["reason_class"] = a.reason_class
     row.setdefault("history", []).append({"at": now(), "status": requested, "note": note or None})
     store.save("queue", rows)
     out(
@@ -784,6 +879,181 @@ def cmd_record_scan(store: Store, a):
     out({"ok": True, "last_trend_scan_at": cfg["last_trend_scan_at"]})
 
 
+# -- deferred targets ---------------------------------------------------------
+
+
+def next_band_dr(dr) -> int | None:
+    """The DR at which the KD zones and volume band next widen - i.e. the first
+    point at which re-reading a page 1 that was too strong is worth a check.
+    None at the top band: there the revisit is a calendar, not a threshold."""
+    d = dr or 0
+    if d >= 35:
+        return None
+    if d >= 20:
+        return 35
+    if d >= 10:
+        return 20
+    return 10
+
+
+def deferred_due(row: dict, dr, today: str) -> bool:
+    if row.get("status") != "open":
+        return False
+    rdr = row.get("revisit_dr")
+    if rdr is not None and (dr or 0) >= rdr:
+        return True
+    after = row.get("revisit_after")
+    if after and today >= after:
+        return True
+    return False
+
+
+def cmd_defer(store: Store, a):
+    cfg = store.config()
+    rows = store.load("deferred")
+    kw = a.keyword.strip().lower()
+    doc = DEFER_CLASS_DOC[a.reason_class]
+    existing = next((r for r in rows if r.get("keyword") == kw and r.get("status") == "open"), None)
+    if existing and not a.allow_duplicate:
+        out({"ok": True, "duplicate": True, "deferred": existing,
+             "message": f"'{kw}' is already deferred as {existing['id']} ({existing['reason_class']})."})
+        return
+    if a.reason_class == "catalogue" and not a.page1:
+        die("class 'catalogue' needs --page1 <domain,domain,...>: the aggregators on page 1 ARE the "
+            "action (they become listing prospects), so a catalogue deferral without them records nothing")
+    if a.reason_class == "brand_navigational" and not a.fold_into:
+        die("class 'brand_navigational' needs --fold-into <suggestion id>: the action is a secondary "
+            "keyword on a page that credits the other project, so name that page")
+
+    page1 = [d.strip().lower() for d in (a.page1 or "").split(",") if d.strip()]
+    revisit_dr = None
+    revisit_after = None
+    if a.revisit_dr is not None:
+        revisit_dr = a.revisit_dr
+    elif a.revisit_after:
+        revisit_after = a.revisit_after
+    elif doc["revisit"] == "dr":
+        revisit_dr = next_band_dr(cfg.get("dr"))
+        if revisit_dr is None:
+            # Top band: no threshold above us. Re-read quarterly - page 1 moves.
+            revisit_after = (datetime.now(timezone.utc) + timedelta(days=90)).strftime("%Y-%m-%d")
+
+    if revisit_dr is not None:
+        revisit_text = f"re-check page 1 when DR >= {revisit_dr} (DR {cfg.get('dr')} at deferral)"
+    elif revisit_after:
+        revisit_text = f"re-check page 1 on or after {revisit_after}"
+    elif doc["revisit"] == "prospects":
+        revisit_text = ("never as a page; the route is a listing on " + ", ".join(page1))
+    elif doc["revisit"] == "fold":
+        revisit_text = f"never as its own page; folded into suggestion {a.fold_into}"
+    else:
+        revisit_text = "never"
+
+    fold_target = None
+    if a.fold_into:
+        fold_target = find_row(store.load("queue"), a.fold_into)
+        if not fold_target:
+            die(f"--fold-into {a.fold_into!r} matches no suggestion")
+
+    row = {
+        "id": new_id(),
+        "keyword": kw,
+        "reason_class": a.reason_class,
+        "authority_count": a.authority_count,
+        "intent": a.intent,
+        "page1_domains": page1,
+        "note": a.note,
+        "engine": a.engine,
+        "fold_into": fold_target["id"] if fold_target else None,
+        "revisit_dr": revisit_dr,
+        "revisit_after": revisit_after,
+        "revisit_text": revisit_text,
+        "action": doc["action"],
+        "dr_at_deferral": cfg.get("dr"),
+        "status": "open",
+        "created_at": now(),
+        "history": [{"at": now(), "status": "open", "note": "deferred"}],
+    }
+    rows.append(row)
+    store.save("deferred", rows)
+
+    # The fold is recorded on BOTH sides, so the page's builder sees the
+    # secondary keyword without reading the deferred list.
+    if fold_target:
+        queue = store.load("queue")
+        tgt = find_row(queue, fold_target["id"])
+        spec = tgt.setdefault("spec", {}) if isinstance(tgt.get("spec"), dict) else {}
+        sec = spec.setdefault("secondary_keywords", [])
+        if kw not in [x.lower() for x in sec]:
+            sec.append(kw)
+        tgt["spec"] = spec
+        tgt.setdefault("history", []).append(
+            {"at": now(), "status": tgt.get("status"), "note": f"absorbed deferred '{kw}' ({a.reason_class}) as a secondary keyword"})
+        store.save("queue", queue)
+
+    prospects_added = []
+    if a.reason_class == "catalogue" and not a.no_prospects:
+        blist = store.load("backlinks")
+        for dom in page1:
+            if any(b["domain"] == dom for b in blist):
+                continue
+            prow = {
+                "id": new_id(),
+                "domain": dom,
+                "url": None,
+                "domain_rating": None,
+                "link_type": "unknown",
+                "reason": f"page-1 catalogue for '{kw}' - a listing there is the route onto that SERP",
+                "outreach_angle": "submit the product as a title/listing; these sites exist to list what we are",
+                "status": "new",
+                "source": "serp-catalogue",
+                "created_at": now(),
+            }
+            blist.append(prow)
+            prospects_added.append(prow["id"])
+        if prospects_added:
+            store.save("backlinks", blist)
+
+    out({"ok": True, "deferred": row, "prospects_added": prospects_added,
+         "folded_into": fold_target["id"] if fold_target else None})
+
+
+def cmd_deferred(store: Store, a):
+    cfg = store.config()
+    rows = store.load("deferred")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if a.status:
+        rows = [r for r in rows if r.get("status") in a.status]
+    if a.reason_class:
+        rows = [r for r in rows if r.get("reason_class") == a.reason_class]
+    for r in rows:
+        r["due"] = deferred_due(r, cfg.get("dr"), today)
+    if a.due:
+        rows = [r for r in rows if r["due"]]
+    by_class: dict[str, int] = {}
+    for r in rows:
+        by_class[r["reason_class"]] = by_class.get(r["reason_class"], 0) + 1
+    out({"ok": True, "count": len(rows), "dr": cfg.get("dr"), "by_class": by_class,
+         "classes": DEFER_CLASS_DOC, "deferred": rows})
+
+
+def cmd_deferred_update(store: Store, a):
+    rows = store.load("deferred")
+    row = find_row(rows, a.id)
+    if not row:
+        die(f"no deferred target matching {a.id!r}")
+    if a.status == "promoted" and not a.note:
+        die("promoting needs --note: say what changed (DR crossed, page 1 re-read and now N/10, "
+            "class was wrong) - a promotion without a reason is the gate being loosened quietly")
+    row["status"] = a.status
+    row["updated_at"] = now()
+    if a.note:
+        row["note"] = a.note
+    row.setdefault("history", []).append({"at": now(), "status": a.status, "note": a.note})
+    store.save("deferred", rows)
+    out({"ok": True, "deferred": row})
+
+
 # -- backlinks --------------------------------------------------------------
 
 
@@ -1022,6 +1292,9 @@ def cmd_overview(store: Store, a):
             }
         )
     settled = [p for p in page_rows if p["settled"]]
+    deferred = store.load("deferred")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    due = [r for r in deferred if deferred_due(r, cfg.get("dr"), today)]
     out(
         {
             "ok": True,
@@ -1045,6 +1318,12 @@ def cmd_overview(store: Store, a):
                 "tools_pending": len(bucket("tool", "pending")),
                 "in_progress": len([r for r in queue if r.get("status") == "in_progress"]),
                 "done": len([r for r in queue if r.get("status") == "done"]),
+            },
+            "deferred": {
+                "open": len([r for r in deferred if r.get("status") == "open"]),
+                "due": len(due),
+                "by_class": {c: len([r for r in deferred if r.get("status") == "open" and r.get("reason_class") == c])
+                             for c in DEFER_CLASSES if any(r.get("reason_class") == c for r in deferred)},
             },
             "tracked_keywords": len(keywords),
             "pages_total": len(page_rows),
@@ -1096,6 +1375,12 @@ def cmd_next_actions(store: Store, a):
     if ungoogled:
         actions.append({"priority": 5, "action": f"{len(ungoogled)} page(s) awaiting the Google "
                         "'Request indexing' click: scripts/indexnow.py google-steps"})
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    due = [r for r in store.load("deferred") if deferred_due(r, cfg.get("dr"), today)]
+    if due:
+        actions.append({"priority": 2, "action": f"{len(due)} deferred target(s) are due a re-read "
+                        f"(DR now {cfg.get('dr')}): `seostate.py deferred --due`, then serp.py each one "
+                        "and promote or re-defer on the measured count."})
     dr_age = days_since(cfg.get("dr_fetched_at"))
     if cfg.get("dr") is None or (dr_age or 99) > 7:
         actions.append({"priority": 5, "action": "Refresh the site's authority score: scripts/authority.py --domain <domain> --save"})
@@ -1176,6 +1461,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--archetype")
     s.add_argument("--authority-count", type=int)
     s.add_argument("--spec")
+    s.add_argument("--reason-class", choices=DEFER_CLASSES,
+                   help="on a rejection: WHY (a bare 'rejected' cannot be argued with)")
+    s.add_argument("--as-owner", action="store_true",
+                   help="the OWNER's approval: bypasses the semi/tool/trend coercions and is recorded as such. "
+                        "An agent passes this only when relaying the owner's explicit decision on a named idea")
     s.set_defaults(fn=cmd_update_suggestion)
 
     s = sub.add_parser("suggestions", help="list the queue in build order")
@@ -1253,6 +1543,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("record-scan", help="stamp the last trend scan time")
     s.set_defaults(fn=cmd_record_scan)
+
+    s = sub.add_parser("defer", help="record a candidate the quality bar WITHHELD, with why and when to re-check")
+    s.add_argument("--keyword", required=True)
+    s.add_argument("--class", dest="reason_class", required=True, choices=DEFER_CLASSES)
+    s.add_argument("--authority-count", type=int)
+    s.add_argument("--intent", choices=["commercial", "comparison", "informational", "transactional"])
+    s.add_argument("--page1", help="comma-separated page-1 domains; REQUIRED for class catalogue "
+                                   "(they become listing prospects)")
+    s.add_argument("--fold-into", help="suggestion id that absorbs this as a secondary keyword; "
+                                       "REQUIRED for class brand_navigational")
+    s.add_argument("--revisit-dr", type=int, help="override: re-check when DR reaches this")
+    s.add_argument("--revisit-after", help="override: re-check on/after YYYY-MM-DD")
+    s.add_argument("--engine", help="e.g. 'Google via serper, US exit' - a count without its engine is not a finding")
+    s.add_argument("--note")
+    s.add_argument("--no-prospects", action="store_true", help="catalogue: record without adding prospects")
+    s.add_argument("--allow-duplicate", action="store_true")
+    s.set_defaults(fn=cmd_defer)
+
+    s = sub.add_parser("deferred", help="list withheld targets; --due = those whose revisit condition is met")
+    s.add_argument("--status", nargs="*", choices=DEFERRED_STATUSES)
+    s.add_argument("--class", dest="reason_class", choices=DEFER_CLASSES)
+    s.add_argument("--due", action="store_true")
+    s.set_defaults(fn=cmd_deferred)
+
+    s = sub.add_parser("deferred-update", help="promote (needs --note) or drop a deferred target")
+    s.add_argument("id")
+    s.add_argument("--status", required=True, choices=DEFERRED_STATUSES)
+    s.add_argument("--note")
+    s.set_defaults(fn=cmd_deferred_update)
 
     s = sub.add_parser("prospect-add", help="add a backlink prospect")
     s.add_argument("--domain", required=True)
