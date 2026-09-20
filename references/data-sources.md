@@ -1017,6 +1017,29 @@ takes precedence — quicker than the console dance if a key already exists.
 
 ### ✅ CrUX field data arrives INSIDE the PSI response — the CrUX API is moot
 
+**Half-corrected 2026-09-20.** Moot for LCP/CLS/INP p75, still true. NOT moot
+for the four **LCP subparts** (time to first byte, resource load delay, load
+duration, element render delay — exposed since January 2025), which PSI's
+`loadingExperience` does not carry and `vitals.py origin --subparts` reads
+from `chromeuxreport.googleapis.com` directly. And the CrUX API's refusal of
+the service-account bearer was re-measured: it answers **HTTP 400 "Request
+contains an invalid argument"** on a correctly shaped request, while an
+unauthenticated call says *"Please use API Key"*. The 400 reads like a bad
+request; it is a missing `GOOGLE_API_KEY`, and the script says so.
+
+**Live with a key, 2026-09-20.** Enabling the API alone changes nothing — the
+console's "doesn't require that you create credentials" banner means no OAuth
+consent, not no key; the bearer still 400s after enabling. With the key:
+`web.dev` PHONE answers (control), `combatskirmish.net` has a **DESKTOP record
+only** (PHONE is `no_record` — too little mobile traffic, a fact about sample
+size), and its LCP p75 of 2,335 ms decomposes into TTFB 642 / load delay 545 /
+load duration 778 / render delay 303 — the image fetch, not the server, is the
+largest piece. ⚠ **A key restricted to CrUX blocks PSI** (403 *"Requests to
+this API pagespeedonline … are blocked"*), and `psi_token()` prefers the key,
+so a CrUX-only key would have silently taken PSI away from an install where the
+service-account path worked. `check_vitals` now falls back to the service
+account on that exact 403 and names the reason in `credential`.
+
 Confirmed live: `pagecheck.py vitals` returns `field_crux` with 75th-percentile
 **LCP, CLS and INP from real users**, plus a FAST/AVERAGE/SLOW category, out of
 PSI's `loadingExperience` block. So the separately-rejected CrUX API (which
@@ -1056,6 +1079,65 @@ SERP volume and geo-pinning** — and nothing else here. Do not spend a session
 re-testing these behind it.
 
 ---
+
+## The 2026-09-20 additions — three API maps, and the one already paid for
+
+Found by the third prior-art pass (`references/prior-art.md`), each probed
+live before a line was written.
+
+### ✅ SerpApi `engine=google_ai_mode` — a second answer surface on the EXISTING key
+
+Probed 2026-09-20 with `~/.serpapi_key`: HTTP 200, `search_metadata.status:
+Success`, and unlike the AI Overview it is **single-stage** — `text_blocks`,
+`references` and `reconstructed_markdown` arrive on the first response, no
+`page_token` to follow. One credit per ask, from the same 250/month pool.
+`geo.py` engine `google_ai_mode`. It existed for months while this file's
+geo-scan section said the LLM side needed keys the install did not have.
+
+### SearchApi.io — four answer engines behind one key (`no_key` until keyed)
+
+**A different company from SerpApi.** `GET https://www.searchapi.io/api/v1/
+search?engine=chatgpt|gemini|perplexity|bing_copilot&q=...&api_key=` returns
+`markdown` plus `reference_links[]` (`link`, `title`, `source`, `snippet`).
+`chatgpt` needs `web_search=true` or the answer comes from memory and "not
+cited" is an artefact of the request. Mapped from `dannwaneri/seo-agent`'s
+client; **unprobed here** (no key), so `geo.py`'s `searchapi_*` engines report
+`no_key` and the parser refuses a payload missing both keys rather than reading
+it as an empty answer. `SEARCHAPI_KEY` / `~/.searchapi_key`.
+
+### ✅ Published crawler IP ranges — one JSON shape, five operators, keyless
+
+| operator | file(s) | probed 2026-09-20 |
+|---|---|---|
+| OpenAI | `openai.com/gptbot.json`, `searchbot.json`, `chatgpt-user.json` | 200, 279 prefixes across three |
+| Anthropic | `claude.com/crawling/bots.json` | 200, 26 prefixes, `creationTime 2026-08-18` — linked only from the support article |
+| Perplexity | `perplexity.ai/perplexitybot.json`, `perplexity-user.json` | 200, 12 |
+| Google | `developers.google.com/static/crawling/ipranges/{common-crawlers,special-crawlers,user-triggered-fetchers,user-triggered-fetchers-google}.json` | 200 after a **301 from the documented `/search/apis/ipranges/` path**, 2,143 |
+| Microsoft | `bing.com/toolbox/bingbot.json` | 200, 28, `creationTime 2024-01-03` |
+
+All `{"creationTime", "prefixes": [{"ipv4Prefix"|"ipv6Prefix"}]}`. `ipranges.py`
+reads them (cached a day), `crawllog.py verify` uses them as the second witness,
+and `providers.py` probes them as `crawler-ipranges` with a control (a known
+Anthropic address verifies, `8.8.8.8` does not). ⚠ Google's move is the trap:
+a client on the remembered URL reads an HTML redirect page, and a parser that
+treats "no prefixes" as an empty list then reports every Googlebot address as
+spoofed. The reader refuses any body that is not the published shape.
+
+### Mapped, deliberately NOT built
+
+- **Google Ads Keyword Planner** (`claude-seo/scripts/keyword_planner.py`) —
+  real Google volume, but a Google Ads *manager* account, a developer token,
+  OAuth, and **bucketed ranges ("1K–10K") for any account without ad spend**.
+  The exact number this skill lacks is not what the free tier returns.
+- **Common Crawl host-level web graph** (`commoncrawl_graph.py`) — keyless
+  PageRank + harmonic centrality, quarterly. A third authority read after Open
+  PageRank and Tranco, at the price of a multi-GB download per release. Not
+  worth an install-sized artefact for a triangulation that already has two legs.
+- **Google Indexing API** (`goenning/google-indexing-script`, 7.7k★, and
+  `claude-seo`'s `indexing_notify.py`) — restricted to `JobPosting` and
+  `BroadcastEvent` pages; Google revokes access for abuse. Not a lever for
+  ordinary URLs, so `indexnow.py`'s "the Google half is a human clicking a
+  button" stays exactly true.
 
 ## Evaluated and REJECTED — do not re-add these
 
@@ -1112,7 +1194,8 @@ export DATAFORSEO_PASSWORD=...
 
 # SERP - real Google (dotfile fallback shown; env wins)
 export SERPER_API_KEY=...            # ~/.serper_key   - 2500 free credits, 1/search
-export SERPAPI_KEY=...               # ~/.serpapi_key  - 250/month, top-100 + AI Overview
+export SERPAPI_KEY=...               # ~/.serpapi_key  - 250/month, top-100 + AI Overview + AI Mode
+export SEARCHAPI_KEY=...             # ~/.searchapi_key - a DIFFERENT vendor: chatgpt/gemini/perplexity/copilot answers
 
 # Bing Webmaster - real volume + backlinks for a VERIFIED property
 export BING_WEBMASTER_API_KEY=...    # ~/.bing_webmaster_key
@@ -1126,6 +1209,7 @@ export CLOUDFLARE_API_TOKEN=...        # or ~/.cloudflare_token
 
 # PageSpeed Insights / Core Web Vitals. NOT required if a Google service
 # account exists AND the PSI API is enabled on its project - see above.
+# REQUIRED for `vitals.py origin --subparts` - the CrUX API is API-key only.
 export GOOGLE_API_KEY=...              # or ~/.google_api_key
 export GSC_SERVICE_ACCOUNT=...         # default ~/.gsc_service_account.json
 

@@ -177,7 +177,46 @@ RULES = [
      r"(?i)(?:\.\s+That'?s it\.\s+That'?s|\b\w+\.\s+Openly\.\s|\.\s+And that'?s okay\.)",
      "sentence fragments deployed for manufactured weight",
      "complete sentences"),
+
+    # --- Added 2026-09-20 from the open-seo `deslop` catalog (prior-art.md, third
+    # pass). Three patterns that catalog names and this one did not, each
+    # mechanical enough for a regex. Two more from the same pass - `anaphora`
+    # and `invisible_unicode` - are STRUCTURAL and live in `_structural_hits`,
+    # because a run of sentence openers and a category-Cf code point are not
+    # single-pattern matches.
+    ("false_range", "low", 1,
+     # "from X to Y to Z" - a spectrum with nothing between the poles. The
+     # two-hop "from X to Y" is ordinary English and is NOT matched; the third
+     # "to" is what turns a range into a list wearing a range's clothes.
+     r"(?i)\bfrom\s+[\w'\-]+(?:\s+[\w'\-]+){0,3}?\s+to\s+[\w'\-]+(?:\s+[\w'\-]+){0,3}?"
+     r"\s+to\s+[\w'\-]+",
+     "a 'from X to Y to Z' range where nothing lies between the poles",
+     "if it is a list, list it; if there is a real spectrum, describe the middle"),
+    ("invented_label", "low", 1,
+     # An abstract noun bolted to a problem-noun and used as if defined:
+     # "the supervision paradox", "the acceleration trap", "workload creep".
+     # Restricted to abstract-suffix heads so "the debt trap" and "the mouse
+     # trap" - real phrases - do not fire.
+     r"(?i)\b(?:the\s+)?[a-z]{3,}(?:tion|sion|ment|ity|ance|ence|ing|load|ship|ness)"
+     r"\s+(?:paradox|trap|creep|inversion|vacuum|dilemma|spiral)\b",
+     "an invented concept label - a name standing where an argument should be",
+     "say what happens instead of naming it"),
 ]
+
+# STRUCTURAL rules: not one regex, so they are declared here and fired by
+# `_structural_hits`, but they carry the same (severity, tolerance, why, fix)
+# shape so `rules`, `corpus` and `diff` treat them identically.
+STRUCTURAL_RULES = {
+    "anaphora": ("medium", 1,
+                 "three or more consecutive sentences opening on the same words",
+                 "vary the openings, or fold the parallel points into one sentence"),
+    "invisible_unicode": ("high", 0,
+                          "an invisible format-control character (zero-width space, "
+                          "joiner, BOM, soft hyphen, direction mark) inside prose - a "
+                          "copy-paste or generation artefact that splits words for "
+                          "search and tokenisers",
+                          "delete it; nothing legible is lost"),
+}
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
@@ -292,6 +331,84 @@ def _front_matter_end(text: str) -> int:
 
 
 TOLERANCE = {r[0]: r[2] for r in RULES}
+TOLERANCE.update({k: v[1] for k, v in STRUCTURAL_RULES.items()})
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'(])")
+_OPENER = re.compile(r"^\W*([\w'-]+)\s+([\w'-]+)", re.UNICODE)
+# Scripts in which U+200C ZERO WIDTH NON-JOINER is orthography, not noise:
+# Arabic/Persian/Urdu and the Indic block.
+_ZWNJ_SCRIPTS = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\u0900-\u0dff\ufb50-\ufdff\ufe70-\ufeff]")
+# Emoji ZWJ sequences: U+200D between two pictographs is a single glyph.
+_PICTO = re.compile(r"[\u2600-\u27bf\U0001f000-\U0001faff]")
+
+
+def _structural_hits(body: str, masked: str, line_of) -> dict:
+    """The two rules a single regex cannot express, in `_fire`'s record shape."""
+    import unicodedata
+    out = {}
+
+    # anaphora: runs of >=3 sentences in one paragraph sharing their first two
+    # words. Two words, not one - "The X. The Y. The Z." is ordinary prose and
+    # only the two-word opener ("They assume that... They assume that...") is
+    # the mechanical repetition the catalog describes.
+    hits = []
+    pos = 0
+    for para in masked.split("\n\n"):
+        sents = [x for x in _SENT_SPLIT.split(para) if x.strip()]
+        run, run_start, prev = 1, 0, None
+        offs, cursor = [], 0
+        for x in sents:
+            i = para.find(x, cursor)
+            offs.append(i if i >= 0 else cursor)
+            cursor = (i if i >= 0 else cursor) + len(x)
+        for idx, x in enumerate(sents):
+            m = _OPENER.match(x.strip())
+            key = (m.group(1).lower(), m.group(2).lower()) if m else None
+            if key and key == prev:
+                run += 1
+            else:
+                if run >= 3:
+                    hits.append((pos + offs[run_start], sents[run_start], run))
+                run, run_start, prev = 1, idx, key
+        if run >= 3:
+            hits.append((pos + offs[run_start], sents[run_start], run))
+        pos += len(para) + 2
+    if hits:
+        sev, tol, why, fix = STRUCTURAL_RULES["anaphora"]
+        found = [{"line": line_of(o), "match": re.sub(r"\s+", " ", first).strip()[:90],
+                  "context": f"{n} consecutive sentences open the same way"} for o, first, n in hits]
+        out["anaphora"] = {"rule": "anaphora", "severity": sev, "count": len(found),
+                           "tolerance": tol, "over_tolerance": len(found) > tol,
+                           "why": why, "fix": fix, "hits": found}
+
+    # invisible_unicode: category Cf in the PROSE (masked, so a code block's
+    # bytes are not judged). Legitimate cases are excluded by context rather
+    # than by list, so a new format character cannot slip past an enumeration.
+    found = []
+    for i, ch in enumerate(masked):
+        if unicodedata.category(ch) != "Cf":
+            continue
+        before, after = masked[i - 1] if i else "", masked[i + 1] if i + 1 < len(masked) else ""
+        if ch == "\u200d" and _PICTO.search(before) and _PICTO.search(after):
+            continue                                   # emoji ZWJ sequence
+        if ch == "\u200c" and (_ZWNJ_SCRIPTS.search(before) or _ZWNJ_SCRIPTS.search(after)):
+            continue                                   # Persian/Indic orthography
+        if ch == "\u00ad" and before.isalpha() and after.isalpha():
+            continue                                   # a hyphenation hint mid-word
+        try:
+            name = unicodedata.name(ch)
+        except ValueError:
+            name = "UNNAMED"
+        ctx = masked[max(0, i - 40):i] + "\u2400" + masked[i + 1:i + 40]
+        found.append({"line": line_of(i), "match": f"U+{ord(ch):04X} {name}",
+                      "context": re.sub(r"\s+", " ", ctx).strip()[:160]})
+    if found:
+        sev, tol, why, fix = STRUCTURAL_RULES["invisible_unicode"]
+        out["invisible_unicode"] = {"rule": "invisible_unicode", "severity": sev,
+                                    "count": len(found), "tolerance": tol,
+                                    "over_tolerance": len(found) > tol,
+                                    "why": why, "fix": fix, "hits": found}
+    return out
 
 
 def _fire(body: str, masked: str) -> dict:
@@ -345,6 +462,7 @@ def _fire(body: str, masked: str) -> dict:
             by_rule[rule] = {"rule": rule, "severity": sev, "count": len(found),
                              "tolerance": tol, "over_tolerance": len(found) > tol,
                              "why": why, "fix": fix, "hits": found}
+    by_rule.update(_structural_hits(body, masked, line_of))
     return by_rule
 
 
@@ -534,9 +652,65 @@ def run_control() -> dict:
     c.check("uniform_tell_stays_quiet_on_a_mixed_tier",
             uniform_verdict(["warn"] * 30 + ["pass"] * 14, subject="pages") is None)
 
-    c.check("every_rule_has_a_tolerance", all(r in TOLERANCE for r, *_ in RULES))
+    c.check("every_rule_has_a_tolerance", all(r in TOLERANCE for r, *_ in RULES)
+            and all(r in TOLERANCE for r in STRUCTURAL_RULES))
     c.check("catalog_is_not_empty", len(RULES) >= 20)
-    return c.verdict(rules=len(RULES))
+
+    # --- the 2026-09-20 rules, each in BOTH directions ---------------------
+    def rule_count(text, rule):
+        r = scan_text(text, html=False)
+        for v in r["flagged"] + [dict(x) for x in r["within_tolerance"]]:
+            if v["rule"] == rule:
+                return v["count"]
+        return 0
+
+    c.check("false_range_fires_on_three_hops",
+            rule_count("It spans from innovation to implementation to cultural change.",
+                       "false_range") == 1)
+    c.check("false_range_does_not_fire_on_an_ordinary_two_hop_range",
+            rule_count("Prices run from ten to forty dollars.", "false_range") == 0)
+    c.check("invented_label_fires_on_an_abstract_problem_noun",
+            rule_count("This is the supervision paradox, and the acceleration trap follows.",
+                       "invented_label") == 2)
+    c.check("invented_label_does_not_fire_on_a_real_phrase",
+            rule_count("We set a mouse trap by the debt trap sign.", "invented_label") == 0)
+
+    ana = ("They assume that users read. They assume that users scroll. They assume that "
+           "users care. The rest of the page is ordinary.")
+    c.check("anaphora_fires_on_three_matching_openers", rule_count(ana, "anaphora") == 1)
+    c.check("anaphora_does_not_fire_on_two",
+            rule_count("They assume that users read. They assume that users scroll. "
+                       "Nobody checked.", "anaphora") == 0)
+    c.check("anaphora_does_not_fire_on_a_shared_first_word_alone",
+            rule_count("The engine starts. The wheels turn. The road bends. The day ends.",
+                       "anaphora") == 0,
+            "one shared word is ordinary English; two is the pattern")
+    c.check("anaphora_does_not_cross_a_paragraph_break",
+            rule_count("They assume that x.\n\nThey assume that y. They assume that z.",
+                       "anaphora") == 0)
+
+    zw = "A normal sentence with a zero\u200bwidth space and a BOM\ufeff inside."
+    c.check("invisible_unicode_fires_on_zwsp_and_bom", rule_count(zw, "invisible_unicode") == 2)
+    c.check("invisible_unicode_names_the_code_point",
+            any("ZERO WIDTH SPACE" in h["match"] for v in scan_text(zw, html=False)["flagged"]
+                if v["rule"] == "invisible_unicode" for h in v["hits"]))
+    c.check("invisible_unicode_is_high_severity_so_it_fails_the_draft",
+            scan_text(zw, html=False)["verdict"] == "fail")
+    c.check("invisible_unicode_spares_an_emoji_zwj_sequence",
+            rule_count("Family: \U0001f468\u200d\U0001f469\u200d\U0001f467 here.",
+                       "invisible_unicode") == 0)
+    c.check("invisible_unicode_spares_persian_zwnj",
+            rule_count("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645 is one word.",
+                       "invisible_unicode") == 0)
+    c.check("invisible_unicode_spares_a_mid_word_soft_hyphen",
+            rule_count("hyphen\u00adation inside a word.", "invisible_unicode") == 0)
+    c.check("invisible_unicode_flags_a_soft_hyphen_between_spaces",
+            rule_count("a stray \u00ad here.", "invisible_unicode") == 1)
+    c.check("invisible_unicode_ignores_code_blocks",
+            rule_count("Prose.\n\n```\nx = '\u200b'\n```\n", "invisible_unicode") == 0)
+    c.check("clean_prose_still_passes_with_the_new_rules",
+            scan_text(CONTROL_CLEAN, html=False)["verdict"] == "pass")
+    return c.verdict(rules=len(RULES) + len(STRUCTURAL_RULES))
 
 
 def scan_file(path: str, *, html=None) -> dict:
@@ -584,7 +758,9 @@ def main():
     elif a.cmd == "rules":
         out = {"ok": True, "check": "slop-rules",
                "rules": [{"rule": r, "severity": sv, "tolerance": t, "why": w, "fix": f}
-                         for r, sv, t, _p, w, f in RULES]}
+                         for r, sv, t, _p, w, f in RULES]
+               + [{"rule": r, "severity": sv, "tolerance": t, "why": w, "fix": f,
+                   "structural": True} for r, (sv, t, w, f) in STRUCTURAL_RULES.items()]}
     else:
         b, af = scan_file(a.before), scan_file(a.after)
         if not (b.get("ok") and af.get("ok")):

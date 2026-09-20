@@ -149,6 +149,16 @@ shape the query actually rewards (if page 1 is all comparisons, a tutorial will
 not rank). State the chosen archetype and why — the recent mix plus the SERP — in
 the run report and the PR body.
 
+⚠ **A comparison or list archetype is a human-conversion shape, not a citation
+play, and the report may not claim otherwise.** ChatGPT 5.6 (Aug 2026) cut
+listicle citations by half and comparison-page citations by a third in one
+release, moving retrieval toward "official", owned pages; Google AI Overviews
+still cite comparisons in proportion to their ranking. Build the comparison
+when the SERP and the buyer want one; do not build it "for GEO", and never
+build one per fan-out query — that is the scaled-content pattern the shift was
+aimed at. The pages only this site can publish — the data-study, the product's
+own reference, the measured finding — are the rising citable class.
+
 **Success criteria**: Two recent exemplars have been read for conventions and voice — not as skeletons — and an archetype is chosen that does NOT repeat the last 2-3 published guides, with the reason (recent mix + SERP) stated for the report and PR body.
 
 ---
@@ -602,6 +612,37 @@ Two rules deserve special attention:
 is expected. Rewrite, re-scan, and use `slop.py diff before.md after.md` to
 confirm the rewrite removed tells rather than trading them for new ones (read
 `introduced`). Full catalog and rationale: `references/deslop.md`.
+
+### Then the CLAIMS CHECK — every number, and whether its source carries it
+
+```bash
+python3 $SEO/factcheck.py claims --draft <the FINAL guide file> --fetch
+```
+
+The step-5 asset is a number, and this is the instrument behind "a source you
+cannot cite, you have not verified". It lists every statistic, money figure,
+large quantity, comparative and named-source claim in the draft, reports the
+ones with **no citation within 200 characters** (`uncited` — the work list),
+and with `--fetch` opens each cited URL once and looks for the claimed number
+in its text. Read the three states as three things:
+
+- **`not_in_source`** — the page was READ and the number is not on it. Either
+  the citation is wrong or the number is; both ship a false claim under the
+  owner's name. Open the page: a number restated ("47 percent", "0.47") can
+  read as absent, so confirm before rewriting — but never ship past it.
+- **`unverified`** — the page could not be fetched (dead link, paywall, JS-only,
+  bot challenge). Unknown, never false — and a citation that cannot be opened
+  is still a citation the reader cannot check, so prefer one that can.
+- **`verified`** — the number is in the page. That proves the citation matches,
+  not that the source is sound, current, or applicable; step 5's reading rule
+  still applies.
+
+**A number this run MEASURED itself** (the information-gain asset from your own
+data, a command's real output) has no external citation and will list as
+`uncited`; say so in the draft — "measured on 2026-09-20 over N rows" — and in
+the run report. That is the honest shape, not a gap.
+
+**Success criteria**: `factcheck.py claims --fetch` ran on the final draft; every `uncited` claim is either sourced or explicitly marked as this run's own measurement; no `not_in_source` claim ships; `unverified` sources were replaced where a checkable one exists.
 
 ### Then the SAMENESS GATE — mandatory
 

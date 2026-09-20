@@ -298,6 +298,20 @@ def check_vitals(url: str, strategy="mobile") -> dict:
             + urllib.parse.urlencode({"url": url, "strategy": strategy, "category": "performance"}))
     if tok.startswith("key:"):
         r = http(base + "&key=" + tok[4:], timeout=180)
+        # A key RESTRICTED to other APIs (measured 2026-09-20: a key made for
+        # CrUX answers PSI with 403 "Requests to this API pagespeedonline ...
+        # are blocked") must not take PSI away from an install where the
+        # service-account path was already working. Fall back to it.
+        if r.get("status") == 403 and "blocked" in (r.text() or "").lower():
+            try:
+                sa = json.loads(Path(GSC_SA).read_text())
+                bearer = _sa_access_token(sa, "openid")
+                r2 = http(base, headers={"Authorization": f"Bearer {bearer}"}, timeout=180)
+                if r2.ok:
+                    r, source = r2, (f"service account {sa.get('client_email')} "
+                                     f"(GOOGLE_API_KEY is restricted away from PSI)")
+            except Exception:                                     # noqa: BLE001
+                pass
     else:
         r = http(base, headers={"Authorization": f"Bearer {tok}"}, timeout=180)
     j = r.json() or {}

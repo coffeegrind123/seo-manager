@@ -428,6 +428,42 @@ def _probe_pagespeed():
     return False, f"{r.get('status')} {msg}", None
 
 
+def _probe_crawler_ipranges():
+    """The five operators' published crawler IP ranges (ipranges.py). The control
+    is the shape check: a file that redirects to HTML or reshapes must read as
+    UNREADABLE, never as an empty list that turns every hit into a forgery."""
+    try:
+        import ipranges
+    except Exception as e:                                          # noqa: BLE001
+        return None, f"ipranges.py unavailable: {e}", None
+    st = ipranges.status()
+    if st.get("control_failed"):
+        return False, st.get("reason", "no list readable"), None
+    rows = st.get("operators") or []
+    unread = {r["operator"]: r["unreadable"] for r in rows if r["unreadable"]}
+    total = sum(r["prefixes"] for r in rows)
+    ok = not unread
+    # Control: a known-Anthropic address (216.73.216.0/22, in the file as of
+    # 2026-08-18) verifies and 8.8.8.8 is spoofed. If both answer the same, the
+    # reader is broken and the source is unusable whatever `ok` says.
+    inside = ipranges.check("216.73.216.5", "claudebot")["verified"]
+    outside = ipranges.check("8.8.8.8", "claudebot")["verified"]
+    return ok, (f"{len(rows)} operators, {total} prefixes"
+                + (f", unreadable: {unread}" if unread else "")), (inside is True and outside is False)
+
+
+def _probe_searchapi():
+    key = read_secret("SEARCHAPI_KEY", "~/.searchapi_key")
+    if not key:
+        return None, "no SEARCHAPI_KEY / ~/.searchapi_key", None
+    r = http("https://www.searchapi.io/api/v1/search?"
+             + urllib.parse.urlencode({"engine": "google", "q": "test", "api_key": key,
+                                       "num": "1"}), timeout=60)
+    j = r.json() or {}
+    status = (j.get("search_metadata") or {}).get("status")
+    return r.ok and status == "Success", f"{r.get('status')} {status or j.get('error', '')}"[:120], None
+
+
 # name, category, cost, needs_key, probe, note
 PROVIDERS = [
     ("google-autocomplete", "expansion", "free", False, _probe_google_autocomplete,
@@ -473,7 +509,14 @@ PROVIDERS = [
     ("serper", "serp", "2500 one-off credits", True, _probe_serper,
      "real Google, 1 credit/search"),
     ("serpapi", "serp", "250/month", True, _probe_serpapi,
-     "real Google top-100 + AI Overview"),
+     "real Google top-100 + AI Overview + AI Mode (engine=google_ai_mode, measured "
+     "2026-09-20 on the same key)"),
+    ("searchapi", "geo", "paid key", True, _probe_searchapi,
+     "a DIFFERENT company from SerpApi: chatgpt/gemini/perplexity/bing_copilot answer "
+     "engines with reference_links, one key - geo.py's searchapi_* engines"),
+    ("crawler-ipranges", "verification", "free", False, _probe_crawler_ipranges,
+     "OpenAI/Anthropic/Perplexity/Google/Bing published crawler IP ranges - the CIDR "
+     "witness for crawllog.py verify; controlled"),
     ("bing-webmaster", "volume", "free key", True, _probe_bing_webmaster,
      "the only free real impression counts + backlinks, verified property only"),
     ("pagespeed", "technical", "free", True, _probe_pagespeed,

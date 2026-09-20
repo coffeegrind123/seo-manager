@@ -70,6 +70,24 @@ Grandiosity standing where a measurement belongs. Replace it with the number.
 strong formatting tell, and usually a sign the list wanted to be a table or a
 paragraph.
 
+**`invisible_unicode`** (added 2026-09-20) — a category-`Cf` code point inside
+prose: a zero-width space, a BOM, a joiner, a direction mark, a stray soft
+hyphen. The one rule here that is a **defect as well as a tell**: an invisible
+character splits a word for search engines and tokenisers, and the reader
+cannot see why the page fails to match. `high`, tolerance 0, and it names the
+code point (`U+200B ZERO WIDTH SPACE`) with a `␀` marker in the context so the
+position is findable. Legitimate cases are excluded by context, not by list —
+an emoji ZWJ sequence, a Persian/Indic ZWNJ, a soft hyphen between letters —
+so a format character this rule has never met still fires. From seomachine's
+`content_scrubber.py`, the one thing in that repo `slop.py` lacked.
+
+**`anaphora`, `false_range`, `invented_label`** (added 2026-09-20, from the
+open-seo `deslop` catalog) — three or more consecutive sentences opening on the
+same two words ("They assume that… They assume that…"); a "from X to Y to Z"
+range with nothing between its poles; and an abstract noun bolted to a
+problem-noun and used as if defined ("the supervision paradox", "the
+acceleration trap"). Each tolerates one — the second is the fingerprint.
+
 ---
 
 ## The principles underneath

@@ -343,6 +343,34 @@ def run_control() -> dict:
     c.check("a_title_resolves_case_insensitively",
             (find_row(rows, "hOw tO aIm") or {}).get("id") == "a1b2c3d4")
     c.check("a_keyword_resolves", (find_row(rows, "cs 1.6 online") or {}).get("id") == "c9d0e1f2")
+
+    # AI-visibility arithmetic: over answers that existed, across runs, with the
+    # single-observation count visible. Each case is a way the rate lies.
+    ai_rows = [
+        {"engine": "e", "query": "q1", "has_ai_answer": True, "cited": True, "runs": 3,
+         "cited_runs": 1, "mentioned": True, "citations": [{"domain": "rival.com"}]},
+        {"engine": "e", "query": "q2", "has_ai_answer": True, "cited": False, "runs": 1,
+         "cited_runs": 0, "mentioned": False, "citations": [{"domain": "rival.com"}]},
+        {"engine": "e", "query": "q3", "has_ai_answer": False, "cited": False,
+         "citations": []},
+        {"engine": "e", "query": "q4", "has_ai_answer": True, "cited": True,
+         "citations": [{"domain": "www.example.com"}]},          # legacy row, no runs
+    ]
+    eng, gap = aggregate_ai(ai_rows, "example.com")
+    e = eng["e"]
+    c.check("ai_rate_is_over_answers_that_existed_across_runs",
+            e["answers"] == 5 and e["cited_runs"] == 2 and e["citation_rate"] == 0.4,
+            str({k: e[k] for k in ("answers", "cited_runs", "citation_rate")}))
+    c.check("ai_no_answer_surface_is_not_in_the_denominator", e["with_answer"] == 3 and e["queries"] == 4)
+    c.check("ai_single_observations_are_counted", e["single_observations"] == 2)
+    c.check("ai_legacy_row_without_runs_is_one_observation",
+            aggregate_ai([ai_rows[3]], "example.com")[0]["e"]["answers"] == 1)
+    c.check("ai_mention_rate_ignores_rows_that_did_not_record_it",
+            e["mention_known"] == 2 and e["mention_rate"] == 0.5)
+    c.check("ai_no_answers_is_a_null_rate_not_zero",
+            aggregate_ai([ai_rows[2]], "example.com")[0]["e"]["citation_rate"] is None)
+    c.check("ai_gap_counts_competitors_only_where_we_were_not_cited",
+            gap == {"rival.com": 1}, str(gap))
     c.check("an_unknown_identifier_is_none_not_the_first_row",
             find_row(rows, "not-a-thing") is None,
             "falling back to row 0 would silently edit an unrelated item")
@@ -1108,13 +1136,25 @@ def cmd_record_ai(store: Store, a):
         die("--json must be a JSON array of {engine, query, has_ai_answer, cited, cited_url, answer_excerpt, citations}")
     stamp = now()
     for e in entries:
+        # `runs` / `cited_runs` carry the sample size (geo.py --runs N). A row
+        # without them is ONE observation, and is stored as one so the
+        # aggregate can say how much of the rate rests on single samples.
+        runs = max(1, int(e.get("runs") or 1))
+        cited = bool(e.get("cited", False))
+        cited_runs = e.get("cited_runs")
+        cited_runs = (int(cited_runs) if cited_runs is not None else (1 if cited else 0))
+        if cited_runs > runs:
+            die(f"cited_runs {cited_runs} exceeds runs {runs} for {e.get('query')!r}")
         store.append(
             "ai",
             {
                 "engine": e.get("engine", "claude"),
                 "query": e.get("query"),
                 "has_ai_answer": bool(e.get("has_ai_answer", True)),
-                "cited": bool(e.get("cited", False)),
+                "cited": cited or cited_runs > 0,
+                "runs": runs,
+                "cited_runs": cited_runs,
+                "mentioned": (None if e.get("mentioned") is None else bool(e.get("mentioned"))),
                 "cited_url": e.get("cited_url"),
                 "answer_excerpt": e.get("answer_excerpt"),
                 "citations": e.get("citations", []),
@@ -1124,26 +1164,54 @@ def cmd_record_ai(store: Store, a):
     out({"ok": True, "recorded": len(entries)})
 
 
-def cmd_ai_visibility(store: Store, a):
-    rows = store.stream("ai")
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=a.days)).isoformat()
-    rows = [r for r in rows if (r.get("checked_at") or "") >= cutoff]
-    cfg = store.config()
-    domain = (cfg.get("domain") or "").lower().replace("www.", "")
+def aggregate_ai(rows: list[dict], domain: str) -> tuple[dict, dict]:
+    """Per-engine rates and the gap table. Pure, so the arithmetic is controllable."""
     by_engine: dict[str, dict] = {}
     gap: dict[str, int] = {}
     for row in rows:
-        eng = by_engine.setdefault(row.get("engine", "unknown"), {"queries": 0, "cited": 0, "with_answer": 0})
+        eng = by_engine.setdefault(row.get("engine", "unknown"),
+                                   {"queries": 0, "cited": 0, "with_answer": 0,
+                                    "answers": 0, "cited_runs": 0, "single_observations": 0,
+                                    "mentioned": 0, "mention_known": 0})
         eng["queries"] += 1
         eng["cited"] += 1 if row.get("cited") else 0
-        eng["with_answer"] += 1 if row.get("has_ai_answer") else 0
+        has = bool(row.get("has_ai_answer"))
+        eng["with_answer"] += 1 if has else 0
+        runs = max(1, int(row.get("runs") or 1))
+        if has:
+            # The rate is over ANSWERS that existed. A question with no answer
+            # surface is not an answer we were left out of (geo.py's rule), and
+            # a --runs N row contributes N answers, not one.
+            eng["answers"] += runs
+            eng["cited_runs"] += int(row.get("cited_runs") if row.get("cited_runs") is not None
+                                     else (1 if row.get("cited") else 0))
+            eng["single_observations"] += 1 if runs == 1 else 0
+        if row.get("mentioned") is not None:
+            eng["mention_known"] += 1
+            eng["mentioned"] += 1 if row.get("mentioned") else 0
         if not row.get("cited"):
             for c in row.get("citations") or []:
                 d = str(c.get("domain", "")).lower().replace("www.", "")
                 if d and d != domain:
                     gap[d] = gap.get(d, 0) + 1
     for stats in by_engine.values():
-        stats["citation_rate"] = round(stats["cited"] / stats["queries"], 3) if stats["queries"] else 0.0
+        stats["citation_rate"] = (round(stats["cited_runs"] / stats["answers"], 3)
+                                  if stats["answers"] else None)
+        stats["mention_rate"] = (round(stats["mentioned"] / stats["mention_known"], 3)
+                                 if stats["mention_known"] else None)
+        stats["rate_note"] = ("citation_rate is cited answers over answers that EXISTED, "
+                              "across every run; single_observations is how many rows rest "
+                              "on one run of a non-deterministic engine")
+    return by_engine, gap
+
+
+def cmd_ai_visibility(store: Store, a):
+    rows = store.stream("ai")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=a.days)).isoformat()
+    rows = [r for r in rows if (r.get("checked_at") or "") >= cutoff]
+    cfg = store.config()
+    domain = (cfg.get("domain") or "").lower().replace("www.", "")
+    by_engine, gap = aggregate_ai(rows, domain)
     gap_domains = sorted(({"domain": d, "cited_on_queries": n} for d, n in gap.items()), key=lambda x: -x["cited_on_queries"])
     recent_queries = sorted({r.get("query") for r in rows if r.get("query")})
     out(

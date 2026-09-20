@@ -233,6 +233,52 @@ BOTS = [
     # with this UA, so without an entry the instrument appears in its own data
     # as an unidentified bot - 33 hits on the window measured.
     ("seo-manager/", "seo-manager (this skill)", "self", []),
+    # --- Added 2026-09-20 from the ai-robots-txt/ai.robots.txt community list --
+    # That list carried 175 agents against the 79 above. Only the ones whose
+    # OPERATOR documents the agent and its purpose are named here, with the
+    # class the operator states; everything the list marks "unclear at this
+    # time" stays in other-bot rather than being guessed into a class. Two rules
+    # from #9 hold: rDNS lists are EMPTY (no operator here documents a suffix),
+    # and an agent whose class is uncertain goes to ai_training - the bucket that
+    # does NOT inflate the ai_search number the GEO reading is built on.
+    #
+    # `search`: Brave Search's crawler is the index Claude's web search reads
+    # from, so a Bravebot absence is a precondition failure for a Claude
+    # citation - the crawllog/geo-scan reading needs this row to say so.
+    ("bravebot", "Bravebot", "search", []),
+    ("meta-webindexer", "meta-webindexer", "ai_search", []),      # Meta AI search index
+    ("mistralai-index", "MistralAI-Index", "ai_search", []),      # Le Chat search index
+    ("mistralai-training", "MistralAI-Training", "ai_training", []),
+    ("kimi-searchbot", "Kimi-SearchBot", "ai_search", []),        # Moonshot
+    ("kimi-user", "Kimi-User", "ai_user", []),
+    ("amzn-searchbot", "Amzn-SearchBot", "ai_search", []),        # Alexa / Rufus index
+    ("amzn-user", "Amzn-User", "ai_user", []),
+    ("exasearchbot", "ExaSearchBot", "ai_search", []),
+    ("linkupbot", "LinkupBot", "ai_search", []),
+    ("andibot", "Andibot", "ai_search", []),
+    ("phindbot", "PhindBot", "ai_user", []),
+    ("kagi-fetcher", "kagi-fetcher", "ai_user", []),
+    ("tongyibot", "TongyiBot", "ai_user", []),                     # Alibaba assistant fetch
+    ("yiyanbot", "YiyanBot", "ai_user", []),                       # Baidu assistant fetch
+    ("qwenbot", "QwenBot", "ai_training", []),                     # Alibaba corpus
+    ("erniebot", "ERNIEBot", "ai_training", []),                   # Baidu corpus
+    ("deepseekbot", "DeepSeekBot", "ai_training", []),
+    ("doubaobot", "DoubaoBot", "ai_training", []),                 # class uncertain -> training
+    ("ai2bot", "AI2Bot", "ai_training", []),
+    ("tavilybot", "TavilyBot", "ai_training", []),                 # data provider, not a citer
+    ("firecrawlagent", "FirecrawlAgent", "ai_training", []),
+    ("crawl4ai", "Crawl4AI", "ai_training", []),
+    # Google's agent-side fetchers. A person asked; these are ai_user, the same
+    # class as ChatGPT-User, and NOT search demand. Note the key ordering: none
+    # of these contains "googlebot", so they cannot be swallowed by that row.
+    ("googleagent-mariner", "GoogleAgent-Mariner", "ai_user", [".googlebot.com", ".google.com"]),
+    ("googleagent-urlcontext", "GoogleAgent-URLContext", "ai_user",
+     [".googlebot.com", ".google.com"]),
+    ("gemini-deep-research", "Gemini-Deep-Research", "ai_user", [".googlebot.com", ".google.com"]),
+    ("notebooklm", "Google-NotebookLM", "ai_user", [".googlebot.com", ".google.com"]),
+    # Anthropic's page lists ClaudeBot / Claude-User / Claude-SearchBot and no
+    # "Claude-Web"; the community list has it as undocumented. Training bucket.
+    ("claude-web", "Claude-Web", "ai_training", []),
 ]
 
 # `user_fetch` is user-TRIGGERED but not an assistant: Google-Read-Aloud is a
@@ -269,7 +315,16 @@ OPERATORS = [
     ("bingbot", "Microsoft"), ("bingpreview", "Microsoft"), ("msnbot", "Microsoft"),
     ("meta-externalagent", "Meta"), ("facebookexternalhit", "Meta"),
     ("amazonbot", "Amazon"), ("bytespider", "ByteDance"), ("ccbot", "CommonCrawl"),
-    ("cohere-ai", "Cohere"), ("mistralai-user", "MistralAI"), ("diffbot", "Diffbot"),
+    ("cohere-ai", "Cohere"), ("mistralai-user", "MistralAI"), ("mistralai-index", "MistralAI"),
+    ("mistralai-training", "MistralAI"), ("diffbot", "Diffbot"),
+    ("bravebot", "Brave"), ("meta-webindexer", "Meta"), ("kimi-", "Moonshot"),
+    ("amzn-", "Amazon"), ("exasearchbot", "Exa"), ("linkupbot", "Linkup"), ("andibot", "Andi"),
+    ("phindbot", "Phind"), ("kagi-fetcher", "Kagi"), ("tongyibot", "Alibaba"),
+    ("qwenbot", "Alibaba"), ("yiyanbot", "Baidu"), ("erniebot", "Baidu"),
+    ("deepseekbot", "DeepSeek"), ("doubaobot", "ByteDance"), ("ai2bot", "Ai2"),
+    ("tavilybot", "Tavily"), ("firecrawlagent", "Firecrawl"), ("crawl4ai", "Crawl4AI"),
+    ("googleagent-", "Google"), ("gemini-deep-research", "Google"), ("notebooklm", "Google"),
+    ("claude-web", "Anthropic"),
     ("yandexbot", "Yandex"), ("baiduspider", "Baidu"),
     ("duckduckbot", "DuckDuckGo"), ("duckassistbot", "DuckDuckGo"),
     ("ahrefsbot", "Ahrefs"), ("semrushbot", "Semrush"), ("mj12bot", "Majestic"),
@@ -594,6 +649,43 @@ def run_control() -> dict:
             "reading the truncated list would understate the forgery")
     c.check("operator_lookup_resolves", operator_of("googlebot") == operator_of("googlebot-image")
             and operator_of("googlebot") is not None)
+
+    # Registry ORDER is load-bearing: `classify_ua` takes the first key that is a
+    # substring of the UA, so an earlier key that is itself a substring of a
+    # later key makes the later row unreachable. Derived from BOTS, so it holds
+    # for every row added after this line was written.
+    keys = [k for k, _l, _c, _v in BOTS]
+    shadowed = [(a, b) for i, a in enumerate(keys) for b in keys[i + 1:] if a in b]
+    c.check("no_registry_key_shadows_a_later_one", not shadowed, str(shadowed[:5]))
+    c.check("bravebot_is_the_claude_search_index_and_is_search",
+            classify_ua("Mozilla/5.0 (compatible; Bravebot/1.0)")[2] == "search")
+    c.check("a_google_agent_fetch_is_ai_user_not_search",
+            classify_ua("Mozilla/5.0 (compatible; GoogleAgent-Mariner)")[2] == "ai_user")
+    c.check("an_undocumented_anthropic_agent_is_training_not_search",
+            classify_ua("Claude-Web/1.0")[2] == "ai_training")
+    c.check("every_ai_row_has_an_empty_rdns_list",
+            all(not v for _k, _l, cat, v in BOTS
+                if cat in ("ai_search", "ai_user", "ai_training") and not _k.startswith(
+                    ("google", "gemini", "notebooklm", "applebot", "amazonbot"))),
+            "a guessed suffix reports every legitimate hit as spoofed")
+
+    # Two witnesses, three states. The combination must never manufacture a
+    # forgery out of two silences, and must never let one silence hide a match.
+    V, S, U = ({"verified": True, "reason": "ok"}, {"verified": False, "reason": "SPOOFED"},
+               {"verified": None, "reason": "no answer"})
+    c.check("witness_dns_verified_alone_verifies", combine_witnesses(V, U)["verified"] is True)
+    c.check("witness_cidr_verified_alone_verifies", combine_witnesses(U, V)["verified"] is True)
+    c.check("witness_one_spoofed_other_silent_is_spoofed",
+            combine_witnesses(S, U)["verified"] is False
+            and combine_witnesses(U, S)["verified"] is False)
+    c.check("witness_two_silences_are_unknown_not_spoofed",
+            combine_witnesses(U, U)["verified"] is None)
+    dis = combine_witnesses(V, S)
+    c.check("witness_disagreement_is_named_not_hidden",
+            dis["verified"] is True and dis.get("witnesses_disagree") is True
+            and "SPOOFED" in dis["reason"])
+    c.check("witness_verdicts_are_three_distinct_states",
+            len({str(combine_witnesses(x, y)["verified"]) for x in (V, S, U) for y in (V, S, U)}) == 3)
     return c.verdict(bots_in_registry=len(BOTS))
 
 
@@ -1283,6 +1375,30 @@ def verify_ip(ip: str, expect_suffixes: list[str]):
     return out
 
 
+def combine_witnesses(dns: dict, cidr: dict) -> dict:
+    """Two witnesses -> one verdict, three states.
+
+    A verification on EITHER path is a verification; a forgery on one path with
+    the other unable to answer is a forgery; two silences are UNKNOWN. Two
+    witnesses DISAGREEING (one verified, one spoofed) is reported as verified
+    with the disagreement named, because "verified" means an operator-published
+    fact matched, and the other path's miss is more often a stale table or a
+    one-way PTR than a forgery."""
+    d, k = dns.get("verified"), cidr.get("verified")
+    if d is True or k is True:
+        out = {"verified": True,
+               "reason": dns["reason"] if d is True else cidr["reason"]}
+        if (d is True and k is False) or (k is True and d is False):
+            out["witnesses_disagree"] = True
+            out["reason"] += " - but the other witness says SPOOFED; read both"
+        return out
+    if d is False or k is False:
+        return {"verified": False, "reason": dns["reason"] if d is False else cidr["reason"]}
+    return {"verified": None,
+            "reason": ("neither rDNS nor a published range could give a verdict: "
+                       f"dns={dns.get('reason')}; cidr={cidr.get('reason')}")}
+
+
 def cmd_verify(a):
     ips: list[tuple[str, str, int]] = []   # (ip, bot_key, hits)
     if a.scan:
@@ -1300,19 +1416,46 @@ def cmd_verify(a):
                           "hint": "pass --ip, or --scan scan.json to verify the top IPs of each bot"}))
         sys.exit(2)
 
+    # SECOND WITNESS: the operator's published IP ranges. Imported lazily for
+    # the same reason `controls` is - this file ships its own source to remote
+    # hosts for `scan`, and `verify` never runs there. Every AI crawler's rDNS
+    # list is EMPTY by rule (#9), so before 2026-09-20 this subcommand could say
+    # nothing about the rows the GEO reading is built on; the CIDR path is how
+    # OAI-SearchBot, Claude-SearchBot and PerplexityBot get a real verdict.
+    cidr = None
+    if not a.no_cidr:
+        try:
+            import ipranges as cidr  # noqa: E402
+        except Exception as e:                                          # noqa: BLE001
+            cidr = None
+            cidr_error = f"ipranges.py unavailable: {e}"
+    # Pre-load each operator once, not once per address.
+    cidr_tables: dict[str, dict] = {}
+    if cidr is not None:
+        for _ip, key, _h in ips:
+            op = (cidr.BOT_FILE.get((key or "").lower()) or (None,))[0]
+            if op and op not in cidr_tables:
+                cidr_tables[op] = cidr.load_operator(op)
+
     def _work(item):
         ip, key, hits = item
         suf = bot_verify_suffixes(key) if key else []
-        r = verify_ip(ip, suf)
+        r = verify_ip(ip, suf) if suf else {"ip": ip, "ptr": None, "forward": [],
+                                            "verified": None, "reason": None}
         r["bot"] = key or None
         r["hits"] = hits
         r["verifiable_by_dns"] = bool(suf)
-        if not suf:
-            # This operator publishes IP ranges instead of rDNS. There is no
-            # verdict to give, so do not manufacture one.
-            r["verified"] = None
-            r["reason"] = ("operator publishes IP ranges, not rDNS - no DNS verdict is possible; "
-                           "absence of a PTR is NOT evidence of spoofing here")
+        r["dns"] = {"verified": r["verified"], "reason": r["reason"]} if suf else {
+            "verified": None,
+            "reason": "no documented rDNS suffix for this bot - absence of a PTR proves nothing"}
+        if cidr is not None and key:
+            r["cidr"] = cidr.check(ip, key, tables=cidr_tables)
+        else:
+            r["cidr"] = {"verified": None,
+                         "reason": ("cidr path disabled" if a.no_cidr else
+                                    locals().get("cidr_error", "no bot key to check against"))}
+        r["verifiable_by_cidr"] = r["cidr"].get("operator") is not None
+        r.update(combine_witnesses(r["dns"], r["cidr"]))
         return r
 
     control = resolver_control()
@@ -1321,32 +1464,49 @@ def cmd_verify(a):
         results = list(ex.map(_work, ips))
 
     if not control["ok"]:
-        # The resolver is the instrument. A broken instrument reports UNKNOWN.
+        # The resolver is the instrument for the DNS path. A broken instrument
+        # reports UNKNOWN on that path; the CIDR path does not use it and keeps
+        # its verdict, which is the point of a second witness.
         for r in results:
-            r["verified"] = None
-            r["reason"] = "resolver control FAILED - no verdict is trustworthy in this environment"
+            r["dns"] = {"verified": None,
+                        "reason": "resolver control FAILED - no DNS verdict is trustworthy here"}
+            k = r["cidr"]["verified"]
+            r["verified"] = k
+            r["reason"] = (r["cidr"]["reason"] if k is not None else
+                           "resolver control FAILED and no published range could answer")
 
-    checkable = [r for r in results if r["verifiable_by_dns"]]
+    checkable = [r for r in results if r["verifiable_by_dns"] or r["verifiable_by_cidr"]]
     verified = [r for r in checkable if r["verified"] is True]
     spoofed = [r for r in checkable if r["verified"] is False]
     unknown = [r for r in results if r["verified"] is None]
+    cidr_status = None
+    if cidr is not None:
+        cidr_status = {op: {"readable": t["readable"], "unreadable": t["unreadable"]}
+                       for op, t in cidr_tables.items()}
     print(json.dumps({
-        "ok": control["ok"],
+        "ok": control["ok"] or bool(cidr_tables),
         "resolver_control": control,
+        "cidr_tables": cidr_status,
         "checked": len(results),
-        "dns_verifiable": len(checkable),
+        "dns_verifiable": sum(1 for r in results if r["verifiable_by_dns"]),
+        "cidr_verifiable": sum(1 for r in results if r["verifiable_by_cidr"]),
         "verified": len(verified),
         "spoofed": len(spoofed),
         "unknown": len(unknown),
+        "witnesses_disagree": sum(1 for r in results if r.get("witnesses_disagree")),
         "spoofed_hits": sum(r["hits"] for r in spoofed),
         "results": results,
-        "reading": "Only `dns_verifiable` bots can be proven; the rest publish IP ranges instead "
-                   "and a missing PTR proves nothing about them. A spoofed hit inflates the crawl "
-                   "numbers of whichever bot it impersonated - subtract `spoofed_hits` before "
-                   "concluding anything about crawl budget. If `resolver_control.ok` is false, "
-                   "EVERY verdict is `unknown` and none of them is a finding.",
+        "reading": "Two witnesses per address: reverse+forward DNS (Google, Bing, Yandex, Apple "
+                   "and the SEO tools) and the operator's PUBLISHED IP RANGES (OpenAI, "
+                   "Anthropic, Perplexity, Google, Microsoft - `cidr_tables` says which lists "
+                   "were read). A bot with neither is `unknown`, never spoofed. A spoofed hit "
+                   "inflates the crawl numbers of whichever bot it impersonated - subtract "
+                   "`spoofed_hits` before concluding anything about crawl budget. If "
+                   "`resolver_control.ok` is false the DNS path is silent and only CIDR "
+                   "verdicts stand; if a `cidr_tables` entry has `unreadable` files, that "
+                   "operator's misses are `unknown`, not forgeries.",
     }, indent=2, ensure_ascii=False))
-    if not control["ok"]:
+    if not control["ok"] and not cidr_tables:
         sys.exit(3)
 
 
@@ -1562,13 +1722,16 @@ def main():
     s.add_argument("--max-urls", type=int, default=200000, help="cap on the distinct-URL set held per bot")
     s.set_defaults(fn=cmd_scan)
 
-    s = sub.add_parser("verify", help="reverse+forward DNS - is that really Googlebot?")
+    s = sub.add_parser("verify", help="reverse+forward DNS AND the operator's published IP "
+                                      "ranges - is that really Googlebot / GPTBot / ClaudeBot?")
     s.add_argument("--ip", action="append", help="IP to check. Repeatable.")
     s.add_argument("--scan", help="a scan.json - verifies the top IPs of every bot in it")
     s.add_argument("--bot", action="append", help="restrict --scan to these bots")
     s.add_argument("--assume", help="bot key to check bare --ip values against")
     s.add_argument("--per-bot", type=int, default=3, help="IPs per bot from --scan")
     s.add_argument("--workers", type=int, default=8)
+    s.add_argument("--no-cidr", action="store_true",
+                   help="skip the published-IP-range witness (offline runs)")
     s.set_defaults(fn=cmd_verify)
 
     s = sub.add_parser("urls", help="distinct URL set one bot touched (feeds `gap`)")

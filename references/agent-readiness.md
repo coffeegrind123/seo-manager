@@ -187,3 +187,42 @@ worth checking whenever you touch one:
 - **A blank line ends a record** in legacy parsers (Python's `urllib.robotparser`
   among them), orphaning every rule after it. Keep a group contiguous — a bare `#`
   gives the same visual separation without the break.
+
+## 6. Three signals added 2026-09-20 — all informational, none a finding
+
+Sourced from `marketingskills/ai-seo` 2.5.0, geo-seo-claude's agent-HTTP-checks
+draft, and `dodopayments/dualmark` (prior-art.md, third pass). Each was measured
+before it was written into `agentcheck.py`, and each is reported as a
+capability or a stated intent — **absence is the ordinary web, never a defect**,
+same as WebMCP.
+
+- **Markdown content negotiation.** `GET` the canonical URL with
+  `Accept: text/markdown` and a site can answer with `Content-Type:
+  text/markdown` — the same URL, two representations, no `.md` twin to guess
+  at. Cloudflare's "Markdown for Agents" does it at the edge: measured
+  2026-09-20 on `developers.cloudflare.com`, `text/markdown; charset=utf-8`
+  with `Vary: Accept`. `agentcheck.py page` reports it under
+  `markdown.content_negotiation`. The ONE defect in this area: markdown served
+  **without `Vary: Accept`** can be cached and handed to browsers. It is flagged
+  only when `served_markdown` is true.
+- **RFC 8288 `Link:` headers.** Service discovery in the HTTP response — an API
+  catalogue, an MCP server card, a markdown alternate — readable without parsing
+  HTML. `link_headers` on the page check; the same Cloudflare page carries
+  `</api/>; rel="service-doc"`. A content site with none is normal.
+- **`Content-Signal:` in robots.txt** (Content Signals Policy, contentsignals.org,
+  Cloudflare 2025): `Content-Signal: search=yes, ai-input=no, ai-train=no`
+  inside a group STATES what its agents may do with the content. It is a
+  declaration a crawler may ignore, so `agentcheck.py policy` reports it as
+  `content_signals.declared` — intent, never enforcement — and names the one
+  incoherence worth seeing: `search=no` on a group whose path is `Allow`ed.
+
+**And the verification gap closed the same day.** Every `ai_search` / `ai_user`
+/ `ai_training` row in `BOTS` has an empty rDNS list by rule (§1 above, prior-art
+#9), which meant `crawllog.py verify` could say nothing about the crawlers this
+whole file is about. OpenAI, Anthropic, Perplexity, Google and Bing publish
+their crawler IP ranges in one JSON shape (`ipranges.py`; sources in
+`data-sources.md`), and `verify` now carries that second witness per address —
+`verified` / `spoofed` / `unverifiable`, where *spoofed* requires a list that was
+actually read. `Bravebot` also joined the registry as `search`: Brave's index is
+what Claude's web search reads from, so its absence in the log is a
+precondition failure for a Claude citation, not a content problem.

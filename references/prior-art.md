@@ -450,6 +450,330 @@ guessed — and refused even under `--missing-is-zero`, which is for a sparse ma
 not for a row that does not exist.
 
 
+## Third pass, 2026-09-20 — the seomachine teardown, and a landscape that HAD moved
+
+Re-run with `gh` nineteen days after the second pass, prompted by the owner
+asking for `TheCraigHewitt/seomachine` specifically. Every repo below was
+inspected live (trees, manifests, source where it mattered); star counts are the
+API's that day. Two of the three prior lessons held, and the third did not:
+
+- **The sibling landscape moved this time.** claude-seo 16,046 → 17,258★ (v2.3.1,
+  pushed 09-11), open-seo 16,097 → **19,560★** (pushed 09-20 — a `deslop` skill
+  with the same lineage as ours, MCP cleanup tools, a rewritten audit skill),
+  geolook 648 → 715★ (still nothing pushed since 08-10). A nineteen-day cadence
+  finds movement where a one-day one found none; weekly would still be waste.
+- **Reading somebody else's API map was again worth more than reading their
+  code** — three maps this pass, one of them for a credential this skill
+  already holds (below).
+- **The survey missed a whole tier last time.** `coreyhaines31/marketingskills`
+  — **50,951★ / 7,715 forks**, MIT, the parent of seomachine's 26 vendored
+  skills — was never in this file. Neither were `zubair-trabzada/geo-seo-claude`
+  (10,728★), `TheCraigHewitt/seomachine` (7,452★), `nowork-studio/notfair-plugin`
+  (3,828★), `yaojingang/GEOFlow` (3,664★, **AGPL**, PHP), `AgriciDaniel/claude-blog`
+  (2,202★), `Auriti-Labs/geo-optimizer-skill` (849★), `elmohq/elmo` (341★),
+  `dannwaneri/seo-agent` (50★). The 08-31 search terms were "seo"; the ecosystem
+  had reorganised around "GEO"/"AEO"/"AI SEO" and a search on the old term does
+  not surface it.
+
+### seomachine, torn down
+
+**What it is.** A Claude Code *workspace* for long-form blog production: 24
+slash commands (`/research`, `/write`, `/optimize`, `/cluster`, `/repurpose`,
+`/research-ai-citations`, five `/landing-*`), 11 agents, the 26 marketingskills
+skills vendored under `.claude/skills/`, 23 Python modules under
+`data_sources/modules/`, a WordPress+Yoast REST publisher, and a `context/`
+directory of brand/voice/keyword templates that every command reads. Originally
+Castos's internal tool; `examples/castos/` is the filled-in reference.
+
+**Dependencies.** `data_sources/requirements.txt`: scikit-learn, nltk, textstat,
+beautifulsoup4, google-analytics-data, google-api-python-client, the DataForSEO
+client. Same verdict as every project in §"The finding that decides everything":
+the script layer is cleanroom by necessity. Nothing changes there.
+
+**Where it is behind this skill, specifically.**
+
+- **A composite score at every step**, and the scores absorb missing data.
+  `opportunity_scorer.py` is an 8-factor weighted 0–100 (volume 25%, position
+  20%, intent 20%, competition 15%, cluster 10%, CTR/freshness/trend 5% each)
+  and `scores['cluster_score'] = cluster_value or 50` — a missing input becomes
+  a mid-value and the total is reported without a mark. That is the substitution
+  the Non-negotiables forbid, done inside the arithmetic where a reader cannot
+  see it. `seo_quality_rater.py`, `content_scorer.py`, `landing_page_scorer.py`
+  and the `/optimize` "SEO score (0–100)" are the same shape. `slop.py` emits no
+  score on purpose; this is the counter-example.
+- **`/research-ai-citations` is a template, not an instrument.** Step 3 says to
+  run 10–15 prompts through ChatGPT/Perplexity *by hand*, and: "If AI tools are
+  not available for live testing, note this in the output and proceed with
+  steps 1-2 plus the audit template." Cannot-ask and not-cited are one path, on
+  paper. Nothing is fail-closed anywhere in the repo; no controls exist.
+- **Volume is DataForSEO or nothing.** No free ladder, no Bing Webmaster, no
+  Search Console → candidates seam.
+- **`content_length_comparator.py` reads page 1 for word counts only** —
+  `competitors.py` here reads depth, headings, thin/UGC/stale, subtopics, and
+  refuses to call a bot-challenge "weak".
+
+**Where it carries something this skill does not.** Four things, all in the
+markdown layer or trivially stdlib:
+
+1. **A question-bank taxonomy for answer engines** (`/research-ai-citations`
+   step 1): six prompt classes — direct recommendation, comparison,
+   feature-specific, use-case, pricing/value, migration/switching — crossed with
+   audience, platform and intent modifiers, then clustered. `workflow-geo-scan.md`
+   step 1 says "convert keywords into the questions a real customer would ask";
+   this is the generator that sentence was missing.
+2. **The action half of GEO.** `context/ai-citation-targets.md` (five tiers of
+   citation surfaces with a "Listed?" column), `context/reddit-strategy.md`
+   (comment > post, F5Bot monitoring, three comment shapes), and `/repurpose`
+   (one article → LinkedIn Article, Medium, 2–3 Reddit comment drafts, a Quora
+   answer, each linking back). `geo-scan` measures `gap_domains` and stops;
+   nothing here turns a gap domain into a prospect.
+3. **Invisible Unicode.** `content_scrubber.py` strips U+200B/200C/200D/FEFF and
+   every category-`Cf` code point. `slop.py` has 20 prose rules and no
+   character-level one, and an invisible character is the one tell that is
+   mechanical *and* a defect (it splits words for tokenisers and search).
+4. **`/cluster`** plans a pillar + 8–12 supporting pages with a link matrix and
+   a build order. `sitegraph.py` measures the graph after the fact; nothing here
+   plans one before it.
+
+The WordPress publisher is not applicable — this skill ships PRs.
+
+### `marketingskills/ai-seo` 2.5.0 — the reference worth reading in full
+
+Pushed 2026-09-05, and unlike most of this space its claims carry sources and
+dates. Five things transfer; two must not.
+
+- **The visibility LADDER**: *retrieved → cited → mentioned → recommended*, plus
+  a shadow rung, *recommended-against*. Each is governed by a different system
+  and only the last changes buying behaviour. Lily Ray's 100-query B2B study
+  (spring 2026): self-promotional "best [category]" listicles earned 323 AI
+  Overview citations, and in **224 of them (69%) the answer recommended a
+  competitor instead** — the publisher's own research handed the model the
+  competitor list. `geo.py` measures the *cited* rung and surfaces
+  `sentences_naming_us` for the *mentioned* one; it does not label the framing.
+- **Format volatility.** ChatGPT 5.6 (Aug 2026, Peec AI data via Tomek Rudzki):
+  listicle citations **−50.5%**, comparison-page citations **−32.1%**, with a
+  surge in `site:` and "official" fan-out queries — retrieval moved toward
+  primary sources. Measured on ChatGPT only; Gemini ~60% owned-site citations.
+  This is the `catalogue` deferral class, confirmed from the other side: a
+  list query is not a page this site should write, on ANY engine.
+- **AI answers are non-deterministic.** Run each prompt 3–5 times per engine,
+  report the *rate with its n* ("cited 3/5"), compare rates over time. `geo.py
+  ask` runs once and caches the answer for the cache TTL, so today it reports a
+  coin-flip as a state.
+- **Split the cause before the fix**: *technical* (cannot be crawled or parsed),
+  *comprehension* (described wrongly), *trust* (understood, not selected).
+  `workflow-geo-scan.md` §0 already does the first split; the other two have no
+  home.
+- **Markdown content negotiation and RFC 8288 `Link` headers.** Serve Markdown
+  at the same canonical URL on `Accept: text/markdown` (Cloudflare "Markdown for
+  Agents" does it at the edge — measured live on `www.cloudflare.com` and
+  `developers.cloudflare.com` by geo-seo-claude's PR draft), and advertise
+  parallel resources in a `Link:` header. `dodopayments/dualmark` (105★) is a
+  whole project for the first half. `agentcheck.py page` checks
+  `<link rel="alternate" type="text/markdown">` and probes `<url>.md`; it never
+  sends the `Accept` header and never reads `Link:`.
+
+Two things in the same file to keep OUT: it lists `ClaudeBot` and `anthropic-ai`
+as crawlers to allow "so Claude can cite you" (both are `ai_training`; the citing
+crawler is `Claude-SearchBot` — §1 of `agent-readiness.md`), and it recommends
+publishing `llms.txt` as an action. The evidence table in `agent-readiness.md` §2
+stands; a 50k-star repo repeating the myth does not change the log study.
+
+### Three API maps, one of them for a key this skill already holds
+
+**SerpApi `engine=google_ai_mode` — PROBED LIVE 2026-09-20, with `~/.serpapi_key`.**
+HTTP 200, `search_metadata.status: Success`, and unlike the AI Overview it is
+**single-stage**: `text_blocks` (6), `references` (5) and a
+`reconstructed_markdown` all arrive on the first response. For "how to play
+counter strike 1.6 in browser": Instagram, **play-cs.com ×2**, VPN4Games, DOS
+Zone — combatskirmish.net absent, the same finding as the AI Overview on
+2026-09-01. Google AI Mode is a second answer surface, on the same key, and
+`geo.py` could not ask it. That is the #2 lesson repeated verbatim: "we lack the
+credential" was a remembered constraint that nobody re-checked against the
+credential in hand. (Plan: `free`, 240 of 250 searches left this month.)
+
+**SearchApi.io** (a different company from SerpApi — `dannwaneri/seo-agent`
+keeps the two clients apart for that reason): `GET /api/v1/search?engine=chatgpt|
+gemini|perplexity|bing_copilot&q=` returns `markdown` + `reference_links[]`
+(`chatgpt` needs `web_search=true` or it never cites). One key, four answer
+engines, in the shape `geo.py`'s `_llm_engine` already parses. Unprobed — no key
+here — so it is wired as `no_key`, which is the correct reachable state and not
+a stub, exactly as `perplexity`/`openai` are today.
+
+**Published crawler IP ranges — one JSON shape across five operators.** Every AI
+crawler in `BOTS` has an EMPTY rDNS list by rule (§9: a guessed suffix reports
+every legitimate hit as spoofed), so `crawllog.py verify` can say nothing about
+the crawlers the GEO report is about, and §10's "every Anthropic row is forged"
+was inferred from the multi-operator heuristic rather than checked. Probed
+2026-09-20, all `{"creationTime": ..., "prefixes": [{"ipv4Prefix"|"ipv6Prefix"}]}`:
+
+| operator | file | note |
+|---|---|---|
+| OpenAI | `openai.com/gptbot.json`, `searchbot.json`, `chatgpt-user.json` | three files, one per class — the taxonomy, published |
+| Anthropic | `claude.com/crawling/bots.json` | `creationTime 2026-08-18`; linked from the support article, not from any docs index |
+| Perplexity | `perplexity.ai/perplexitybot.json`, `perplexity-user.json` | `creationTime 2025-02-07` |
+| Google | `developers.google.com/static/crawling/ipranges/{common-crawlers,special-crawlers,user-triggered-fetchers,user-triggered-fetchers-google}.json` | the old `/search/apis/ipranges/` path 301s here — a remembered URL would have read as "Google removed the list" |
+| Bing | `bing.com/toolbox/bingbot.json` | `creationTime 2024-01-03` |
+
+`ipaddress` is stdlib. This is the verification path for exactly the rows whose
+rDNS list must stay empty — and it distinguishes "forged" from "unverifiable"
+per address rather than per operator-count.
+
+**`ai-robots-txt/ai.robots.txt`** — the community UA list, 175 entries against
+our 79; **135 are unknown to `BOTS`**. Most are scrapers that belong in
+`ai_training` by the §9 rule (a wrong guess must not inflate `ai_search`), but
+several are documented answer-engine indexers and matter for the GEO reading:
+`Bravebot` (Brave Search is Claude's search backend — being in that index is a
+precondition for a Claude citation, and it is not in the table),
+`meta-webindexer`, `MistralAI-Index`, `Kimi-SearchBot`/`Kimi-User`,
+`Amzn-SearchBot`/`Amzn-User`, `ExaSearchBot`, `Andibot`, `PhindBot`,
+`GoogleAgent-Mariner`, `Gemini-Deep-Research`, `Google-NotebookLM`,
+`ChatGPT Agent`/`Operator`, `kagi-fetcher`, `DeepSeekBot`, `QwenBot`/`TongyiBot`,
+`ERNIEBot`/`YiyanBot`, `DoubaoBot`, `Claude-Web` (undocumented — Anthropic's
+page does not list it).
+
+**Smaller maps.** `FlorianBruniaux/google-search-console-mcp` (61 tools) is a
+list of GSC-derived analyses, and every one is already here except
+`ai_overviews_impact` — CTR-at-position on queries with an AI Overview against
+those without, which needs `drift.py`'s `ai_overview.present` joined to
+`gsc.py query` rows. `claude-seo` (v2.3.1) carries four scripts worth knowing
+and not porting: `keyword_planner.py` (Google Ads Keyword Planner — real Google
+volume, but a developer token and a manager account, and **bucketed ranges
+without ad spend**), `lcp_subparts.py` (CrUX has exposed LCP's four sub-metrics
+— TTFB, resource load delay, load duration, render delay — since January 2025;
+`vitals.py origin` reads CrUX and does not decompose LCP), `commoncrawl_graph.py`
+(host-level PageRank + harmonic centrality from the quarterly web graph,
+keyless — a third independent authority read after Open PageRank and Tranco,
+at the price of a multi-GB download), and `content_verify.py` (claims in a
+draft — `47% of`, `$3.2 billion`, `according to a Stanford study` — with no
+citation marker within 200 characters). `goenning/google-indexing-script`
+(7,706★) is the Indexing API, which Google restricts to `JobPosting` and
+`BroadcastEvent` pages; it is not a lever for ordinary URLs and abuse revokes
+access, so `indexnow.py`'s "the Google half is a human clicking a button"
+stays true.
+
+**open-seo `deslop` vs `slop.py`.** Its `structures.md`/`tropes.md` catalog and
+our 20 rules overlap almost entirely; three regex-able patterns are missing
+here: **anaphora** (three or more consecutive sentences opening on the same
+words), **false ranges** ("from X to Y to Z" where nothing lies between), and
+**invented concept labels** ("the supervision paradox", "the acceleration trap"
+— an abstract problem-noun bolted to a domain word and used as if defined).
+
+### Ranked, from this pass — ✅ ALL BUILT 2026-09-20
+
+Everything below is stdlib and keyless unless it says otherwise; nothing needs
+an install. Ordered by how much of the program's current reading it changes.
+Built the same day, in this order; `controls.py audit` reads 32 of 32
+instruments, 623 checks, and `run_tests.py` 19 of 19 suites. What each one
+found on contact with live data is under its entry.
+
+- **✅ #14 — `geo.py`: the surfaces it could already reach.** Live: AI Mode
+  answered the site's core query with play-cs.com ×2, dos.zone, Instagram,
+  VPN4Games — combatskirmish.net absent, the AI Overview finding repeated on a
+  second surface. `--runs` forced a rewrite of the sweep arithmetic (a run is
+  an answer, so share-of-voice stays ≤ 1.0 by construction), and `seostate.py
+  record-ai` / `ai-visibility` now store `runs`/`cited_runs`/`mentioned` and
+  compute the rate over answers that existed — the old `cited / queries`
+  counted questions with no answer surface in the denominator, the exact
+  error `geo.py` had already fixed one layer down. `google_ai_mode`
+  engine on the existing SerpApi key (measured working); a `searchapi` provider
+  for `chatgpt`/`gemini`/`perplexity`/`bing_copilot` (`no_key` until one exists);
+  `--runs N` sampling with the citation *rate and n* reported, cache bypassed
+  for repeat runs; ladder fields — `cited`, `mentioned` (from
+  `sentences_naming_us`), and the verbatim framing sentence left for a human,
+  never auto-labelled "recommended". Controls: a rate with n=1 is reported as a
+  single observation, not a rate; a run set where every attempt was `cannot_ask`
+  refuses.
+- **✅ #15 — `crawllog.py verify` by published CIDR.** All eleven files read
+  live (2,488 prefixes). Googlebot `66.249.66.1`: both witnesses agree. A
+  known Anthropic address verifies, `8.8.8.8` claiming ClaudeBot is spoofed,
+  and the combination is a pure function with its own six-way control. Fetch the operator files
+  above (cached with their `creationTime`), match with `ipaddress`, and give
+  every AI-crawler row a direct `verified`/`spoofed`/`unverifiable` per address
+  instead of the operator-count inference. Controls in both directions: an
+  address inside a published prefix verifies, `8.8.8.8` claiming GPTBot does
+  not, and an operator with no published list is `unverifiable`, never
+  `spoofed`. The `.googlebot.com` rDNS path stays for Google and Bing; CIDR is
+  a second witness there, not a replacement.
+- **✅ #16 — `BOTS`: the documented answer-engine crawlers.** 79 → 107 rows.
+  A new structural control derives from the table: no earlier key may be a
+  substring of a later one, because `classify_ua` takes the first match and a
+  shadowed row is unreachable forever — nothing had ever checked that. Add the named
+  indexers and fetchers above with the class the operator documents, rDNS
+  lists empty, and `Bravebot` as `search` with a note that it is the Claude
+  index. Everything undocumented from the community list goes to
+  `ai_training`, which is the bucket that does not imply a citation. The
+  taxonomy control derives from `BOTS`, so growth cannot read as regression.
+- **✅ #17 — `agentcheck.py`: three signals it did not send or read.** The
+  known-positive control is live: `developers.cloudflare.com` answers
+  `Accept: text/markdown` with `text/markdown; charset=utf-8` and `Vary:
+  Accept`, and carries `</api/>; rel="service-doc"`.
+  `Accept: text/markdown` on the page URL (report `Content-Type`, and `Vary`);
+  the response `Link:` header parsed per RFC 8288; and in `policy`, the
+  `Content-Signal:` robots.txt directive (Cloudflare's `search`/`ai-input`/
+  `ai-train` content-usage declaration) reported as stated policy. All three
+  are informational — absence is never a finding, same as WebMCP.
+- **✅ #18 — `slop.py`: four rules.** 24 in the catalog. The structural two
+  needed their own firing path; the invisible-character rule is `high` because
+  it is a defect, and its exclusions are by context (script, neighbours), so a
+  format character the rule has never met still fires. `invisible_unicode` (category `Cf`,
+  located by code point, with the emoji-ZWJ and Persian/Indic ZWNJ cases
+  excluded by script so the rule cannot fire on legitimate text),
+  `anaphora`, `false_range`, `invented_label`. Each with its own control in both
+  directions, as `binary_contrast` has.
+- **✅ #19 — `factcheck.py claims`.** The citation-proximity rule was wrong
+  twice while its control was being written: centre-distance attached a
+  paragraph's second claim to the first claim's source, and the fallback then
+  borrowed the previous sentence's link — both turning an *uncited* claim into
+  a `not_in_source` against the wrong page. Now: the nearest link AFTER the
+  claim in the same sentence (or an immediate footnote), else a link before it
+  in the same sentence, else uncited. Live on a deliberately mis-cited draft:
+  `0.1%` cited to Google's AI guide came back `not_in_source` from 24,866
+  characters of read page, which is the finding the instrument exists for. The instrument the Non-negotiable "a source
+  you cannot cite, you have not verified" has never had: extract the numeric
+  and authority claims from a DRAFT, report every one without a citation marker
+  nearby, and with `--fetch` open each cited URL and check the claimed number
+  actually appears in the source text. A fetch that fails is `unverified`,
+  never `false`; a number absent from a page that was read is the finding.
+  Control: a known-true claim against a fixture page passes, a fabricated one
+  fails, and an unreachable source refuses.
+- **✅ #20 — `workflow-geo-scan.md`.** The six-class question-bank generator in
+  step 1; rates-with-n in steps 2–3 and 5; the ladder in the report (cited /
+  mentioned / framing verbatim); the technical–comprehension–trust split before
+  any content is proposed; and a **presence step** that reads `gap_domains`
+  and files the recurring ones as `seostate.py prospect-add` rows — the action
+  half seomachine has and this skill measures without acting on. Repurposing
+  copy (LinkedIn/Medium/Reddit) stays out: it is owner-voice work and the
+  quality bar's security rule keeps agents off third-party posting surfaces.
+- **✅ #21 — `vitals.py origin --subparts`.** Built and then found
+  `no_key` on this install: the CrUX API answers the service-account bearer
+  PSI accepts with **HTTP 400 "invalid argument"** on a correct request, and
+  only an unauthenticated call says "use an API key". The 400 is the trap —
+  it reads as a bad request and is a missing credential — so the script
+  reports `no_key` with the measured reason instead of letting the status
+  through. `data-sources.md`'s "the CrUX API is moot" was half right and is
+  corrected. The four LCP sub-metrics from CrUX,
+  so "LCP 4.2s" becomes "TTFB 1.1s, render delay 2.4s". Needs the PSI
+  credential `origin` already needs; reports `unavailable` when CrUX has no
+  record, as it does now.
+- **✅ #22 — `references/data-sources.md`.** Entries for SearchApi.io, SerpApi AI
+  Mode, the five IP-range files, Keyword Planner (mapped, not built: bucketed
+  without spend), the Common Crawl web graph (mapped, not built: the download),
+  and the Indexing API (not a lever; say why).
+- **✅ #23 — `quality-bar.md` / `workflow-build-guide.md`.** Plus a CLAIMS
+  CHECK step in build-guide §9, before the sameness gate.
+  The ChatGPT 5.6 format shift belongs next to the `catalogue` class and next
+  to the archetype rotation: a listicle archetype is a human-conversion shape,
+  not a citation play, and the report may not claim otherwise.
+
+Not taken, with the reason: `/cluster`-style pillar planning (the research
+ladder already works one FACET at a time and `sitegraph.py silos` measures the
+result; a planning layer on top would be a second queue), Common Crawl web
+graph (a multi-GB quarterly download for a third authority read that Open
+PageRank and Tranco already triangulate), Keyword Planner (a manager account
+and a developer token for bucketed ranges), and every composite score.
+
+
 ---
 
 ## Ranked gaps

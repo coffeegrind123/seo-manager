@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import collections
 import re
 import sys
 import urllib.parse
@@ -155,6 +156,65 @@ def run_control() -> dict:
             len(_coverage("", titles)["gaps"]) == len(titles))
     c.check("matching_is_case_insensitive",
             _coverage("RECOIL", ["Recoil control"])["gaps"] == [])
+
+    # --- claims: extraction, citation proximity, and the three verification states
+    draft = ("Intro. According to the Stanford Report, 47% of marketers ship late "
+             "[source](https://good.example/s). Revenue reached $3.2 billion last year "
+             "[report](https://good.example/r). Uptime was 99.5% "
+             "[dead](https://dead.example/x). " + ("Filler sentence here. " * 12) +
+             "\n\nA far-away claim: 12 percent of teams churn. " + ("More filler. " * 20) +
+             "\n\n```\nrate = '88%'\n```\n`inline 77%` too.")
+    claims = extract_claims(draft)
+    texts = [x["text"] for x in claims]
+    c.check("a_percentage_is_a_claim", "47%" in texts, str(texts))
+    c.check("a_named_source_is_a_claim",
+            any(x["kind"] == "authority" and x["named_source"] == "Stanford Report" for x in claims))
+    c.check("a_number_inside_a_code_block_is_not_a_claim", "88%" not in texts)
+    c.check("a_number_inside_inline_code_is_not_a_claim", "77%" not in texts)
+    c.check("a_claim_near_a_link_is_cited",
+            next(x for x in claims if x["text"] == "47%")["citation"] == "https://good.example/s")
+    c.check("a_claim_far_from_any_link_is_uncited",
+            next(x for x in claims if x["text"] == "12 percent")["citation"] is None)
+    c.check("a_previous_sentences_link_is_not_borrowed",
+            extract_claims("Per [x](https://a.example/) it rained. Sales rose 41% after. " * 3)
+            [0]["citation"] is None,
+            "a link that closed the previous sentence is not this claim's citation")
+    c.check("a_footnote_right_after_the_full_stop_still_counts",
+            extract_claims("Sales rose 41%.[^1] Then more prose followed here. " * 3)
+            [0]["citation"] == "[^1]")
+    c.check("a_same_sentence_link_before_the_claim_still_counts",
+            extract_claims("[Gartner](https://a.example/) puts churn at 41% overall. " * 3)
+            [0]["citation"] == "https://a.example/")
+    c.check("a_bare_year_is_not_a_quantity_claim",
+            "2025" not in [x["text"] for x in extract_claims("In 2025 we shipped. " * 10)])
+
+    pages = {
+        "https://good.example/s": {"status": 200, "body": ("<html><body>" + "x " * 100 +
+                                   "The Stanford Report shows 47% of marketers ship late."
+                                   "</body></html>").encode()},
+        "https://good.example/r": {"status": 200, "body": ("<html><body>" + "y " * 100 +
+                                   "Revenue reached $2.9 billion.</body></html>").encode()},
+        "https://dead.example/x": {"status": 404, "body": b"", "error": "HTTP 404"},
+    }
+
+    class _R(dict):
+        def text(self):
+            return (self.get("body") or b"").decode()
+    verify_claims(claims, fetch=lambda u: _R(pages.get(u) or {"status": None, "error": "no route"}))
+    st = {x["text"]: x["verification"]["state"] for x in claims}
+    c.check("a_number_present_in_the_cited_page_verifies", st.get("47%") == "verified", str(st))
+    c.check("a_named_source_present_in_the_page_verifies",
+            st.get("According to the Stanford Report") == "verified")
+    c.check("a_number_absent_from_a_read_page_is_not_in_source",
+            st.get("$3.2 billion") == "not_in_source")
+    c.check("an_unreachable_source_is_unverified_never_false", st.get("99.5%") == "unverified")
+    c.check("an_uncited_claim_stays_uncited", st.get("12 percent") == "uncited")
+    c.check("the_three_verification_states_are_distinct",
+            len({st.get("47%"), st.get("$3.2 billion"), st.get("99.5%")}) == 3)
+    c.check("each_source_is_fetched_once",
+            len(verify_claims(claims, fetch=lambda u: _R(pages[u]))) == 3)
+    c.check("a_thousands_separator_does_not_hide_a_match",
+            "3200" in _norm_number("3,200") and "47%" in _norm_number("47%"))
     return c.verdict(note="the matcher is proven offline; whether OpenAlex/Crossref/"
                           "Wikipedia ANSWER is a separate question - `providers.py status` "
                           "is the live probe for that")
@@ -266,6 +326,218 @@ def cmd_coverage(a):
     }
 
 
+# -------------------------------------------------------------------- claims
+# The instrument behind the Non-negotiable "a source you cannot cite, you have
+# not verified". `sources` hands out candidates; nothing checked that a number
+# the draft went on to state is actually IN the page the draft cites for it.
+# Mapped from `claude-seo/scripts/content_verify.py` (claim extraction with a
+# citation-proximity check), and extended with the half that matters: `--fetch`
+# opens each cited source and looks for the claimed number in its text.
+#
+# THREE STATES per cited claim, never two:
+#   verified          the number (or the named source) appears in the fetched page
+#   not_in_source     the page was READ and the number is not in it - the finding
+#   unverified        the page could not be fetched or yielded no text - unknown
+# A fetch failure is not a false claim. Collapsing it would make every dead link
+# a fabrication and every paywall a lie.
+
+_CLAIM_PATTERNS = [
+    ("statistic", re.compile(r"\b\d+(?:[.,]\d+)?\s*(?:%|percent\b|per cent\b)", re.I)),
+    ("money", re.compile(r"[$\u20ac\u00a3]\s?\d+(?:[.,]\d+)*\s*(?:million|billion|trillion|[kmb])?\b",
+                         re.I)),
+    ("quantity", re.compile(r"\b\d+(?:[.,]\d+)?\s*(?:million|billion|trillion|thousand)\b", re.I)),
+    ("quantity", re.compile(r"\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b")),
+    ("comparative", re.compile(r"\b(?:\d+(?:\.\d+)?x|twice|three times|ten times)\s+"
+                               r"(?:as\s+\w+|more|less|faster|slower|higher|lower|larger|smaller)\b",
+                               re.I)),
+    ("authority", re.compile(r"\b(?i:according to)\s+(?:(?i:a|an|the)\s+)?"
+                             r"([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,4})", re.U)),
+    ("authority", re.compile(r"\b([A-Z][\w&.-]*(?:\s+[A-Z][\w&.-]*){0,3})\s+"
+                             r"(?:reports?|found|estimates?|measured|says|said|shows?)\s+that\b")),
+]
+_LINK = re.compile(r"\[[^\]]*\]\((https?://[^)\s]+)\)|<?(https?://[^\s)>\]]+)>?|\[\^?\d+\]")
+_CODE = [re.compile(r"(?s)```.*?```"), re.compile(r"(?s)~~~.*?~~~"), re.compile(r"`[^`\n]*`")]
+CITATION_WINDOW = 200
+_NUM = re.compile(r"\d+(?:[.,]\d+)?")
+_TAGS = re.compile(r"(?s)<(script|style|noscript)[^>]*>.*?</\1>|<[^>]+>")
+
+
+def _blank_code(text: str) -> str:
+    out = text
+    for rx in _CODE:
+        out = rx.sub(lambda m: re.sub(r"\S", " ", m.group(0)), out)
+    return out
+
+
+def extract_claims(text: str) -> list[dict]:
+    """Verifiable claims in prose, each with the nearest citation marker."""
+    masked = _blank_code(text)
+    lines = [0]
+    for ln in masked.splitlines():
+        lines.append(lines[-1] + len(ln) + 1)
+
+    def line_of(off):
+        lo, hi = 0, len(lines) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if lines[mid] <= off:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo + 1
+
+    links = [(m.start(), m.end(), m.group(1) or m.group(2) or m.group(0))
+             for m in _LINK.finditer(masked)]
+    seen, claims = set(), []
+    for kind, rx in _CLAIM_PATTERNS:
+        for m in rx.finditer(masked):
+            span = (m.start(), m.end())
+            if any(a <= span[0] < b for a, b in seen):
+                continue
+            # a bare year is a date, not a claim
+            frag = m.group(0)
+            if kind == "quantity" and re.fullmatch(r"(?:19|20)\d\d", frag.strip()):
+                continue
+            seen.add(span)
+            # A citation FOLLOWS its claim by convention, so the nearest link
+            # after the claim wins; a link before it is the fallback. Measured
+            # while writing the control: a centre-distance rule attached the
+            # second claim in a paragraph to the FIRST claim's source.
+            def _same_sentence_after(a):
+                gap = masked[m.end():a]
+                return (not re.search(r"[.!?\n]", gap)) or re.fullmatch(r"[.!?\s]{0,3}", gap)
+            after = sorted((a - m.end(), url) for a, b, url in links
+                           if m.end() <= a <= m.end() + CITATION_WINDOW
+                           and _same_sentence_after(a))
+            # ...and only within the SAME sentence: a link that closed the
+            # previous sentence is that sentence's citation, and borrowing it
+            # turns an uncited claim into a not_in_source against the wrong page.
+            before = sorted((m.start() - b, url) for a, b, url in links
+                            if m.start() - CITATION_WINDOW <= b <= m.start()
+                            and not re.search(r"[.!?\n]", masked[b:m.start()]))
+            near = after or before
+            ctx = masked[max(0, m.start() - 80):m.end() + 80]
+            claims.append({
+                "kind": kind, "text": re.sub(r"\s+", " ", frag).strip(),
+                "line": line_of(m.start()), "offset": m.start(),
+                "context": re.sub(r"\s+", " ", ctx).strip(),
+                "named_source": (m.group(1).strip() if kind == "authority" and m.groups() else None),
+                "numbers": _NUM.findall(frag),
+                "citation": (near[0][1] if near else None),
+                "citation_is_url": bool(near and near[0][1].startswith("http")),
+            })
+    claims.sort(key=lambda c: c["offset"])
+    return claims
+
+
+def _norm_number(n: str) -> set[str]:
+    """The spellings a page might use for one number. `47%` ~ `47 percent`,
+    `3,200` ~ `3200`, `3.2` stays `3.2`. Deliberately small - the goal is to
+    not miss an honest restatement, not to accept any digit on the page."""
+    bare = n.replace(",", "")
+    out = {n, bare}
+    if "." in bare and bare.endswith("0"):
+        out.add(bare.rstrip("0").rstrip("."))
+    return out
+
+
+def _page_text(r) -> str:
+    body = r.text() if hasattr(r, "text") else ""
+    return re.sub(r"\s+", " ", html_unescape(_TAGS.sub(" ", body)))
+
+
+def html_unescape(s: str) -> str:
+    import html
+    return html.unescape(s)
+
+
+def verify_claims(claims: list[dict], *, fetch=None, timeout: int = 25) -> dict:
+    """Open each cited URL ONCE and look for the claim's numbers / named source."""
+    fetch = fetch or (lambda u: http(u, timeout=timeout, retries=1,
+                                     ua="Mozilla/5.0 (compatible; seo-manager/1.0)"))
+    pages: dict[str, dict] = {}
+    for c in claims:
+        url = c.get("citation") if c.get("citation_is_url") else None
+        if not url:
+            c["verification"] = {"state": "uncited", "reason": "no citation within "
+                                                               f"{CITATION_WINDOW} chars"}
+            continue
+        if url not in pages:
+            r = fetch(url)
+            ok = bool(r) and r.get("status") == 200
+            text = _page_text(r) if ok else ""
+            pages[url] = {"status": r.get("status") if r else None, "ok": ok,
+                          "text": text, "chars": len(text),
+                          "error": None if ok else (r.get("error") if r else "no response")}
+        pg = pages[url]
+        if not pg["ok"] or pg["chars"] < 200:
+            c["verification"] = {"state": "unverified", "url": url,
+                                 "reason": (f"source could not be read (HTTP {pg['status']}, "
+                                            f"{pg['error'] or pg['chars']} chars) - UNKNOWN, "
+                                            f"not false")}
+            continue
+        low = pg["text"].lower()
+        if c["kind"] == "authority" and c.get("named_source"):
+            hit = c["named_source"].lower() in low
+            c["verification"] = {"state": "verified" if hit else "not_in_source", "url": url,
+                                 "reason": (f"named source {c['named_source']!r} "
+                                            f"{'appears' if hit else 'does not appear'} in the page")}
+            continue
+        nums = c.get("numbers") or []
+        if not nums:
+            c["verification"] = {"state": "unverified", "url": url,
+                                 "reason": "claim carries no number to look for"}
+            continue
+        missing = [n for n in nums if not any(v in low for v in _norm_number(n))]
+        c["verification"] = {"state": "verified" if not missing else "not_in_source",
+                             "url": url,
+                             "reason": ("every number appears in the source text" if not missing
+                                        else f"{missing} not found in {pg['chars']} chars of source "
+                                             f"text - the page was READ; this is the finding")}
+    return pages
+
+
+def cmd_claims(a):
+    try:
+        text = Path(a.draft).read_text(encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "check": "factcheck-claims", "error": f"cannot read draft: {e}"}
+    if len(_blank_code(text).split()) < 50:
+        return {"ok": False, "check": "factcheck-claims", "control_failed": True,
+                "reason": "draft has under 50 words of prose - nothing to check, and a clean "
+                          "report here would read as 'every claim verified'"}
+    claims = extract_claims(text)
+    pages = verify_claims(claims) if a.fetch else {}
+    if not a.fetch:
+        for c in claims:
+            c["verification"] = ({"state": "uncited", "reason": "no citation within "
+                                                                f"{CITATION_WINDOW} chars"}
+                                 if not c.get("citation") else
+                                 {"state": "cited_unchecked",
+                                  "reason": "pass --fetch to open the source and look for the number"})
+    states = collections.Counter(c["verification"]["state"] for c in claims)
+    return {
+        "ok": True, "check": "factcheck-claims", "draft": a.draft,
+        "claims": len(claims),
+        "by_state": dict(states),
+        "uncited": [c for c in claims if c["verification"]["state"] == "uncited"],
+        "not_in_source": [c for c in claims if c["verification"]["state"] == "not_in_source"],
+        "unverified": [c for c in claims if c["verification"]["state"] == "unverified"],
+        "verified": [{"text": c["text"], "line": c["line"], "url": c["verification"].get("url")}
+                     for c in claims if c["verification"]["state"] == "verified"],
+        "cited_unchecked": [{"text": c["text"], "line": c["line"], "citation": c["citation"]}
+                            for c in claims if c["verification"]["state"] == "cited_unchecked"],
+        "sources_fetched": {u: {k: v for k, v in p.items() if k != "text"} for u, p in pages.items()},
+        "reading": ("`uncited` is the work list the information-gain rule already implies. "
+                    "`not_in_source` is the one that matters: the cited page was READ and the "
+                    "number is not there - either the citation is wrong or the number is. "
+                    "`unverified` is UNKNOWN (dead link, paywall, JS-only page), never a "
+                    "finding against the claim. A number can be restated ('47 percent', "
+                    "'0.47') in ways this does not recognise - open the page before calling "
+                    "a not_in_source a fabrication. No score, on purpose."),
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -298,6 +570,13 @@ def main():
     c.add_argument("--limit", type=int, default=20)
     c.add_argument("--lang", default="en")
     c.set_defaults(fn=cmd_coverage)
+
+    k = sub.add_parser("claims", help="numeric/authority claims in a draft: uncited ones, "
+                                      "and with --fetch whether the cited page carries the number")
+    k.add_argument("--draft", required=True)
+    k.add_argument("--fetch", action="store_true",
+                   help="open every cited URL once and look for the claimed number in its text")
+    k.set_defaults(fn=cmd_claims)
 
     a = p.parse_args()
     out = a.fn(a)

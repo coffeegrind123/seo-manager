@@ -99,7 +99,63 @@ def parse_robots(text: str) -> list[dict]:
                 continue          # directive before any user-agent: ignored
             expecting_agent = False
             cur["rules"].append((field, value))
+        elif field == "content-signal":
+            # Content Signals Policy (contentsignals.org, Cloudflare, 2025):
+            # `Content-Signal: search=yes, ai-input=no, ai-train=no` inside a
+            # group STATES what the group's agents may do with the content. It
+            # is a declaration, not an access rule - a crawler may ignore it -
+            # so it is reported as stated policy and never scored.
+            if cur is None:
+                continue
+            expecting_agent = False
+            cur.setdefault("content_signal", {}).update(parse_content_signal(value))
     return groups
+
+
+CONTENT_SIGNAL_KEYS = ("search", "ai-input", "ai-train")
+
+
+def parse_content_signal(value: str) -> dict:
+    out = {}
+    for part in value.split(","):
+        k, _, v = part.strip().partition("=")
+        k, v = k.strip().lower(), v.strip().lower()
+        if k in CONTENT_SIGNAL_KEYS and v in ("yes", "no"):
+            out[k] = (v == "yes")
+    return out
+
+
+def parse_link_header(value: str) -> list[dict]:
+    """RFC 8288 `Link:` -> [{url, rel, type, ...}]. Commas inside quoted
+    parameters are respected; a malformed segment is skipped, not fatal."""
+    out = []
+    if not value:
+        return out
+    # split on commas that are outside <...> and outside quotes
+    segs, buf, depth, quoted = [], [], 0, False
+    for ch in value:
+        if ch == '"':
+            quoted = not quoted
+        elif ch == "<" and not quoted:
+            depth += 1
+        elif ch == ">" and not quoted:
+            depth = max(0, depth - 1)
+        if ch == "," and not quoted and depth == 0:
+            segs.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        segs.append("".join(buf))
+    for seg in segs:
+        m = re.match(r'\s*<([^>]*)>\s*(.*)$', seg)
+        if not m:
+            continue
+        row = {"url": m.group(1)}
+        for pm in re.finditer(r';\s*([A-Za-z0-9*_-]+)\s*=\s*("([^"]*)"|([^;,\s]+))', m.group(2)):
+            row[pm.group(1).lower()] = pm.group(3) if pm.group(3) is not None else pm.group(4)
+        out.append(row)
+    return out
 
 
 def _match_len(pattern: str, path: str) -> int:
@@ -215,6 +271,33 @@ def run_control() -> dict:
     c.check("an_empty_robots_allows_rather_than_denies",
             allowed(empty, "GPTBot", "/")["allowed"] is True,
             "an empty or unreachable robots.txt must never read as a site-wide block")
+
+    # Content Signals: parsed per group, stated not enforced, garbage ignored.
+    cs = parse_robots("User-agent: *\nContent-Signal: search=yes, ai-input=no, AI-Train=No\n"
+                      "Allow: /\n\nUser-agent: GPTBot\nDisallow: /\n")
+    c.check("content_signal_is_captured_on_its_group",
+            cs[0].get("content_signal") == {"search": True, "ai-input": False, "ai-train": False},
+            str(cs[0].get("content_signal")))
+    c.check("content_signal_does_not_leak_to_the_next_group", "content_signal" not in cs[1])
+    c.check("content_signal_does_not_change_access",
+            allowed(cs, "GPTBot", "/")["allowed"] is False
+            and allowed(cs, "SomeUnknownBot", "/")["allowed"] is True)
+    c.check("an_unknown_signal_key_or_value_is_ignored",
+            parse_content_signal("bogus=yes, search=maybe, ai-train=no") == {"ai-train": False})
+    c.check("a_signal_before_any_group_is_ignored",
+            not any(g_.get("content_signal") for g_ in parse_robots("Content-Signal: search=no\n")))
+
+    # RFC 8288 Link: quoted commas survive, params are lower-cased, junk is skipped.
+    lk = parse_link_header('<https://x.example/api>; rel="service-desc"; type="application/json", '
+                           '<https://x.example/p.md>; rel="alternate"; type="text/markdown", '
+                           '<https://x.example/q>; title="a, b"; rel=next, garbage')
+    c.check("link_header_splits_on_unquoted_commas_only",
+            [x["url"] for x in lk] == ["https://x.example/api", "https://x.example/p.md",
+                                       "https://x.example/q"], str(lk))
+    c.check("link_header_keeps_a_quoted_comma_inside_a_param", lk[2].get("title") == "a, b")
+    c.check("link_header_reads_rel_and_type", lk[1]["rel"] == "alternate"
+            and lk[1]["type"] == "text/markdown")
+    c.check("an_empty_link_header_is_an_empty_list", parse_link_header("") == [])
     return c.verdict(groups_parsed=len(g))
 
 
@@ -357,6 +440,23 @@ def check_policy(origin: str, path: str = "/") -> dict:
                 f"`{bad}:` in robots.txt is ignored by Google",
                 f"Use a meta robots tag or an X-Robots-Tag header for {bad}."))
 
+    # Stated content-usage policy (Content Signals). Reported, never scored: it
+    # is a declaration crawlers may ignore, so it is evidence of INTENT and of
+    # nothing else. A `search=no` next to an `Allow: /` is the one thing worth
+    # naming - the site says "do not surface me" to the crawlers it lets in.
+    content_signals = [{"agents": g["agents"], "signals": g["content_signal"]}
+                       for g in groups if g.get("content_signal")]
+    for cs in content_signals:
+        if cs["signals"].get("search") is False and any(
+                allowed(groups, a if a != "*" else "SomeUnknownBot", path)["allowed"]
+                for a in cs["agents"]):
+            findings.append(_finding(
+                "info", "content_signal_search_no_but_allowed",
+                f"group {cs['agents']} declares search=no while the path is Allowed - "
+                f"a stated wish not to be surfaced, which a crawler may honour or not",
+                "If exclusion is the intent, Disallow is the enforceable instruction."))
+            break
+
     findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 9), f["rule"]))
     return {
         "ok": True, "check": "agent-policy", "robots_url": url, "status": 200,
@@ -365,6 +465,12 @@ def check_policy(origin: str, path: str = "/") -> dict:
                     else "warn" if findings else "pass"),
         "summary": summary, "category_meaning": CATEGORY_MEANING,
         "bots": rows, "sitemaps": sitemaps, "findings": findings,
+        "content_signals": {
+            "declared": content_signals,
+            "status": "Content Signals Policy (contentsignals.org) - a stated policy on "
+                      "search / ai-input / ai-train that crawlers MAY ignore; absence is "
+                      "not a finding and presence is not enforcement",
+        },
         "note": "Resolved with Google's precedence rules: the most specific User-agent "
                 "group wins, then the longest matching path rule, ties to Allow. "
                 "Consecutive User-agent lines share one rule block.",
@@ -562,6 +668,21 @@ def check_page(url: str) -> dict:
     md = http(md_url, timeout=15, ua=BROWSER_UA)
     md_available = (md.get("status") == 200
                     and "html" not in (md.get("ctype") or "").lower())
+    # CONTENT NEGOTIATION: the same canonical URL asked for `text/markdown`.
+    # Cloudflare's "Markdown for Agents" answers this at the edge (measured on
+    # www.cloudflare.com and developers.cloudflare.com, 2026-09), and dualmark
+    # / aeo.js do it in the framework. Reported as a capability; a site that
+    # serves HTML here is ordinary, not deficient.
+    neg = http(url, timeout=20, ua=BROWSER_UA,
+               headers={"Accept": "text/markdown, text/html;q=0.5"})
+    neg_ctype = (neg.get("ctype") or "").lower()
+    neg_headers = neg.get("headers") or {}
+    negotiated_md = (neg.get("status") == 200 and neg_ctype.startswith("text/markdown"))
+    vary = (neg_headers.get("vary") or (r.get("headers") or {}).get("vary") or "")
+    # RFC 8288 Link headers on the ORIGINAL response - service discovery for
+    # agents (API catalogue, MCP server card, a markdown twin) without parsing
+    # the HTML. Zero extra requests.
+    links = parse_link_header((r.get("headers") or {}).get("link", ""))
 
     findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 9), f["rule"]))
     return {
@@ -575,7 +696,22 @@ def check_page(url: str) -> dict:
         "structure": {"landmarks": landmarks, "forms": len(forms), "inputs": len(inputs),
                       "images": len(imgs), "images_without_alt": len(noalt)},
         "markdown": {"alternate_link": bool(md_link), "dot_md_url": md_url,
-                     "dot_md_available": md_available},
+                     "dot_md_available": md_available,
+                     "content_negotiation": {
+                         "requested": "Accept: text/markdown, text/html;q=0.5",
+                         "status": neg.get("status"),
+                         "content_type": neg_ctype or None,
+                         "served_markdown": negotiated_md,
+                         "vary_includes_accept": "accept" in vary.lower(),
+                         "note": ("served_markdown=true is a capability worth noting; "
+                                  "false is the ordinary web, not a defect. A markdown "
+                                  "response WITHOUT `Vary: Accept` can be cached and "
+                                  "served to browsers - that IS a defect, and only "
+                                  "applies when served_markdown is true"),
+                     }},
+        "link_headers": {"count": len(links), "links": links[:20],
+                         "status": "RFC 8288 service discovery - informational; absence "
+                                   "is the norm on a content site"},
         "webmcp": {"forms_with_tools": len(webmcp_forms), "js_api_referenced": webmcp_js,
                    "status": "proposed standard, Chrome origin trial - absence is an "
                              "opportunity, never a defect"},

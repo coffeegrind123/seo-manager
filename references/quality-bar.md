@@ -132,6 +132,17 @@ it must say WHICH of these it is, because each implies a different ACTION:
 | `dev_intent` | page 1 is docs / dev Q&A; the searcher is building something | none; recorded so the next run does not re-spend the check | never |
 | `off_remit` | the product cannot honestly be the answer | none, ever — the remit test is not DR-relative | never |
 
+**The `catalogue` class has evidence from the answer-engine side too.** ChatGPT
+5.6 (Aug 2026, Peec AI data via Tomek Rudzki and Lily Ray) cut listicle
+citations by **50.5%** and comparison-page citations by **32.1%** in one release,
+while `site:` and "official" fan-out queries surged — retrieval moved toward
+primary sources and owned pages. And on Google's side, Lily Ray's 100-query B2B
+study found **69%** of the AI Overview citations earned by self-promotional
+"best [category]" listicles landed in answers that recommended a competitor.
+So a list query is not a page this site should write at ANY DR, and a
+"best X" page built for citation is built for a signal that has already been
+demoted; the aggregators the query hands page 1 to are the route on.
+
 `catalogue` is the one that is easy to mis-file as `authority`. Measured
 2026-09-14: `browser vr games` / `vr fps browser` / `webxr games` carried 5–7
 authorities, and a first pass called them "rejected — heyVR/itch own it". The

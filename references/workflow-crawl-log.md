@@ -226,11 +226,21 @@ reading.
 
 ```bash
 python3 $SEO/crawllog.py verify --scan /tmp/scan.json --bot googlebot --bot bingbot
+python3 $SEO/crawllog.py verify --scan /tmp/scan.json --bot oai-searchbot --bot claude-searchbot \
+    --bot perplexitybot --bot chatgpt-user            # the AI crawlers - CIDR witness
 ```
 
-Reverse DNS to the operator's domain, then a **forward** lookup back to the same
-IP. Reverse alone proves nothing — the PTR for an IP is set by whoever holds the
-IP.
+**Two witnesses per address, since 2026-09-20.** Reverse DNS to the operator's
+domain, then a **forward** lookup back to the same IP — reverse alone proves
+nothing, the PTR for an IP is set by whoever holds the IP. And the operator's
+**published IP ranges** (`ipranges.py`: OpenAI, Anthropic, Perplexity, Google,
+Bing, one JSON shape), which is the ONLY witness that can reach the AI crawlers
+— their rDNS lists are empty by rule, so before this the rows the GEO reading
+rests on could never be verified, and "every Anthropic row is forged" was an
+inference from the multi-operator detector rather than a check. Each result
+carries `dns`, `cidr` and a combined verdict; `witnesses_disagree` is named,
+not resolved. Read `cidr_tables` — an operator with an `unreadable` file makes
+its misses `unknown`, never spoofed.
 
 **Read `resolver_control` first.** It resolves a PTR that must exist
 (`8.8.8.8 → dns.google`). If it fails, every verdict is `unknown` and none of
@@ -337,7 +347,7 @@ It complements `verify` rather than duplicating it, and covers its blind spot:
 
 | | catches | blind to |
 |---|---|---|
-| `verify` | a forged IP for an operator that publishes **rDNS** (Google, Bing) | operators that publish IP RANGES — returns `null`, no verdict |
+| `verify` | a forged IP for an operator that publishes **rDNS** (Google, Bing) or **IP ranges** (OpenAI, Anthropic, Perplexity, Google, Bing) | an operator that publishes neither — `unknown`, no verdict |
 | `ua_spoofing` | a forged **UA**, for any operator, with no DNS at all | a scanner disciplined enough to forge only ONE identity |
 
 **The control is built in**: Googlebot + GoogleOther + Googlebot-Image from a

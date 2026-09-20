@@ -633,6 +633,105 @@ def origin_field(origin: str, strategy: str = "mobile") -> dict:
     }
 
 
+# ------------------------------------------------------------- LCP subparts
+# CrUX has exposed LCP's four sub-metrics since January 2025 (mapped from
+# `claude-seo/scripts/lcp_subparts.py`, prior-art.md third pass). They turn
+# "LCP 4.2s" into "TTFB 1.1s + load delay 0.3s + load duration 0.4s + render
+# delay 2.4s", which names the layer the fix lives in. They exist only for an
+# IMAGE LCP; a text-LCP origin has no subparts, and that is `unavailable`, not
+# zero. The CrUX API is a separate endpoint from PSI and takes the same key.
+LCP_SUBPARTS = {
+    "time_to_first_byte": "largest_contentful_paint_image_time_to_first_byte",
+    "resource_load_delay": "largest_contentful_paint_image_resource_load_delay",
+    "resource_load_duration": "largest_contentful_paint_image_resource_load_duration",
+    "element_render_delay": "largest_contentful_paint_image_element_render_delay",
+}
+CRUX_ENDPOINT = "https://chromeuxreport.googleapis.com/v1/records:queryRecord"
+
+
+def parse_lcp_subparts(record: dict) -> dict:
+    """CrUX record -> the four p75 subparts, their sum, and each one's share.
+
+    Each is a p75 of ITS OWN distribution, so the four do not add up to the LCP
+    p75 and the shares are of their sum, not of LCP. Said in the output because
+    the first reading of these numbers is always "they don't add up"."""
+    metrics = (record or {}).get("metrics") or {}
+    parts = {}
+    for short, name in LCP_SUBPARTS.items():
+        p75 = ((metrics.get(name) or {}).get("percentiles") or {}).get("p75")
+        parts[short] = {"p75_ms": (float(p75) if p75 is not None else None)}
+    present = {k: v["p75_ms"] for k, v in parts.items() if v["p75_ms"] is not None}
+    total = sum(present.values()) if present else None
+    for k, v in parts.items():
+        v["share_of_subparts"] = (round(v["p75_ms"] / total, 3)
+                                  if v["p75_ms"] is not None and total else None)
+    lcp = ((metrics.get("largest_contentful_paint") or {}).get("percentiles") or {}).get("p75")
+    largest = max(present, key=present.get) if present else None
+    return {"subparts": parts, "subparts_reported": sorted(present),
+            "sum_of_subpart_p75_ms": total,
+            "lcp_p75_ms": (float(lcp) if lcp is not None else None),
+            "largest_subpart": largest,
+            "note": ("each subpart is the p75 of its OWN distribution, so the four do not "
+                     "sum to lcp_p75_ms; share_of_subparts is over their sum. Subparts exist "
+                     "only for an IMAGE LCP - an origin whose LCP is text has none, and that "
+                     "is `unavailable`, not fast.")}
+
+
+def lcp_subparts(origin: str, form_factor: str = "PHONE") -> dict:
+    try:
+        from pagecheck import psi_token
+    except Exception as e:                                        # noqa: BLE001
+        return refuse("vitals-lcp-subparts", f"cannot import pagecheck: {e}")
+    tok, source = psi_token()
+    if not tok or not tok.startswith("key:"):
+        # ⚠ MEASURED 2026-09-20: the service-account bearer that PSI accepts is
+        # answered by the CrUX API with HTTP 400 "Request contains an invalid
+        # argument" - on a request shape that is correct - while an unauthenticated
+        # call says "Please use API Key". The 400 reads like a bad request and is
+        # a missing credential. CrUX is API-key only here; say so rather than
+        # letting the misleading status through.
+        return {"ok": False, "check": "vitals-lcp-subparts", "origin": origin,
+                "state": "no_key",
+                "error": ("CrUX API needs GOOGLE_API_KEY (or ~/.google_api_key); the PSI "
+                          f"service-account path does not reach it ({source})"),
+                "how_to_fix": "create an API key on the project that owns the service account, "
+                              "enable the Chrome UX Report API on it (free), export GOOGLE_API_KEY",
+                "note": "a missing credential is 'cannot ask', not a bad score"}
+    o = urllib.parse.urlsplit(origin)
+    root = f"{o.scheme or 'https'}://{o.netloc or o.path}"
+    body = json.dumps({"origin": root, "formFactor": form_factor,
+                       "metrics": ["largest_contentful_paint", *LCP_SUBPARTS.values()]}).encode()
+    hdr = {"Content-Type": "application/json"}
+    url = CRUX_ENDPOINT
+    if tok.startswith("key:"):
+        url += "?key=" + tok[4:]
+    else:
+        hdr["Authorization"] = f"Bearer {tok}"
+    r = http(url, data=body, headers=hdr, method="POST", timeout=60)
+    j = r.json() or {}
+    if r.get("status") == 404:
+        return {"ok": True, "check": "vitals-lcp-subparts", "origin": root,
+                "form_factor": form_factor, "state": "no_record",
+                "subparts_reported": [],
+                "note": "CrUX has no record for this origin/form factor - too little "
+                        "traffic. An unanswered question, not a failing score."}
+    if not r.ok:
+        msg = str((j.get("error") or {}).get("message", ""))[:300]
+        return {"ok": False, "check": "vitals-lcp-subparts", "origin": root,
+                "state": "failing", "status": r.get("status"), "credential": source,
+                "error": msg,
+                "how_to_fix": ("enable the Chrome UX Report API on the project named in "
+                               "the error - free, no card"
+                               if "has not been used in project" in msg else
+                               "check the credential; CrUX accepts an API key")}
+    out = parse_lcp_subparts(j.get("record") or {})
+    return {"ok": True, "check": "vitals-lcp-subparts", "origin": root,
+            "form_factor": form_factor, "credential": source,
+            "state": ("answered" if out["subparts_reported"] else "unavailable"),
+            "collection_period": (j.get("record") or {}).get("collectionPeriod"),
+            **out}
+
+
 # -------------------------------------------------------------------- control
 CONTROL_HTML = """<!doctype html><html><head>
 <title>T</title>
@@ -746,6 +845,30 @@ def run_control() -> dict:
             "the measured case that motivates two samples must stay documented")
     c.check("the_uniform_tell_is_wired",
             (uniform_verdict(["warn"] * 12, subject="templates") or {}).get("population") == 12)
+
+    # LCP subparts: the parser in both directions, offline.
+    rec = {"metrics": {
+        "largest_contentful_paint": {"percentiles": {"p75": 4200}},
+        "largest_contentful_paint_image_time_to_first_byte": {"percentiles": {"p75": 1100}},
+        "largest_contentful_paint_image_resource_load_delay": {"percentiles": {"p75": 300}},
+        "largest_contentful_paint_image_resource_load_duration": {"percentiles": {"p75": "400"}},
+        "largest_contentful_paint_image_element_render_delay": {"percentiles": {"p75": 2400}}}}
+    sp = parse_lcp_subparts(rec)
+    c.check("subparts_read_all_four_and_coerce_strings",
+            sp["subparts_reported"] == sorted(LCP_SUBPARTS) and
+            sp["subparts"]["resource_load_duration"]["p75_ms"] == 400.0, str(sp["subparts"]))
+    c.check("the_largest_subpart_is_named", sp["largest_subpart"] == "element_render_delay")
+    c.check("shares_are_over_the_subpart_sum_not_lcp",
+            sp["sum_of_subpart_p75_ms"] == 4200.0
+            and sp["subparts"]["element_render_delay"]["share_of_subparts"] == round(2400 / 4200, 3))
+    text_lcp = parse_lcp_subparts({"metrics": {
+        "largest_contentful_paint": {"percentiles": {"p75": 1800}}}})
+    c.check("a_text_lcp_origin_has_no_subparts_and_says_so",
+            text_lcp["subparts_reported"] == [] and text_lcp["largest_subpart"] is None
+            and text_lcp["lcp_p75_ms"] == 1800.0 and text_lcp["sum_of_subpart_p75_ms"] is None,
+            "no subparts must never read as four zeros")
+    c.check("an_empty_record_is_not_a_fast_site",
+            parse_lcp_subparts({})["subparts_reported"] == [])
     return c.verdict(images_parsed=len(p.images))
 
 
@@ -797,6 +920,9 @@ def main() -> int:
     o = sub.add_parser("origin", help="CrUX ORIGIN field data (needs a PSI credential)")
     o.add_argument("origin")
     o.add_argument("--strategy", default="mobile", choices=["mobile", "desktop"])
+    o.add_argument("--subparts", action="store_true",
+                   help="also decompose LCP into its four CrUX subparts (TTFB, load delay, "
+                        "load duration, render delay) - image LCP only")
 
     sub.add_parser("control", help="prove the parser and grouper discriminate")
 
@@ -807,6 +933,9 @@ def main() -> int:
         out = probe_page(a.url, a.timeout, a.repeat)
     elif a.cmd == "origin":
         out = origin_field(a.origin, a.strategy)
+        if a.subparts:
+            out["lcp_subparts"] = lcp_subparts(
+                a.origin, "PHONE" if a.strategy == "mobile" else "DESKTOP")
     else:
         urls, err = _read_urls(a)
         out = (refuse("vitals-sweep", err) if err else
