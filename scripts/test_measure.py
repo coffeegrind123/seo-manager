@@ -244,11 +244,15 @@ def test_decay_classification():
             ("https://x.com/decayer", 10, 400, 6.0),     # will slip badly
             ("https://x.com/demand", 10, 400, 5.0),      # position improves
             ("https://x.com/noise", 0, 3, 50.0),         # under min-impressions
+            ("https://x.com/clicksgone", 300, 3000, 2.0),  # same rank, CTR 10% -> 3%
+            ("https://x.com/steady", 30, 300, 4.0),      # same rank, CTR 10% -> 9%: noise
         ]))
         cur.write_text(gsc([
             ("https://x.com/decayer", 1, 40, 18.0),
             ("https://x.com/demand", 1, 40, 3.0),
             ("https://x.com/noise", 0, 1, 60.0),
+            ("https://x.com/clicksgone", 90, 3000, 2.1),
+            ("https://x.com/steady", 27, 300, 4.0),
         ]))
         out = subprocess.run(
             [sys.executable, str(HERE / "decay.py"), "compare",
@@ -265,6 +269,15 @@ def test_decay_classification():
           "/noise" not in decayed and "/noise" not in dropped)
     check("position is impression-weighted, not a mean of means",
           d["decay"][0]["position"]["before"] == 6.0, d["decay"][0]["position"])
+    ctrl = [r["page"] for r in d.get("ctr_loss", [])]
+    check("same rank, same demand, CTR 10% -> 3% is a CTR LOSS",
+          "/clicksgone" in ctrl, d.get("ctr_loss"))
+    check("CONTROL: a 10% -> 9% wobble on 300 impressions is not",
+          "/steady" not in ctrl, d.get("ctr_loss"))
+    row = next((r for r in d.get("ctr_loss", []) if r["page"] == "/clicksgone"), {})
+    check("the CTR verdict carries its interval and counts",
+          (row.get("ctr") or {}).get("verdict") == "decrease"
+          and (row.get("ctr") or {}).get("ci95"), row.get("ctr"))
 
 
 def main():

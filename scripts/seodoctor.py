@@ -320,6 +320,26 @@ def check_project(root: Path) -> dict:
 
 
 
+def check_ledger(repair: bool = True) -> dict:
+    """The algorithm-update calendar `decay`/`drift` correlate against. A stale
+    one reads as 'no update near this date' - it once sat three months behind
+    and missed two spam updates. Re-synced from Google's own dashboard when
+    stale; a failed sync is reported, never blocking."""
+    import algoupdates
+    st = algoupdates.cmd_status(argparse.Namespace(ledger=str(algoupdates.LEDGER)))
+    if not st.get("ok"):
+        return {"state": "unreadable", "detail": st.get("reason") or st.get("error")}
+    if not st["stale"]:
+        return {"state": "fresh", "last_synced": st["last_synced"], "ongoing": st["ongoing"]}
+    if not repair:
+        return {"state": "stale", "last_synced": st["last_synced"],
+                "fix": "python3 algoupdates.py sync"}
+    res = algoupdates.cmd_sync(argparse.Namespace(ledger=str(algoupdates.LEDGER), dry_run=False))
+    return {"state": "resynced" if res.get("ok") else "stale_sync_failed",
+            "added": len(res.get("added") or []), "updated": len(res.get("updated") or []),
+            "detail": None if res.get("ok") else (res.get("reason") or res.get("errors"))}
+
+
 def run_control() -> dict:
     """Prove the preflight's own readers discriminate - repairing nothing.
 
@@ -421,6 +441,7 @@ def main() -> int:
         "deps": check_deps(),
         "project": check_project(Path(a.root).resolve()),
         "providers": check_providers(live=a.providers),
+        "update_ledger": check_ledger(repair=not a.check),
     }
     # Order matters: the display is a PRECONDITION of the daemon. Repairing it
     # after ensure_serpd() would leave a freshly-failed daemon behind.

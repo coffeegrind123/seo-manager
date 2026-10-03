@@ -70,6 +70,8 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from controls import Controls  # noqa: E402
+import algoupdates  # noqa: E402
+import stats  # noqa: E402
 
 
 def load_rows(path: str):
@@ -163,38 +165,26 @@ def pct(new, old):
 
 
 def load_updates(path):
-    try:
-        d = json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception as exc:
-        return None, f"could not read {path}: {exc}"
-    ups = d.get("updates") if isinstance(d, dict) else d
-    out = []
-    for u in ups or []:
-        try:
-            out.append({
-                "date": u["date"],
-                "name": u.get("name") or u["date"],
-                "kind": u.get("kind") or "unknown",
-                "source": u.get("source"),
-                "ended": u.get("ended"),
-            })
-        except Exception:
-            continue
-    return out, None
+    """The ledger's rows, unmodified. Normalising them here once dropped every
+    field but five, which is how `status: ongoing` never reached the window."""
+    ledger, err = algoupdates.load_ledger(Path(path))
+    if err:
+        return None, err
+    return [u for u in ledger["updates"] if isinstance(u, dict) and u.get("date")], None
 
 
 def updates_in_window(updates, start: str, end: str):
+    """Rollouts that CERTAINLY overlap [start, end]: a known end, or still open.
+    Span semantics live in algoupdates.span - one definition for both readers."""
     if not updates:
         return []
-    hits = []
-    for u in updates:
-        d = u["date"]
-        e = u.get("ended") or d
-        # A rollout overlapping the window at all is relevant; core updates run
-        # for weeks and the damage lands somewhere inside that span.
-        if not (e < start or d > end):
-            hits.append(u)
-    return hits
+    return algoupdates.correlate(updates, start, end)["in_window"]
+
+
+def updates_possibly_in_window(updates, start: str, end: str):
+    if not updates:
+        return []
+    return algoupdates.correlate(updates, start, end)["possibly_in_window"]
 
 
 def run_control() -> dict:
@@ -270,7 +260,7 @@ def cmd_compare(a):
         except Exception:
             pass
 
-    decaying, demand, rising, lost, gained, settling = [], [], [], [], [], []
+    decaying, demand, rising, lost, gained, settling, ctr_loss = [], [], [], [], [], [], []
 
     for key, c in cur.items():
         page = key[0]
@@ -314,6 +304,10 @@ def cmd_compare(a):
             "impressions": {"before": p["impressions"], "after": c["impressions"], "change": d_imp},
             "clicks": {"before": p["clicks"], "after": c["clicks"], "change": d_clicks},
             "position": {"before": p["position"], "after": c["position"], "change": d_pos},
+            # CTR as a RATE with an interval: a change is called only when the
+            # Newcombe 95% interval of the difference excludes zero.
+            "ctr": stats.compare_rates(int(p["clicks"]), int(p["impressions"]),
+                                       int(c["clicks"]), int(c["impressions"])),
         }
 
         if d_imp is not None and d_imp <= -a.drop:
@@ -331,7 +325,19 @@ def cmd_compare(a):
         elif d_imp is not None and d_imp >= a.drop:
             rec["verdict"] = "rising"
             rising.append(rec)
+        elif (rec["ctr"]["verdict"] == "decrease"
+              and (d_pos is None or abs(d_pos) < a.pos_slip)):
+            # Demand held, rank held, and the click went somewhere else - an AI
+            # Overview, a new SERP feature, a better snippet above. Neither decay
+            # nor demand, and invisible to both.
+            rec["verdict"] = "ctr_loss"
+            rec["why"] = (f"impressions and position held, CTR fell "
+                          f"{rec['ctr']['before']['rate']:.1%} -> {rec['ctr']['after']['rate']:.1%} "
+                          f"(95% CI of the change {rec['ctr']['ci95']}) - check the SERP for a new "
+                          f"AI Overview or feature before touching the page")
+            ctr_loss.append(rec)
 
+    ctr_loss.sort(key=lambda r: r["clicks"]["before"] - r["clicks"]["after"], reverse=True)
     decaying.sort(key=lambda r: r["impressions"]["before"] - r["impressions"]["after"], reverse=True)
     demand.sort(key=lambda r: r["impressions"]["before"] - r["impressions"]["after"], reverse=True)
     lost.sort(key=lambda r: r["impressions_before"], reverse=True)
@@ -346,11 +352,13 @@ def cmd_compare(a):
                         f"separate content problems - look for an algorithm update, a technical "
                         f"regression, or a crawl collapse before rewriting anything.")
 
-    algo = []
-    if updates and a.current_start and a.current_end:
-        algo = updates_in_window(updates, a.current_start, a.current_end)
-    elif updates and a.previous_start and a.current_end:
-        algo = updates_in_window(updates, a.previous_start, a.current_end)
+    algo, algo_maybe = [], []
+    win = ((a.current_start, a.current_end) if a.current_start and a.current_end
+           else (a.previous_start, a.current_end) if a.previous_start and a.current_end
+           else None)
+    if updates and win:
+        algo = updates_in_window(updates, *win)
+        algo_maybe = updates_possibly_in_window(updates, *win)
 
     print(json.dumps({
         "ok": True,
@@ -360,12 +368,15 @@ def cmd_compare(a):
         "counts": {
             "decay": len(decaying), "demand_drop": len(demand), "lost": len(lost),
             "rising": len(rising), "new": len(gained), "settling": len(settling),
+            "ctr_loss": len(ctr_loss),
         },
         "sitewide_signal": sitewide,
         "algorithm_updates_in_window": algo,
+        "algorithm_updates_possibly_in_window": algo_maybe,
         "algorithm_updates_error": uerr,
         "decay": decaying[: a.top],
         "demand_drop": demand[: a.top],
+        "ctr_loss": ctr_loss[: a.top],
         "lost": lost[: a.top],
         "rising": rising[: a.top],
         "settling": settling[: a.top],

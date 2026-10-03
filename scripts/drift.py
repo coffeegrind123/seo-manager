@@ -62,6 +62,7 @@ def die(msg, **extra):
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from controls import Controls  # noqa: E402
+import algoupdates  # noqa: E402
 
 
 def host_of(url: str) -> str:
@@ -284,12 +285,10 @@ def cmd_compare(a):
         updates, uerr = load_updates(a.updates)
     window_start = (before.get("taken_at") or "")[:10]
     window_end = (after.get("taken_at") or "")[:10]
-    in_window = []
-    for u in updates or []:
-        d = u.get("date", "")
-        e = u.get("ended") or d
-        if window_start and window_end and not (e < window_start or d > window_end):
-            in_window.append(u)
+    in_window, maybe_in_window = [], []
+    if updates and window_start and window_end:
+        corr = algoupdates.correlate(updates, window_start, window_end)
+        in_window, maybe_in_window = corr["in_window"], corr["possibly_in_window"]
 
     if mean_churn >= a.volatile:
         verdict = "SITE-WIDE VOLATILITY"
@@ -318,6 +317,7 @@ def cmd_compare(a):
                             for d, n in exit_counter.most_common(10) if n > 1],
         "ai_overview_changes": feature_changes,
         "algorithm_updates_in_window": in_window,
+        "algorithm_updates_possibly_in_window": maybe_in_window,
         "algorithm_updates_error": uerr,
         "per_keyword": per_kw[: a.top],
         "reading": {
