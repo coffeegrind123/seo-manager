@@ -74,6 +74,13 @@ cause no rewrite touches. Check, in order:
 
 Only when the site-wide explanations are excluded do you work the list.
 
+⚠ Run `algoupdates.py status` first — a calendar not synced in 30 days says
+nothing about the last month. `algorithm_updates_in_window` now uses each
+rollout's real span (a core update that began before the window and ended inside
+it correlates; one still running overlaps every later window). Rollouts with an
+unknown end are listed in `algorithm_updates_possibly_in_window` and reported as
+possible, never as present.
+
 **Success criteria**: `sitewide_signal` was read and the site-wide explanations (algorithm overlap, crawl collapse, a deploy) were each checked and excluded before any page was worked individually.
 
 ---
@@ -121,6 +128,20 @@ be fading, which is a research-workflow input, not a rewrite.
 **Success criteria**: Zero queue items were created from demand drops, and the report says so explicitly.
 
 ---
+
+## 4b. `ctr_loss` — the click went somewhere else
+
+Added 2026-10-03. Impressions held, position held, and CTR fell **beyond noise**
+(the row's `ctr.ci95` — a Newcombe interval on clicks over impressions — excludes
+zero). Neither decay nor demand: the page did not lose ground and nobody stopped
+searching. Something on the SERP took the click — a new AI Overview, a video or
+shopping block, a rewritten snippet above.
+
+Before touching the page, look at the SERP (`drift.py` snapshot, or
+`serp.py "<query>"` for `ai_overview.present`). If an overview appeared, the
+query belongs in `geo.py gap`, not in a rewrite. Every decay row now carries
+`ctr` with its interval; a CTR "drop" whose interval spans zero is noise at
+that sample size and is not reported as one.
 
 ## 5. `lost` — verify before diagnosing
 

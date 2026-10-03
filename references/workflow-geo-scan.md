@@ -95,6 +95,21 @@ Then interpret the scan below against it:
 > of the domain. The near-zero citation result that this workflow had been
 > reporting was explained entirely by ingestion, not by the answers.
 
+Then two checks that can each explain a zero on their own (2026-10-03):
+
+```bash
+python3 $SEO/agentcheck.py reach https://<domain>/<a-page>   # what citing-crawler UAs are SERVED
+```
+
+- **The Search Console "Search generative AI" setting.** A property set to
+  *exclude* gets no links, no grounding and no impressions in AI Overviews, AI
+  Mode or gen-AI Discover — uncitable by configuration (support answer 16908024).
+  It has no API here; ask the owner, or look in Settings. Check it before
+  reading any Google-surface absence.
+- **The edge.** A CDN rule can 403 OAI-SearchBot while robots.txt says Allow.
+  `reach` reports that only when a forged Googlebot is served (otherwise the edge
+  verifies by IP and the answer is `cannot_ask` — read the access log instead).
+
 **Success criteria**: `by_category` ingestion numbers and Common Crawl presence are in hand BEFORE any answer is sampled, and the three AI-crawler classes are kept distinct. If no `ai_search` crawler reaches the site, that is reported as the finding and the citation result is NOT read as a content verdict.
 
 ---
@@ -155,7 +170,36 @@ python3 $SEO/geo.py sweep --domain <domain> --bank questions.txt --max 20 --runs
 ```
 
 Read `per_question[].rates` (per engine, over answered runs), `mentioned_by`,
-and each result's `sentences_naming_us` — verbatim, for the framing call. A
+and each result's `sentences_naming_us` — verbatim, for the framing call.
+
+Before any rate, read three fields (2026-10-03):
+
+- **`parser_suspect_engines`** — an engine that answered 5+ questions and cited
+  nobody in ANY of them. Far likelier a renamed payload field than an engine that
+  cites no one; its answers are already out of the rate. Report the engine as
+  unmeasured, never as "does not cite us".
+- **`citation_rate_ci95` and `small_sample`** — the sweep's rate with its Wilson
+  interval. Under 20 answers it is a small sample, and is reported with its counts.
+- **per row `runs.ci95` / `band` / `stable`** — "cited 3/3" has a lower bound of
+  0.44 and is not stably "usually cited". Say `stable: false` out loud.
+
+Two further rungs the rows now separate: **`retrieved_not_cited`** (the engine
+READ the page while answering and did not cite it — a page that is reached but
+not chosen, which is the comprehension/trust cause below, not the technical one)
+and **`best_list_rank`** (the position in a list answer of the first item naming
+the site; `null` for a prose-only mention, never 0).
+
+**Comparing two sweeps** — never subtract two `citation_rate`s:
+
+```bash
+python3 $SEO/geo.py diff --before .seo/geo/sweep-<old>.json --after .seo/geo/sweep-<new>.json
+```
+
+It pairs the questions both runs asked the same engine, counts each one up, down
+or unchanged, and runs an exact sign test (McNemar at one run per side), Holm-
+corrected across engines. Fewer than 6 changed questions is `too_few_changes` —
+five unanimous flips cannot reach p < 0.05, so that is "cannot tell", not "no
+change". A
 question whose engines all returned `no_answer_surface` is a fact about the
 question, not a miss; one that `could_not_ask` on every engine is unknown and
 is NOT in the rate.
@@ -238,6 +282,33 @@ have different fixes and only one of them is content:
 | **technical** | no `ai_search` hits in `crawllog`, `agentcheck.py policy` blocks the citing class, `agentcheck.py page` finds JS-only content, Common Crawl `absent` | §0 — crawlability, robots, rendering. No page fixes this. |
 | **comprehension** | `mentioned` but `sentences_naming_us` describe the product wrongly or vaguely | the extractable fact block — `geo.py extractable`, answer-first openings, the definition sentence |
 | **trust** | crawled, described correctly, still not cited or not recommended | consensus off-site — the presence step below. A new guide changes little here. |
+
+`share_of_voice[].kind` and `competitor_citations_by_kind` sort the gap by what
+KIND of source wins — forum, video, reviews, pr, ecommerce, social, developer,
+reference, institutional, or a listicle / comparison page on an ordinary site.
+Each kind is a different move: a forum thread is earned by participating, a
+review site by a listing, a listicle by outreach, a reference page only by
+notability. A gap that is mostly `forum` is not a content backlog.
+
+### 4.2 Where we rank and are not quoted — the Search Console join
+
+```bash
+python3 $SEO/gsc.py query --dimensions query --days 28 > .seo/gsc-q.json
+python3 $SEO/geo.py gap --domain <domain> --gsc .seo/gsc-q.json --top 30 --runs 1
+```
+
+| tier | meaning | the move |
+|---|---|---|
+| **B** | ranks 1–4, the overview quotes someone else (or no one) | Google already trusts the page; make its answer the liftable sentence (`geo.py extractable`) |
+| **A** | ranks 5–20, a competitor is quoted | the overview is the way past the ranking; read what the quoted page says that ours does not |
+| **C** | cited, but CTR below this site's OWN no-overview median at that position | cited and still losing the click — the title/snippet, not the content |
+| **D** | no overview | nothing to win here today |
+| **X** | could not ask | unknown, never a tier |
+
+`ai_overview_ctr_impact` compares CTR with and without an overview per position
+bucket. ⚠ Impressions are not independent trials and the two groups differ in
+intent, so a difference is a lead, never a measured cause. Each query costs one
+SerpApi search per run: budget `--top` against the month's quota.
 
 ## 4.5 Presence — turn the recurring gap domains into prospects
 

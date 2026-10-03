@@ -62,7 +62,9 @@ checks the **X display first** — serpd runs headed Chrome, and a dead Xvfb
 leaves a stale socket that presents downstream as "chrome did not bind CDP";
 the doctor restarts Xvfb — and restarts a daemon whose `/health` says
 `throttled` (Google `/sorry`), since a restart mints a fresh proxy session and
-waiting does not.
+waiting does not. It also re-syncs the algorithm-update ledger from Google's
+Search Status Dashboard when it is over 30 days old (`update_ledger` in the
+output), because a stale calendar reads as "no update near this date".
 
 **A red preflight is never permission to end a run short.** If `serpd` cannot be
 revived, `ddg` and the `--provider browser` handoff still work and the run
@@ -114,7 +116,7 @@ with twenty pages that read like one template.
 | **drift** (what changed on page 1) | fortnightly | `references/workflow-drift.md` |
 | **crawl-log** (what bots actually did) | monthly | `references/workflow-crawl-log.md` |
 | **programmatic** (generated silos) | before shipping, then quarterly | `references/workflow-programmatic.md` |
-| **health** (technical audits → queue) | quarterly | `references/workflow-health.md` |
+| **health** (`sitecheck.py` + link graph → queue) | quarterly | `references/workflow-health.md` |
 | **contract** (did the deploy break it) | **after every deploy** | `references/workflow-contract.md` |
 | **international** (the hreflang mesh) | quarterly + on locale change | `references/workflow-international.md` |
 
@@ -172,7 +174,7 @@ Supporting references:
 
 ## The scripts
 
-31 scripts, all stdlib Python 3, no installs. Every one prints JSON; `--help`
+36 scripts, all stdlib Python 3, no installs. Every one prints JSON; `--help`
 lists the subcommands.
 
 ```bash
@@ -197,7 +199,10 @@ The six you touch in almost every run:
 | `remeasure.py` | did the change work? Hypotheses with pre-registered directions, re-checked by re-running the same command |
 | `brief.py` | a build brief assembled from measurements — and a hard refusal when page 1 could not be read |
 | `vitals.py` | whole-site Core Web Vitals sampled per TEMPLATE, keyless — and a network baseline, because the first version blamed the site for the container's DNS |
-| `sitegraph.py` | the internal link graph, offline or live — orphans, click depth, broken links, and the ISLAND silos that look well-linked and are reachable from nowhere |
+| `sitegraph.py` | the internal link graph, offline or live — orphans, click depth, broken links, and the ISLAND silos that look well-linked and are reachable from nowhere; `suggest` names which pages should link to the weak ones |
+| `sitecheck.py` | the site-level checks health calls non-negotiable — hosts, soft 404, sitemap, redirects, canonicals, headers, duplicate variants — with a `diff` between runs |
+| `algoupdates.py` | Google's update calendar synced from Google's own Search Status Dashboard, with real rollout spans; `seodoctor` re-syncs it when stale |
+| `stats.py` | Wilson / Newcombe / exact McNemar / Holm — the only way a rate here is allowed to "change" |
 
 **Read `references/scripts.md` before running anything else** — it carries the
 full table (research, measurement, guards, tests), the command cookbook, and the
@@ -272,9 +277,10 @@ well as in the quality bar:
 
   **This is now structural rather than a habit.** `controls.py` provides the
   primitive (`Controls`, `refuse()`, `guard_zero()`, `uniform_verdict()`) and
-  **every one of the 32 instruments carries a control you can run** — `control`
+  **every one of the 35 instruments carries a control you can run** — `control`
   as a subcommand, or `--control` on the five flag-style ones. `controls.py
-  audit` runs the lot (623 checks, no network) and reports `ok: false` naming
+  audit` runs the lot (697 checks; a live source that refuses is `unreachable`,
+  never `broken`) and reports `ok: false` naming
   any instrument that cannot currently prove itself. It was built after seven
   instruments failed their controls in a single run on 2026-09-01; each would
   have shipped as a confident finding about the site.
@@ -293,6 +299,11 @@ well as in the quality bar:
   implementation's own docstring, and one because its robots.txt fixture put an
   "orphan" directive where it was a legitimate continuation. Derive the expected
   value independently, or the control is a mirror.
+- **A rate that moved is not a rate that changed.** CTR between two windows, a
+  citation rate between two sweeps, a remeasured share: each is a change ONLY
+  when its 95% interval excludes zero (`stats.compare_rates`, Newcombe's hybrid
+  score interval). With this skill's sample sizes most movements are noise -
+  3/10 → 5/10 is `no_detectable_change`. Report the counts with the rate, always.
 - **Every AI-citation claim names its n.** An answer engine is non-deterministic:
   the same prompt cites different sources run to run, so "not cited" from one
   run is a coin toss reported as a state. `geo.py --runs 3` (or more) reports
@@ -310,6 +321,10 @@ well as in the quality bar:
   pinned exits — the claim survived, but only because it was re-measured. Pin it
   (`serp.py --proxy-country`), name it, name the engine. Where a country cannot be
   pinned, that is **unmeasured**, never confirmed.
+- **A rank drop needs two reads.** One SERP read is one sample of a personalised,
+  A/B-tested page. `rankcheck.py` re-reads every drop candidate and reports only
+  `confirmed` drops; a null position is `out_of_range` at the depth it was read,
+  never a position, and a previously-unranked keyword can never "drop".
 - **A verified-country list is a measurement with a date on it.** `serp.py`'s had
   gone stale and refused `us` with a confident reason that had stopped being true.
   Re-measure with `serp.py --verify-countries` before reading an absence as
@@ -328,6 +343,12 @@ well as in the quality bar:
   regression and recording it as one opens a critical finding on every page.
   Report the refusal and its reason. **Never** report a pass from a run that
   refused, and never widen `--max-fail-share` to make a refusal go away.
+- **Edge rules are not robots.txt.** A CDN can prepend rules nobody committed
+  (Cloudflare's managed block), serve a crawler a different robots.txt, or 403 a
+  crawler the file allows. `agentcheck.py policy` names the first two and `reach`
+  the third - and `reach` answers `cannot_ask` rather than "blocked" when the edge
+  also refuses a forged Googlebot, because then it is verifying by IP and a forged
+  UA proves nothing.
 - **`llms.txt` is not a ranking or citation lever.** Google's own docs say
   Search ignores it, and 0.1% of AI-bot requests touch it. Report it as
   optionality; never propose building one as a GEO action, and never let

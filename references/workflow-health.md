@@ -17,7 +17,7 @@ program needs *work items*, and nothing connected the two.
 |---|---|
 | One page, quick on-page check | `seo-audit` |
 | One page, deep + PageSpeed + social | `seo-audit-full` |
-| Whole site, everything, one report | `full-seo-audit` |
+| Whole site, the technical basics, one report | **`sitecheck.py all`** (this skill) |
 | One dimension across the site | the specific audit skill (below) |
 | What bots actually did | **`workflow-crawl-log.md`** (this skill) |
 | Generated silo at scale | **`workflow-programmatic.md`** (this skill) |
@@ -46,33 +46,64 @@ statistically meaningful, so `null` means *too few real users to measure*. On a
 small site expect the lab numbers alone, and never report the absence as a
 performance finding.
 
-The single-dimension audits: `sitemap-audit`, `robots-txt-audit`,
-`redirect-audit`, `internal-link-audit`, `external-link-audit`,
-`meta-data-audit`, `heading-structure-audit`, `image-seo-audit`,
-`schema-markup-audit`, `canonical-tag-audit`, `open-graph-audit`,
-`mixed-content-audit`, `pagination-audit`, `soft-404-audit`,
-`content-quality-audit`, `keyword-cannibalization-audit`,
-`site-architecture-audit`, `core-web-vitals-audit`, `llms-txt-audit`.
+The single-dimension checks, mapped to what this skill ships (the
+`*-audit` skill names this table once pointed at are not installed here — check
+the skill list before reaching for one):
 
-**Do not run all nineteen by reflex.** Pick from what you already suspect —
+| Dimension | Run |
+|---|---|
+| sitemap, redirects, canonicals, soft 404, host variants, HSTS/security headers, mixed content | `sitecheck.py` |
+| robots.txt per crawler, llms.txt, what crawlers are served, `/.well-known` | `agentcheck.py` |
+| internal links, orphans, islands, depth, broken links, link suggestions | `sitegraph.py` |
+| meta/schema/canonical regressions after a deploy | `contract.py` |
+| structured data, HTML validity | `pagecheck.py` |
+| Core Web Vitals by template, CrUX field history | `vitals.py` |
+| hreflang | `hreflang.py` |
+| cannibalisation | `decay.py` |
+
+**Do not run all of them by reflex.** Pick from what you already suspect —
 `seostate.py overview`, the last crawl-log scan, and the last decay run will
-point at two or three. A nineteen-part report is a way of not deciding anything.
+point at two or three. A report on every dimension is a way of not deciding anything.
 
-**Success criteria**: Two or three audits are selected from evidence already in hand (`seostate.py overview`, the last crawl-log scan, the last decay run) — not all nineteen by reflex. An empty `field_crux` is recorded as unmeasurable, never as a performance finding.
+**Success criteria**: Two or three audits are selected from evidence already in hand (`seostate.py overview`, the last crawl-log scan, the last decay run) — not every dimension by reflex. An empty `field_crux` is recorded as unmeasurable, never as a performance finding.
 
 ---
 
 ## 2. Always run these three on a content site
 
-They are the ones whose failure silently invalidates other work:
+They are the ones whose failure silently invalidates other work, and all three
+are **`sitecheck.py`** — this skill's own, because the separate audit skills this
+section used to name (`canonical-tag-audit`, `sitemap-audit`, `redirect-audit`)
+were **not installed** when checked on 2026-10-03, so the three checks called
+non-negotiable here could not actually run:
 
-1. **`canonical-tag-audit`** — a canonical pointing at a 404 or a redirect makes
-   a page **unindexable**, and the page looks completely fine when you load it.
-2. **`sitemap-audit`** — 404s and noindexed URLs in a sitemap cost trust on
-   every other URL in it.
-3. **`redirect-audit`** — chains and loops eat crawl budget and lose signal.
+1. **Canonicals** — a canonical pointing at a 404 or a redirect makes a page
+   **unindexable**, and the page looks completely fine when you load it.
+2. **Sitemap** — listed URLs that redirect, 4xx, say noindex or canonicalise
+   elsewhere: each is a URL you asked Google to index and then refused.
+3. **Redirects** — chains, loops and temporary hops eat crawl budget and leave
+   the OLD URL as the indexed one.
 
-Then the one everyone skips and shouldn't: **`internal-link-audit`**, because
+```bash
+python3 $SEO/sitecheck.py all https://example.com --sample 150 --save   # hosts, soft 404, headers,
+                                                                        # sitemap, canonicals, variants
+python3 $SEO/sitecheck.py redirects --urls old-urls.txt                 # a migration's URL list
+python3 $SEO/sitecheck.py diff --before .seo/sitecheck/<a>.json --after .seo/sitecheck/<b>.json
+```
+
+`all` checks the **host** first (http/https × www/apex must reach ONE origin in
+one permanent hop — two variants serving 200 is the whole site twice) and the
+**soft 404** (an unknown URL answering 200 indexes every typo, and makes optional
+files like `llms.txt` and `/.well-known/*` read as present to every checker). The
+sitemap is **sampled evenly across the file**, not from its head; a clean sample
+bounds the error rate and does not prove zero, and the output says which it was.
+A `--save`d run diffs as `new` / `fixed` / `persisting`, keyed `(rule, url)`.
+
+⚠ **A refusal is not a clean bill.** `sitecheck` refuses rather than reports when
+no host variant answers, when no sitemap can be read, or when a header check
+lands on an error page. `refused` in the `all` output names each one.
+
+Then the one everyone skips and shouldn't: the **internal link** audit, because
 orphan pages are the cheapest fix in SEO and nothing else surfaces them.
 
 Run that fourth one with **`sitegraph.py`**, and run it against the LOCAL
@@ -125,7 +156,24 @@ this tool exists to find: `/guides/bunny-hop` is linked from 16 of 17 guides, a 
 which is indistinguishable from a nav by frequency alone. Only the parent-path test
 separates them, and `test_sitegraph.py` case 8 holds both in one graph to prove it.
 
-**Success criteria**: `canonical-tag-audit`, `sitemap-audit` and `redirect-audit` have all run, plus the `sitegraph.py` link-graph audit, and each returned a read result rather than an error. `silos` was read for `islands` before `orphans` was believed.
+Two follow-ups that turn the graph into work items:
+
+```bash
+# Internal links that land on a redirect or an error (the live crawl follows
+# redirects, so the graph alone cannot see this), and indexable pages the
+# sitemap leaves out:
+python3 $SEO/sitecheck.py links --graph .seo/graph/site.json --origin https://example.com \
+  --sitemap https://example.com/sitemap.xml
+# Which existing pages should link to the weak ones, with an anchor - evidence is
+# a shared Search Console query and shared title words, never similarity alone:
+python3 $SEO/gsc.py query --dimensions page query --days 90 > .seo/gsc-page-query.json
+python3 $SEO/sitegraph.py suggest --graph .seo/graph/site.json --gsc .seo/gsc-page-query.json
+```
+
+`suggest` returns nothing for a target nothing relates to. An empty list is the
+finding (the page has no topical neighbour on the site), not a gap to pad.
+
+**Success criteria**: `sitecheck.py all` has run (hosts, soft 404, headers, sitemap sample, canonicals, variants) and every part returned a read result or a named refusal, plus the `sitegraph.py` link-graph audit. `silos` was read for `islands` before `orphans` was believed.
 
 ---
 
@@ -173,7 +221,7 @@ Worth knowing so the report is honest about its own edges:
   → `workflow-crawl-log.md`.
 - **Whether a page is indexed.** Auditors read the page; only Search Console
   knows Google's decision → `gsc.py inspect`.
-- **Whether a thin page is a problem.** `content-quality-audit` measures the
+- **Whether a thin page is a problem.** A content check measures the
   text. Indexation decides → `workflow-programmatic.md`.
 - **Whether a fix worked.** That is `decay` and `drift`, weeks later.
 

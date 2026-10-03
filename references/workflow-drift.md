@@ -111,6 +111,17 @@ does not list; absence of an update in the window is not evidence there was none
 
 ---
 
+### Spans, not start dates (2026-10-03)
+
+The calendar now carries each rollout's real end (`algoupdates.py sync` from
+Google's Search Status Dashboard), so a core update that began before the
+window and finished inside it correlates — it used not to, because both
+consumers windowed on an `ended` field no row had. A rollout still running is
+`span_kind: ongoing` and overlaps every later window. A rollout whose end is
+unknown appears only in **`algorithm_updates_possibly_in_window`** — report it as
+possible, never as present. Run `algoupdates.py status` first: a calendar that
+was not synced in 30 days says nothing about the last month.
+
 ## 7. Act
 
 | Signal | Response |

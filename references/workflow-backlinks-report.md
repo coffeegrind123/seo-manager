@@ -42,6 +42,25 @@ never a prospect for a young site anyway.
 Say in the report which path you used. **"No backlink data source configured" is
 an honest answer; an invented referring-domain count is not.**
 
+### Two prospect sources you already own (2026-10-03)
+
+```bash
+# 1. RECLAIM - real links, followed by real people, that land on a dead or moved URL.
+python3 $SEO/backlinks.py referrers --remote root@<host> --site <domain> > .seo/ref.json
+python3 $SEO/backlinks.py reclaim --scan .seo/ref.json --site https://<domain>
+# 2. UNLINKED MENTIONS - pages that already name the site without linking to it.
+python3 $SEO/backlinks.py mentions --brand "<Brand>" --site <domain> --add-prospects
+```
+
+Reclaim first: a `still_broken` row is a link that already exists and is being
+wasted, fixed with one 301 and no outreach at all (the suggested target is a slug
+match — confirm the content matches). An unlinked mention is the warmest outreach
+there is: the author already chose to write about the site. Every mention page is
+READ — a search snippet is not evidence — and grouped by publisher (a substack, a
+medium author, a subreddit is one prospect, not ten). ⚠ IP-lookup, WHOIS and
+scanner pages print every domain they meet; they come back as `machine_listings`
+and are never prospects. The first live run's only "prospect" was one.
+
 ## 2. Filter
 
 Keep relevant, plausibly-reachable prospects: niche blogs, tool directories,

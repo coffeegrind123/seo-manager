@@ -387,6 +387,29 @@ python3 $SEO/crawllog.py gap --crawled /tmp/crawled.txt \
 
 ---
 
+## 4b. Faceted navigation — budget spent enumerating filters
+
+```bash
+python3 $SEO/crawllog.py urls --remote root@<host> --ssh-key ~/.ssh/<key> \
+  --glob '/var/log/caddy/access*.log*' --bot googlebot --keep-query > /tmp/gb.tsv
+python3 $SEO/crawllog.py facets --urls /tmp/gb.tsv --site https://<domain> --check 10
+```
+
+`--keep-query` is required: without it every variant collapses onto its path and
+there is nothing to read (`facets` says so when no URL carries a query).
+`param_hit_share` is the share of the bot's hits spent on parameter URLs; each
+path is flagged `many_variants` (5+), `many_params` (3+ in one URL), `facet_keys`
+(sort/filter/colour/size/page…) or `tracking_params` (utm/gclid/session ids).
+`--check` fetches the most-crawled variants and says what each declares about
+itself: `canonicalised` (folds, but still costs the fetch), `noindex`, or
+**`indexable_duplicate`** — a self-canonical 200 under a parameter, the waste to
+fix first. A canonical saves the index; only a robots.txt pattern saves the
+crawl, and only for parameters that never carry unique content.
+
+**Success criteria**: `facets` was run on `--keep-query` output, and any `indexable_duplicate` variant is queued with its path and parameter keys rather than counted as budget.
+
+---
+
 ## 5. What to do with it
 
 Findings become queue items like anything else, and the same bar applies.

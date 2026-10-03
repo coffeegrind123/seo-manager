@@ -226,3 +226,88 @@ their crawler IP ranges in one JSON shape (`ipranges.py`; sources in
 actually read. `Bravebot` also joined the registry as `search`: Brave's index is
 what Claude's web search reads from, so its absence in the log is a
 precondition failure for a Claude citation, not a content problem.
+
+---
+
+## 7. 2026-10-03 — the edge layer, discovery documents, and four corrections
+
+**What a crawler is served is not what robots.txt says.** Three things sit between
+the file in the repo and what a crawler obeys, and each one is invisible from the
+repo:
+
+- **Cloudflare's managed robots.txt** is PREPENDED at the edge between
+  `# BEGIN Cloudflare Managed content` / `# END ...` markers (Cloudflare's docs,
+  `bots/additional-configurations/managed-robots-txt`). With an origin file present
+  it produces **two `User-agent: *` groups**. RFC 9309 §2.2.1 says every group
+  matching a crawler is combined; `agentcheck.py` read only the first, so on
+  Cloudflare's own documented example it reported the origin's `Disallow: /lp` as
+  open. Fixed, with that example as the fixture. `policy` now names the managed
+  block and the agents it closes (`cloudflare_managed_robots`, `high` when it
+  closes a citing crawler) — change it in the dashboard, not the repo.
+- **A robots.txt that varies by User-Agent.** `policy` fetches the file as
+  Googlebot and as the citing crawlers and diffs it against the browser copy
+  (`robots_varies_by_user_agent`).
+- **An edge that refuses the crawler outright** — Cloudflare AI Crawl Control, a
+  bot-fight rule, a WAF. `agentcheck.py reach <url>` fetches the page as a browser
+  (control 1), as a **forged Googlebot** (control 2) and as each `ai_search` /
+  `ai_user` UA, and classifies each `served` / `refused` / `challenged` / `differs`
+  / `silent`. ⚠ Every crawler UA sent from here is a forgery. An edge that verifies
+  bots by IP refuses forgeries whatever its AI policy is — measured on reddit.com:
+  403 to forged GPTBot AND to forged Googlebot. So when control 2 is refused,
+  `reach` answers **`cannot_ask`** and points at the access log; only when a forged
+  Googlebot is served does a refused AI UA mean a UA rule aimed at that crawler.
+  Challenge pages are recognised by vendor fingerprint (all patterns in a row must
+  match, under 120 visible words — a real article saying "Just a moment" is not one).
+
+**`/llms.txt` behind a CDN.** A 403/406 to a desktop-browser request is
+`blocked` — whether the file exists is unknown. It used to fold into "absent".
+
+**Discovery documents** (`agentcheck.py discovery`) — all optional, none a Google
+signal, absence never a finding:
+
+| Surface | What is checked | Source of the rules |
+|---|---|---|
+| `Agentmap:` in robots.txt, `<link rel="ai-catalog">`, `Link: rel=ai-catalog`, `/.well-known/ai-catalog.json` | Agentic Resource Discovery catalog, validated in the conformance suite's TWO tiers: errors (specVersion, `urn:air:` identifier, displayName, type present, exactly one of url/data, trustManifest.identity) and warnings (unregistered or renamed media type, representativeQueries outside 2–5, root `collections`) | `ards-project/ard-spec` `conformance/bin/conformance-test`, which Lighthouse's `ard-schema` audit ports directly. ⚠ A third-party port made "unregistered media type" an ERROR and so rejected Cloudflare's own live catalog (`application/vnd.oai.openapi+json`, `text/plain`) — that catalog is now the known-good fixture |
+| `/.well-known/ucp` | Universal Commerce Protocol profile in the shape the spec has: root `ucp`, dated `version`, `services` / `capabilities` keyed by reverse-domain name, each a LIST of version variants; a flat `{merchant, capabilities[]}` is `missing-ucp-root` | ucp.dev specification overview; developers.google.com/merchant/ucp |
+| `/.well-known/api-catalog`, `oauth-protected-resource`, `oauth-authorization-server`, `agent-card.json` | 200 + JSON (+ `linkset+json` for RFC 9727) | RFC 9727, RFC 9728, RFC 8414, A2A |
+
+The one real finding in this table is a **200 that is not the document**: a
+catch-all host answers its HTML shell for every `/.well-known` path, and
+Lighthouse's `ard-schema` audit FAILS a 200 at `ai-catalog.json` instead of
+marking it N/A. `discovery` probes a random path first and says when the host is
+a catch-all.
+
+**WebMCP:** `document.modelContext` is the current entry point;
+`navigator.modelContext` alone is the legacy one. `page` reports which, and counts
+`registerTool(` call sites in script bodies only.
+
+**Corrections and additions, each read on the primary page on 2026-10-03:**
+
+1. **Google's user-triggered fetchers "generally ignore robots.txt rules"**
+   (Google's wording, user-triggered-fetchers page). The list there:
+   Feedfetcher, Google-Read-Aloud, Google-CWS, Google-Site-Verification,
+   **Google-GeminiNotebook**, **Google-Agent**. `agentcheck.py policy` no longer
+   reports Google-Agent / GeminiNotebook as "blocked" by a Disallow
+   (`robots_applies: false`) — a block that does not happen is not a finding.
+2. **NotebookLM's fetcher is now `Google-GeminiNotebook`** (crawling changelog,
+   2026-07-16); the fetchers page lists `Google-NotebookLM` as supported until
+   August 2026. Both classify in `crawllog.py`.
+3. **Search Console's "Search generative AI" setting** (support answer 16908024,
+   worldwide 2026-08-31) can EXCLUDE a property from AI Overviews, AI Mode and
+   gen-AI in Discover: no links, no grounding, no impressions there. **Check it
+   before reading any AI-visibility absence** — an excluded site is uncitable by
+   configuration, and no content work changes that. It is separate from
+   `Google-Extended`, which governs Gemini training and grounding in Gemini Apps
+   and Vertex AI and "does not impact a site's inclusion in Google Search"
+   (common-crawlers page — unchanged from §1 above). A third-party claim that
+   Google-Extended also governs training of the models behind Search gen-AI
+   features is NOT on that page and is not repeated here.
+4. **Google has made no statement about `Content-Signal`** either way. Report a
+   declared signal as stated intent, never as something Google honours or ignores.
+   And a `*`-group signal says nothing to a crawler that has a group of its own —
+   `content_signal_not_in_named_groups` lists them.
+
+GoogleAgent-Mariner, GoogleAgent-URLContext and Gemini-Deep-Research come from
+the community `ai.robots.txt` list and are **not** on Google's fetchers page; they
+stay in `BOTS` but `ipranges.py` will not call one spoofed — undocumented is
+`unverifiable`.

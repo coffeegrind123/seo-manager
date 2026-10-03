@@ -1139,6 +1139,75 @@ spoofed. The reader refuses any body that is not the published shape.
   ordinary URLs, so `indexnow.py`'s "the Google half is a human clicking a
   button" stays exactly true.
 
+## The 2026-10-03 additions — a remembered "no API", and four maps
+
+### ✅ Google Search Status Dashboard — the update calendar HAS a feed
+
+The ledger said "There is no API" and was kept by hand; it had gone three
+months stale and missed two spam updates. Probed 2026-10-03:
+
+| URL | What it is |
+|---|---|
+| `status.search.google.com/incidents.json` | JSON, the ~10 most recent incidents across all products: `begin`, `end` (absent = still rolling out), `service_name` (Ranking, Serving…), `affected_products[].id`, Google's own update text |
+| `status.search.google.com/products/<id>/history` | HTML, every incident for a product since 2021 (42 for Ranking): incident id, start DAY, duration ("2 days, 16 hours"); a row with no duration is open. Ranking `rGHU1u87FJnkP6W2GwMi`, Serving `pKUD9XkLn3TBLquSpQMD` |
+| `status.search.google.com/en/feed.atom` | Atom, the latest incident only |
+| `status.search.google.com/incidents/<id>.json` | **404** — no per-incident JSON |
+
+`algoupdates.py sync` merges the first two. The HTML's class prefixes are a build
+hash, so rows are read by class SUFFIX; the control requires a known 2021
+incident to parse before a merge is accepted. Day-precision ends are rounded UP
+(a duration from an unknown start hour can end on the next calendar day), which
+only ever widens a correlation.
+
+### ✅ Google's user-triggered fetchers — a third IP file, and a "generally ignore"
+
+`developers.google.com/static/crawling/ipranges/user-triggered-agents.json`
+(creationTime 2026-10-02, 20 prefixes) is named on the user-triggered-fetchers
+page alongside the two files `ipranges.py` already read; it is read now. The same
+page says these fetchers "generally ignore robots.txt rules" and lists
+Google-Agent and Google-GeminiNotebook (NotebookLM's 2026-07-16 rename). User-
+owned fetchers reverse-resolve to `*.gae.googleusercontent.com`, which any App
+Engine tenant can obtain, so rDNS is not a witness for them — CIDR is.
+
+### ✅ CrUX History API — the same key, 25 weekly points
+
+`POST chromeuxreport.googleapis.com/v1/records:queryHistoryRecord?key=…` with
+`{origin|url, formFactor, metrics}` → `record.metrics.<m>.percentilesTimeseries.p75s`
+(CLS values are STRINGS; a missing week is null/`NaN`) and
+`record.collectionPeriods[].lastDate`. Measured with the install's
+`GOOGLE_API_KEY`: www.wikipedia.org returned 25 periods for LCP/INP/CLS;
+combatskirmish.net PHONE is `no_record`. Each point is a 28-day rolling window, so
+consecutive points overlap. `vitals.py history`.
+
+### Agentic Resource Discovery and UCP — the specs, not a port of them
+
+- **ARD** (`ai-catalog.json`): `ards-project/ard-spec`, `conformance/bin/
+  conformance-test` (`validate_manifest`, `classify_media_type`) is what Lighthouse's
+  `ard-schema` audit ports. Two tiers — errors invalidate, warnings do not. Any
+  valid IANA media type is allowed; developers.cloudflare.com's live catalog
+  uses `application/vnd.oai.openapi+json` and `text/plain` and is conformant.
+- **UCP** (`/.well-known/ucp`): ucp.dev specification overview — root `ucp`,
+  dated `version` (latest 2026-08-25), `services` / `capabilities` keyed by
+  reverse-domain name, each a list of version variants.
+
+### ⚠ Wikimedia rate-limits in time windows
+
+A burst of pageview probes (five calls plus two audits in a few minutes) drew
+HTTP 429 "You are making too many requests" on every call, including a probe
+that should 404; minutes later the same calls answered normally, from both
+curl and urllib, with the same UA. `trendfeeds.py pageviews` now retries 429/503
+twice with backoff, and its control reports a refusal as `unreachable` rather
+than letting the audit call the reader broken.
+
+### Mapped, not built
+
+- **awesome-submitlist** (`alvinunreal/awesome-submitlist`, `data/destinations.json`,
+  CC0, synced weekly from api.submitlist.io): 339 launch destinations with
+  type, link_type, DR, traffic and pricing. Used as a SEED for
+  `backlink-playbook.md`, never as truth — its 37 newsletters are all labelled
+  "dofollow" (a link in an email is not a backlink) and its 44 subreddits
+  "unknown" (Reddit links are ugc/nofollow).
+
 ## Evaluated and REJECTED — do not re-add these
 
 Each was probed from this container on 2026-08-01. Recording the negatives so

@@ -60,6 +60,53 @@ best; do not take all four.
 
 ---
 
+## Seeds from awesome-submitlist — free, listed as dofollow, NOT verified here
+
+Imported 2026-10-03 from `alvinunreal/awesome-submitlist` (`data/destinations.json`, CC0, synced 2026-09-28 from api.submitlist.io): the 44 entries typed directory / launch site / marketplace, priced free and labelled dofollow, minus everything already above.
+
+⚠ **The link type is the LIST's claim, not a measurement.** The same file labels all 37 of its newsletters "dofollow" (a link in an email is not a backlink) and all 44 subreddits "unknown" (Reddit links are ugc/nofollow), and it lists Capterra as dofollow where the table above has it as nofollow - Capterra is left out here for that reason. Before spending time on one, open an EXISTING listing on it and read the `rel` on the outbound link. `sitelike.org` was dropped: it is a site-value directory, the class `backlinks.py mentions` files as `machine_listings`. The DR column is the list's Ahrefs figure.
+
+| DR | Where | Type | Free tier, per the list | Audience |
+|---|---|---|---|---|
+| 91 | **[Nextdoor](https://business.nextdoor.com/en-us/getting-started/business-page)** | directory | free | business |
+| 91 | **[ProvenExpert](https://www.provenexpert.com/en-us/register/)** | directory | free | business |
+| 86 | **[GeekWire](https://www.geekwire.com/submit-startup/)** | directory | free | business, startup |
+| 86 | **[Softpedia](https://www.softpedia.com/user/submit.shtml)** | directory | free | developer-tools, saas |
+| 84 | **[TrustRadius](https://solutions.trustradius.com/)** | directory | Qualifying products can be listed for free, while Customer Voice and add-ons are paid. | business, saas |
+| 83 | **[F6S](https://www.f6s.com/)** | directory | A basic company profile is free; Grok notes that some premium features may be paid. | business, startup |
+| 79 | **[Brownbook](https://www.brownbook.net/register/)** | directory | Listing creation, profile claims, and enhanced Profile+ accounts are free. | business |
+| 79 | **[Index by Dodo Payments](https://index.dodopayments.com/submit)** | directory | Listing submission is free and is subject to Dodo Payments team verification. | indie, startup |
+| 78 | **[ToolPilot.ai](https://www.toolpilot.ai/pages/submit-your-ai-tool)** | directory | The free tier requires a backlink or badge and can take up to about 90 days; Priority is about US$99 one-time and Premium starts about US$19 | ai |
+| 76 | **[e27](https://e27.co/startup/create/profile/)** | directory | Basic company profiles, funding submissions, and contributor content are free; Pro membership adds visibility and networking features. | community, startup |
+| 75 | **[Alternative.me](https://alternative.me/how-to/submit-software/)** | directory | Software submission is free with a user account. | indie, productivity |
+| 75 | **[Gust](https://gust.helpscoutdocs.com/article/211-publishing-your-profile)** | directory | Basic profile creation, publishing, and directory visibility are free; Gust Launch and related incorporation or equity-management products a | business, startup |
+| 75 | **[SaaSworthy](https://saasworthy.com)** | directory | Standard includes a basic profile and organic review capture, with higher paid plans. | business, saas, startup |
+| 74 | **[SelectHub](https://pmo.selecthub.com/claim-your-product/)** | directory | The basic claim and listing path is available with paid seller programs for analyst validation, leads, and enhanced profiles. | business, saas |
+| 73 | **[Landbook](https://land-book.com/submission-guidelines)** | directory | Website submissions are free; templates can have a paid feature step after approval. | design |
+| 73 | **[PeerPush](https://peerpush.com/)** | product-launch-site | The free plan joins a publication queue; one-time paid plans offer immediate publication, permanent links, and optional promotion. | indie, startup |
+| 73 | **[SoftwareWorld](https://www.softwareworld.co/)** | directory | Basic listings are free; paid Featured and Sponsored plans offer ranking, interviews, PR, and other promotion. | business, saas |
+| 72 | **[Aura++](https://auraplusplus.com/projects/submit)** | product-launch-site | Free and no-follow tiers cost US$0; Premium costs US$29 and Premium Plus costs US$69, with stronger promotional and link benefits. | indie, startup |
+| 71 | **[AI Directories](https://www.aidirectori.es/submit-ai-tool)** | directory | Submitting an AI tool to the site's own catalog is free; one-time paid packages starting around US$99 cover manual submission to external di | ai |
+| 71 | **[Ecomm Design](https://ecomm.design/submit/)** | directory | The submission and about pages do not list a paid listing option. | design, ecommerce |
+| 71 | **[TrustMRR](https://trustmrr.com/dashboard)** | directory | The base verified-revenue listing is free; paid add-ons include dofollow and visibility upgrades, while marketplace sale plans start at US$2 | business, saas |
+| 70 | **[OpenHunts](https://openhunts.com/projects/submit)** | product-launch-site | Free Launch costs US$0 with limited weekly slots and a long queue; Premium Launch starts at about US$9.90, with higher highlight options ava | indie, startup |
+| 68 | **[PitchWall](https://pitchwall.co/submit)** | product-launch-site | Free Launch has a wait of 30 days or more; Pro Launch costs US$49 and Premium Launch costs US$99 for faster or featured placement. | ai, developer-tools, saas, startup |
+| 67 | **[Serchen](https://www.serchen.com/get-listed/)** | directory | Basic Get Listed and profile claim are available without a required fee; premium features and advertising are separate. | business, saas |
+| 62 | **[Startup Ranking](https://www.startupranking.com/startup/create)** | product-launch-site | Startup registration and listing are free; a paid option of about $99 accelerates approval from the typical 60–80 days to 24 hours, with add | saas, startup |
+| 58 | **[AI With Me](https://aiwith.me/submit/)** | directory | Free submissions are available with a longer wait and lower visibility; paid one-time and monthly plans offer faster listing, higher placeme | ai, saas |
+| 53 | **[Saas AI Tools](https://saasaitools.com/submit-listing-2/)** | directory | Free submissions use a review queue; an optional featured or fast-track option costs about $67 for priority. | ai, saas |
+| 51 | **[Appvizer](https://help.appvizer.com/en/articles/how-do-i-reference-software-on-appvizer)** | directory | Basic software referencing is free and without commitment; paid campaigns and lead-generation options are separate. | business, saas |
+| 51 | **[eBool](https://www.ebool.com/submit)** | directory | The free queue can take about six months; one-time Premium, Pro, and Super options cost about $47, $117, and $197 for priority review and st | business, saas |
+| 51 | **[VentureRadar](https://www.ventureradar.com/add_company)** | directory | The standard company profile is free and reviewed, typically within 21 business days. The add-company form also offers a $75 Premium Profile | business, saas, startup |
+| 50 | **[AppAgg](https://appagg.com/add/)** | directory | Grok reported free listing submission. | developer-tools, startup |
+| 44 | **[TipSeason](https://www.tipseason.com/ai-tools/submit-free)** | directory | The directory offers a free queue listing and a $99 paid priority review; the site presents the free queue as up to 90 days and the paid rev | ai, productivity, startup |
+| 43 | **[Startup Buffer](https://startupbuffer.com/site/submit)** | directory | A profile can be submitted for review without payment; separate paid promotion packages offer faster or tracked placement. | business, saas, startup |
+| 42 | **[BestofAI](https://bestofai.com/)** | directory | The basic Add Tool path is presented as a free account action; featured sponsor placement is published at $250 per month. | ai, saas |
+| 10 | **[BroUseAI](https://www.brouseai.com/submission/ai)** | directory | Basic submission is free and enters the review queue; the optional Premium plan is a one-time $29 plus VAT and advertises review within 48 h | ai, productivity |
+
+**App marketplaces** - a listing is only possible if you ship the integration, and then it is one of the strongest links a tool site can earn: [Google Workspace Marketplace](https://developers.google.com/workspace/marketplace/how-to-publish) (DR 100); [Microsoft Marketplace](https://learn.microsoft.com/en-us/partner-center/marketplace-offers/submit-to-appsource-via-partner-center) (DR 96); [HubSpot App Marketplace](https://developers.hubspot.com/docs/apps/developer-platform/list-apps/listing-your-app/app-marketplace-listing-requirements) (DR 93); [Slack App Directory](https://api.slack.com/apps) (DR 92); [Visual Studio Marketplace](https://code.visualstudio.com/api/working-with-extensions/publishing-extension) (DR 92); [Make App Directory](https://www.make.com/en/technology-partners) (DR 90); [n8n Integrations](https://docs.n8n.io/integrations/creating-nodes/deploy/submit-community-nodes/) (DR 90); [Wellfound](https://wellfound.com/recruit/all-features/post-a-job) (DR 87); [Spot SaaS](https://www.spotsaas.com/get-listed) (DR 67).
+
+
 ## Paid — only if the free list is exhausted
 
 Ordered by ROI, and the honest answer is usually **"not yet"**. Work every free

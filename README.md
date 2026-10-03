@@ -26,10 +26,10 @@ directory. Scripts are stdlib Python 3 with no installs.
 | Workflow | Job |
 |---|---|
 | `crawl-log` | real crawl budget from your own access log: budget by silo, statuses served to bots, AI-crawler ingestion, verified-vs-spoofed Googlebot |
-| `decay` | pages that lost *rank*, separated from pages whose *demand* fell |
-| `drift` | whole-page-1 diffs: new entrants, AI-Overview changes, volatility, algorithm-update correlation |
+| `decay` | pages that lost *rank*, separated from pages whose *demand* fell, and pages that lost the *click* at a held rank |
+| `drift` | whole-page-1 diffs: new entrants, AI-Overview changes, volatility, algorithm-update correlation against real rollout spans synced from Google's Search Status Dashboard |
 | `programmatic` | index-bloat scoring across generated silos, decided on index evidence |
-| `health` | technical audits triaged into queue items |
+| `health` | `sitecheck.py` (hosts, soft 404, sitemap, redirects, canonicals, headers) + the link graph, triaged into queue items |
 
 ## Design rules it holds itself to
 
@@ -43,6 +43,9 @@ directory. Scripts are stdlib Python 3 with no installs.
   the failure mode that silently scores a stranger's SERP.
 - **The authority count on page 1 overrules any difficulty score**, in both
   directions.
+- **A rate that moved is not a rate that changed.** CTR, citation rate and
+  remeasured shares change only when a 95% interval of the difference excludes
+  zero (`stats.py`, pinned to the methods' published values).
 - **Free-first.** DuckDuckGo, Google Autocomplete, real Google via a headed
   browser, Search Console, access logs, Common Crawl, RDAP, sitemaps. SerpApi /
   Brave / DataForSEO / Open PageRank are upgrades, never prerequisites.
@@ -59,11 +62,13 @@ Then, from your site's repo root, ask Claude Code to "set up the SEO pipeline".
 ## Tests
 
 ```bash
-python3 scripts/test_guards.py    # SERP guards, against real captured responses
-python3 scripts/test_measure.py   # bot classification, log parsing, verification, decay
+python3 scripts/run_tests.py      # all 23 suites, each in its own process, JSON verdict
+python3 scripts/controls.py audit # can every instrument still tell a finding from a reader bug?
 ```
 
-Both suites are built from bugs that actually shipped — the fixtures in
+Use `run_tests.py`, not `pytest` — most suites define no `test_` functions, and
+pytest reports a green over a fraction of them. The suites are built from bugs
+that actually shipped — the fixtures in
 `assets/fixtures/` are real responses, including the two that fooled every naive
 check.
 

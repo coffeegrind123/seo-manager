@@ -774,6 +774,103 @@ PageRank and Tranco already triangulate), Keyword Planner (a manager account
 and a developer token for bucketed ranges), and every composite score.
 
 
+
+## Fourth pass, 2026-10-03 — a remembered "no API", and the bugs a teardown finds at home
+
+Re-run with `gh` thirteen days after the third pass, at the owner's request
+("search GitHub for SEO repos, pick and implement"). Three teardowns ran in
+parallel; every claim acted on below was re-read on its primary source first,
+and three of the teardowns' claims did not survive that (end of section).
+
+**The landscape moved again, on a two-week cadence.** claude-seo 17,258 →
+18,221★ (v2.4.0 "agent readiness", v2.4.1 "Google-currency patch", a Google
+changes ledger verified through 2026-09-28); open-seo 19,560 → 22,240★ (JS
+rendering in audits, Shopify crawler signatures); marketingskills 52,636★;
+geo-seo-claude 10,915★ (Cloudflare managed-robots detection); geo-optimizer-skill
+975★ (llms.txt behind a CDN/WAF). New since 09-20: `jianruntech/geo-score` (619★,
+an "open GEO rubric" - a 0–100 score, so its scoring is out and its MEASUREMENT
+rules were read), `Albert-Weasker/niubigeo` (4,855★), `limelit-co/open`,
+`elmohq/elmo` (citation taxonomy, alias matching), `databluedev/searchmirror`,
+`SelmiAbderrahim/rankme.fast`, two `jev-seo` audit tools, `alvinunreal/awesome-
+submitlist` (339 launch destinations, CC0), and the RankSpotAI awesome-lists.
+
+**Searching the ECOSYSTEM found less than searching OUR OWN CODE against it.**
+Reading what the siblings check, and then asking whether this skill gets the
+same input right, turned up more defects than features:
+
+| Found | Where | What it did |
+|---|---|---|
+| ledger had no end dates | `decay.py`, `drift.py` | windowed on `ended`, which no row carried: a core update that began before the window never correlated |
+| "there is no API" | `google-updates.json` | false - `incidents.json` + `/history`; the ledger was 3 months stale and missed 2 spam updates |
+| `splitlines()` on robots.txt | `agentcheck.py`, `competitors.py` | U+2028 (and NEL, VT, FF, FS) inside a COMMENT became a live rule |
+| BOM before `User-agent` | `agentcheck.py` | the whole first group vanished |
+| empty `User-agent:` | `agentcheck.py` | matched every crawler - a blank line made GPTBot fully disallowed |
+| groups not combined (RFC 9309 2.2.1) | `agentcheck.py` | Cloudflare's managed block adds a second `*` group; the origin's Disallows were read as open |
+| a second robots parser | `competitors.py` | no Allow, no longest match, per-line group reset - now the shared one |
+| substring mentions | `geo.py` | "Nova" in "Casanova"; a citation LINK counted as a prose mention, merging two rungs |
+| `news.bbc.co.uk` → `co.uk` | `geo.py`, `backlinks.py`, (+ partial lists in `serp.py`, `rankcheck.py`) | any .co.uk citation was "us" for a .co.uk site; one shared `providers.registrable` now |
+| empty AI Overview block | `geo.py` | SerpApi's `{"error": "...not available"}` block read as an answer that left us out |
+| `depth_checked` dropped | `seostate.py record-rank` | every stored null position had lost the depth `rankcheck.py`'s docstring promised it kept; exit country never stored |
+| health's "always run" audits | `workflow-health.md` | named three skills that are not installed |
+| a 429 called "broken" | `controls.py audit` | a rate-limited live control turned the audit red as a reader bug |
+
+**Built, all stdlib** (35 instruments / 697 control checks / 23 suites after):
+
+- `algoupdates.py` (new) - the ledger synced from Google's own dashboard, one span
+  definition for both consumers, `possibly_in_window` for unknown ends,
+  `unverified[]` for refused rumours; `seodoctor` re-syncs when stale.
+- `sitecheck.py` (new) - hosts, soft 404, redirects, sitemap sample, canonicals,
+  headers/mixed content, variants, graph-based link targets, `diff`. Rules from
+  jev-seo ×2 and Bhanunamikaze/Agentic-SEO-Skill, re-derived.
+- `stats.py` (new) - Wilson, Newcombe hybrid, exact McNemar, Holm; used by `geo`,
+  `decay` (`ctr_loss`), `remeasure` (`--denominator`). From searchmirror and
+  geo-score's statistics, pinned to the methods' published values.
+- `agentcheck.py` - `reach` (forged-Googlebot control; geo-score's challenge
+  table), `discovery` (ARD from the spec's own conformance suite, UCP in the shape
+  ucp.dev defines), managed-robots, per-UA robots diff, Content-Signal coverage,
+  llms.txt `blocked`, WebMCP entry point, Google's robots-ignoring fetchers.
+- `geo.py` - CIs, stable bands, parser-drift control, retrieved vs cited, source
+  kinds (elmo's taxonomy, reduced), list rank (limelit's rule), URL hygiene,
+  Gemini redirect resolution, `diff` (paired, exact, Holm), `gap` (the GSC ×
+  overview join prior-art.md had left as the one unbuilt `ai_overviews_impact`).
+- `rankcheck.py` - rank states, drop candidates confirmed by a second read
+  (rankme.fast). `backlinks.py` - `reclaim`, `mentions` (beyondseo's reputation
+  method), machine listings. `sitegraph.py suggest` (rankme.fast's
+  candidate rule, scaled to titles). `crawllog.py facets`
+  (Agentic-SEO-Skill's faceted-nav audit, from our own logs). `vitals.py history`
+  (CrUX History). `crawllog`/`ipranges` - Google-GeminiNotebook, Google-Agent,
+  OAI-AdsBot, Google's `user-triggered-agents.json`.
+
+**Three teardown claims that did not survive the primary source** - the reason
+every claim was re-read before it was used:
+
+1. *"Google-Extended also governs training of the models behind Search gen-AI
+   features."* Not on Google's common-crawlers page, which says Gemini Apps /
+   Vertex training and grounding and "does not impact a site's inclusion in
+   Google Search". Not written anywhere here.
+2. *"ARD `type` must be a registered media type"* (claude-seo's port). The
+   spec's conformance suite makes that a WARNING at most and permits extension
+   types; developers.cloudflare.com's live catalog uses `vnd.oai.openapi+json` and
+   `text/plain` and is conformant. A port of a validator is not the validator.
+3. *GoogleAgent-Mariner / -URLContext / Gemini-Deep-Research as Google
+   user-triggered fetchers.* Not on Google's fetchers page (the six there are
+   Feedfetcher, Read-Aloud, CWS, Site-Verification, GeminiNotebook, Google-Agent).
+   They stay in `BOTS` from the community list, and `ipranges.py` will not call one
+   spoofed.
+
+**Not taken:** geo-score's 0–100 readiness score and every other composite;
+model-labelled sentiment and "recommendation" (niubigeo's are a stub and a
+self-label); elmo's 25k editorial-domain list (the rule taxonomy covers the
+recurring hosts; vendoring 25k rows for the long tail is not worth the file);
+SERP-overlap keyword clustering (the third pass's reason still holds); the
+Lighthouse `AGENTIC_BROWSING` PSI category (worth a look when it leaves the
+13.x line - it reads `auditRefs` at runtime, so wiring it is cheap later);
+Google Ads Keyword Planner, Common Crawl web graph (unchanged reasons).
+
+**The rule this pass adds:** when a sibling ships a check, run OUR equivalent on
+THEIR fixture before reading their code. Five of the bugs above were found that
+way in minutes; none would have been found by reading feature lists.
+
 ---
 
 ## Ranked gaps
