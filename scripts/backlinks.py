@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import subprocess
 import sys
@@ -72,6 +73,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from providers import registrable as _shared_registrable  # noqa: E402
 try:
     import crawllog
 except Exception as exc:                                    # pragma: no cover
@@ -179,9 +181,7 @@ def _registrable(host: str) -> str:
     """Good-enough eTLD+1 for same-owner matching. Deliberately NOT a public-suffix
     list: this only decides whether to LABEL a row as self-referral, and the rows
     are all still reported, so a wrong answer costs a label rather than data."""
-    bare = host.split(":", 1)[0]
-    parts = [x for x in bare.split(".") if x]
-    return ".".join(parts[-2:]) if len(parts) >= 2 else bare
+    return _shared_registrable(host)
 
 
 def classify_referrer(host: str, landing: str, own: set[str]) -> str:
@@ -437,9 +437,10 @@ def cmd_referrers(a):
             d = domains.get(h)
             if d is None:
                 d = domains[h] = {"hits": 0, "landing": Counter(), "sources": Counter(),
-                                  "first": None, "last": None}
+                                  "served": Counter(), "first": None, "last": None}
             d["hits"] += 1
             d["landing"][rec["uri"].split("?", 1)[0]] += 1
+            d["served"][(rec["uri"].split("?", 1)[0], int(rec.get("status") or 0))] += 1
             d["sources"][ref[:180]] += 1
             if rec["ts"]:
                 t = rec["ts"].timestamp()
@@ -448,7 +449,7 @@ def cmd_referrers(a):
 
     own = {_registrable(a.site)} if a.site else set()
     own |= {_registrable(x) for x in (a.own or [])}
-    rows, excluded = [], []
+    rows, excluded, reclaim = [], [], {}
     for h, d in sorted(domains.items(), key=lambda kv: -kv[1]["hits"]):
         top_landing = d["landing"].most_common(3)
         row = {
@@ -463,6 +464,15 @@ def cmd_referrers(a):
         kind = classify_referrer(h, top_landing[0][0] if top_landing else "", own)
         if kind == "genuine":
             rows.append(row)
+            # A real link a person followed, landing on an error or a redirect,
+            # is the cheapest link there is to win back: it already exists.
+            for (path, st), n in d["served"].items():
+                if st >= 400 or (300 <= st < 400 and st != 304):
+                    r_ = reclaim.setdefault(path, {"path": path, "status": st, "visits": 0,
+                                                   "referrers": []})
+                    r_["visits"] += n
+                    if h not in r_["referrers"]:
+                        r_["referrers"].append(h)
         else:
             row["excluded_as"] = kind
             excluded.append(row)
@@ -509,6 +519,7 @@ def cmd_referrers(a):
         "search_referrals": dict(search_hits.most_common(10)),
         "ai_assistant_referrals": dict(ai_hits.most_common(10)),
         "backlinks": rows[: a.top],
+        "reclaim_candidates": sorted(reclaim.values(), key=lambda r: -r["visits"])[: a.top],
         # Kept, not hidden: a misclassification has to be VISIBLE to be fixable,
         # and one person's referrer spam is another's small niche forum.
         "excluded": excluded[: a.top],
@@ -529,6 +540,10 @@ def cmd_referrers(a):
                                       "and the citation was clicked. This is the hardest possible "
                                       "GEO evidence, and it is the downstream half of what "
                                       "crawllog.py's ai_search/ai_user categories measure upstream.",
+            "reclaim_candidates": "Genuine referrals that were SERVED a 4xx or a redirect: a real "
+                                  "link, followed by a real person, landing on a dead or moved "
+                                  "URL. `backlinks.py reclaim --scan <this json>` re-checks each "
+                                  "one live and proposes a 301 target.",
             "blind_spot": "A backlink nobody clicks does not appear here and still passes ranking "
                           "signal. Treat this as a FLOOR on the link profile, never a census.",
             "next": "Record the ones worth keeping with `seostate.py prospect-add`, and look at "
@@ -659,6 +674,242 @@ def cmd_footprint(a):
     }, indent=2, ensure_ascii=False))
 
 
+def _slug_words(u: str) -> set[str]:
+    path = urlsplit(u).path if "://" in u else u
+    return {w for w in re.split(r"[^a-z0-9]+", path.lower()) if len(w) >= 3}
+
+
+def reclaim_rows(cands: list[dict], origin: str, sitemap_urls: list[str], chain=None) -> list[dict]:
+    """Each candidate -> its state NOW (the log may be weeks old) and, when
+    still broken, the sitemap URL whose slug shares the most words with it.
+    A suggestion is a lead for a human to confirm, never an automatic 301."""
+    o = origin.rstrip("/")
+    out = []
+    for c in cands:
+        url = o + c["path"]
+        hops = chain(url)
+        final = hops[-1]
+        row = {**c, "url": url, "now": [h.get("status") for h in hops]}
+        if final.get("status") == 200 and len(hops) == 1:
+            row["state"] = "already_fixed"
+        elif final.get("status") == 200:
+            row["state"] = "redirects_to_live"
+            row["hops"] = len(hops) - 1
+        elif final.get("status") is None:
+            row["state"] = "unknown"
+        else:
+            row["state"] = "still_broken"
+            words = _slug_words(c["path"])
+            best = max(sitemap_urls, key=lambda u: (len(words & _slug_words(u)), -len(u)),
+                       default=None)
+            if best and words & _slug_words(best):
+                row["suggest_301_to"] = best
+                row["shared_slug_words"] = sorted(words & _slug_words(best))
+        out.append(row)
+    return out
+
+
+def cmd_reclaim(a):
+    """Local only: needs live HTTP and sitecheck.py, so it never runs on --remote."""
+    import sitecheck
+    try:
+        scan = json.loads(Path(a.scan).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        die(f"cannot read {a.scan}: {exc}")
+    cands = scan.get("reclaim_candidates")
+    if cands is None:
+        die("that file has no reclaim_candidates - re-run `referrers` with this version")
+    sm_urls = []
+    for src in (a.sitemap or sitecheck.sitemaps_for(a.site)):
+        sm_urls += [e["loc"] for e in sitecheck.read_sitemaps(src)["urls"]]
+    rows = reclaim_rows(cands, a.site if "://" in a.site else "https://" + a.site, sm_urls,
+                        chain=sitecheck.follow_chain)
+    print(json.dumps({
+        "ok": True, "check": "backlinks-reclaim", "candidates": len(rows),
+        "still_broken": [r for r in rows if r["state"] == "still_broken"],
+        "redirects_to_live": [r for r in rows if r["state"] == "redirects_to_live"],
+        "already_fixed": len([r for r in rows if r["state"] == "already_fixed"]),
+        "unknown": [r for r in rows if r["state"] == "unknown"],
+        "sitemap_urls_considered": len(sm_urls),
+        "reading": ("`still_broken` rows are live links into dead URLs: 301 each to the page that "
+                    "replaced it (the slug match is a lead, confirm the content matches). "
+                    "`redirects_to_live` already land somewhere - ask the linking site to update "
+                    "the URL only when the chain is long."),
+    }, indent=2))
+
+
+# Platforms where one registrable domain hosts many independent publishers. A
+# mention on alice.substack.com and one on bob.substack.com are two outreach
+# targets, and ten posts by one author on medium.com are one.
+_PLATFORM_SUBDOMAIN = {"substack.com", "blogspot.com", "wordpress.com", "tumblr.com",
+                       "github.io", "ghost.io", "hashnode.dev", "bearblog.dev"}
+_PLATFORM_PATH = {"medium.com", "dev.to", "reddit.com"}
+
+
+def publisher_key(url: str) -> str:
+    p = urlsplit(url)
+    host = (p.hostname or "").lower()
+    host = host[4:] if host.startswith("www.") else host
+    reg = _registrable(host)
+    if reg in _PLATFORM_SUBDOMAIN and host != reg:
+        return host
+    if reg in _PLATFORM_PATH:
+        seg = [x for x in p.path.split("/") if x]
+        if seg and (seg[0].startswith("@") or reg == "dev.to"):
+            return f"{reg}/{seg[0]}"
+        if reg == "reddit.com" and len(seg) >= 2 and seg[0] == "r":
+            return f"reddit.com/r/{seg[1]}"
+    return reg
+
+
+# Pages that print every domain they meet: IP/ASN lookups, WHOIS, DNS and
+# site-value directories, security scanners. Measured 2026-10-03: the first
+# live run's only "prospect" was bgp.he.net's IP page and all four "links"
+# were scanner reports. A name in a machine listing is not an author's choice,
+# so it is labelled, kept visible, and never offered for outreach.
+_MACHINE_HOSTS = {"bgp.he.net", "stackray.app", "urlscan.io", "whois.com", "who.is",
+                  "builtwith.com", "similarweb.com", "siteprice.org", "sitelike.org",
+                  "hypestat.com", "website.informer.com", "dnslytics.com", "securitytrails.com",
+                  "viewdns.info", "robtex.com", "shodan.io", "censys.io", "crt.sh",
+                  "virustotal.com", "sitecheck.sucuri.net", "statvoo.com", "siteindices.com",
+                  "webstatsdomain.org", "ipaddress.com", "dnschecker.org", "domaintools.com"}
+_MACHINE_PATH = re.compile(r"/(ip|ipv6|asn?|whois|dns|domain|domains|site|sites|scan|scans|"
+                           r"targets?|lookup|report|result)/", re.I)
+_MACHINE_HOST_WORD = re.compile(r"(^|\.)(whois|dns|ipinfo|ip|scan|scanner|lookup|siteinfo|"
+                                r"sitevalue|worth)[a-z0-9-]*\.", re.I)
+
+
+def machine_listing(url: str) -> bool:
+    p = urlsplit(url)
+    host = (p.hostname or "").lower()
+    reg = _registrable(host)
+    if host in _MACHINE_HOSTS or reg in _MACHINE_HOSTS or any(host.endswith("." + m) for m in _MACHINE_HOSTS):
+        return True
+    return bool(_MACHINE_HOST_WORD.search(host + ".") and _MACHINE_PATH.search(p.path + "/"))
+
+
+def classify_mention_page(html: str, page_url: str, domain: str, brand: str | None) -> dict:
+    """linked / mention_only / absent for one fetched page. Comments, scripts
+    and styles are not prose; a brand inside a longer word is not a mention
+    (the matcher is geo.py's, shared so the two never disagree)."""
+    from html.parser import HTMLParser
+    from geo import _name_patterns
+
+    ours = _registrable(domain)
+
+    class P(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.skip, self.text, self.links = 0, [], []
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style", "noscript", "template"):
+                self.skip += 1
+            if tag == "a":
+                a = dict(attrs)
+                href = a.get("href") or ""
+                h = host_of(href) if "://" in href else ""
+                if h and _registrable(h) == ours:
+                    self.links.append(sorted((a.get("rel") or "").lower().split()))
+
+        def handle_endtag(self, tag):
+            if tag in ("script", "style", "noscript", "template") and self.skip:
+                self.skip -= 1
+
+        def handle_data(self, data):
+            if not self.skip:
+                self.text.append(data)
+
+    pr = P()
+    try:
+        pr.feed(html or "")
+    except Exception:
+        pass
+    if pr.links:
+        followed = [r for r in pr.links if not ({"nofollow", "ugc", "sponsored"} & set(r))]
+        return {"state": "linked", "links": len(pr.links),
+                "rels": pr.links[0] if not followed else [],
+                "followed_links": len(followed)}
+    text = " ".join(pr.text)
+    if any(r.search(text) for r in _name_patterns(domain, brand)):
+        return {"state": "mention_only"}
+    return {"state": "absent"}
+
+
+def cmd_mentions(a):
+    """Pages that name the site and do not link to it - the warmest outreach
+    there is: the author already chose to write about you. Search for the brand
+    and the domain, excluding the site, then READ each page; a search snippet
+    is not evidence of a mention."""
+    from competitors import robots_allows
+    from providers import BROWSER_UA, http as _http
+    seen, pages = set(), []
+    queries = [f'"{a.brand}" -site:{a.site}'] + ([f'"{a.site}" -site:{a.site}'] if not a.brand_only else [])
+    refused = []
+    for q in queries:
+        p = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "serp.py"), q,
+                            "--count", str(a.count), "--raw"], capture_output=True, text=True,
+                           timeout=300)
+        try:
+            d = json.loads(p.stdout or "{}")
+        except ValueError:
+            d = {}
+        if not d.get("ok"):
+            refused.append({"query": q, "error": d.get("error") or (p.stderr or "")[-300:]})
+            continue
+        for r in d.get("results") or []:
+            u = r.get("url") or ""
+            if u and u not in seen and _registrable(host_of(u)) != _registrable(a.site):
+                seen.add(u)
+                pages.append(u)
+    if not pages and refused:
+        die("no search for the brand could be read - nothing is known about mentions",
+            refused=refused)
+    rows = []
+    for u in pages[: a.max_pages]:
+        if not robots_allows(u):
+            rows.append({"url": u, "state": "robots_disallowed"})
+            continue
+        r = _http(u, timeout=25, ua=BROWSER_UA, retries=1)
+        if r.get("status") != 200:
+            rows.append({"url": u, "state": "unreadable", "status": r.get("status")})
+            continue
+        row = {"url": u, "publisher": publisher_key(u),
+               **classify_mention_page(r.text(), u, a.site, a.brand)}
+        if row["state"] in ("linked", "mention_only") and machine_listing(u):
+            row["machine_listing"] = True
+        rows.append(row)
+    prospects, seen_pub = [], set()
+    for r in rows:
+        if r["state"] == "mention_only" and not r.get("machine_listing") \
+                and r["publisher"] not in seen_pub:
+            seen_pub.add(r["publisher"])
+            prospects.append(r)
+    added = 0
+    if a.add_prospects:
+        for r in prospects:
+            subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "seostate.py"),
+                            "prospect-add", "--domain", r["publisher"], "--url", r["url"],
+                            "--reason", "unlinked mention - the page names us without a link",
+                            "--angle", "ask for the existing mention to become a link"],
+                           capture_output=True, text=True)
+            added += 1
+    print(json.dumps({
+        "ok": True, "check": "backlinks-mentions", "queries": queries, "refused": refused,
+        "pages_read": len([r for r in rows if r["state"] in ("linked", "mention_only", "absent")]),
+        "unlinked_prospects": prospects,
+        "already_linked": [r for r in rows if r["state"] == "linked" and not r.get("machine_listing")],
+        "machine_listings": [r for r in rows if r.get("machine_listing")],
+        "not_a_mention": len([r for r in rows if r["state"] == "absent"]),
+        "unreadable": [r for r in rows if r["state"] in ("unreadable", "robots_disallowed")],
+        "prospects_added": added,
+        "reading": ("Each prospect page was READ and names the brand in its text without linking. "
+                    "One row per publisher (a substack, a medium author, a subreddit). `absent` "
+                    "pages matched the search but not the page - search engines match more loosely "
+                    "than a name does. Unreadable pages are unknown, not mentions."),
+    }, indent=2))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -689,6 +940,22 @@ def main():
     s.add_argument("--limit", type=int, default=1000, help="captures per index")
     s.add_argument("--top", type=int, default=20)
     s.set_defaults(fn=cmd_footprint)
+
+    s = sub.add_parser("reclaim", help="re-check referred-but-broken landings live; propose 301s")
+    s.add_argument("--scan", required=True, help="saved JSON output of `referrers`")
+    s.add_argument("--site", required=True, help="origin, e.g. https://example.com")
+    s.add_argument("--sitemap", action="append", help="default: the sitemaps robots.txt lists")
+    s.set_defaults(fn=cmd_reclaim)
+
+    s = sub.add_parser("mentions", help="pages that NAME the site without linking (outreach)")
+    s.add_argument("--brand", required=True)
+    s.add_argument("--site", required=True, help="bare domain, e.g. example.com")
+    s.add_argument("--count", type=int, default=20)
+    s.add_argument("--max-pages", type=int, default=30)
+    s.add_argument("--brand-only", action="store_true", help="skip the domain-name search")
+    s.add_argument("--add-prospects", action="store_true",
+                   help="file each unlinked mention with seostate.py prospect-add")
+    s.set_defaults(fn=cmd_mentions)
 
     a = p.parse_args()
     a.fn(a)

@@ -97,6 +97,70 @@ check(f"no referrers flag is dropped on --remote (missing: {missing})", not miss
 check("the control itself found real flags to check", len(declared - remote_only) >= 5)
 
 print()
+print("\n8. reclaim - a real link that lands on a dead page is a link being wasted")
+import subprocess as _sp, tempfile as _tf, json as _js
+from pathlib import Path
+UA_H = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+def _ln(path, status, ref, n=1):
+    return "".join(f'1.2.3.{i} - - [01/Oct/2026:10:00:0{i % 10} +0000] "GET {path} HTTP/1.1" '
+                   f'{status} 512 "{ref}" "{UA_H}"\n' for i in range(n))
+with _tf.TemporaryDirectory() as td:
+    log = Path(td) / "access.log"
+    log.write_text(_ln("/old-guide", 404, "https://forum.test/thread/9", 3)
+                   + _ln("/moved", 301, "https://blog.test/post", 2)
+                   + _ln("/fine", 200, "https://blog.test/post", 4)
+                   + _ln("/cached", 304, "https://blog.test/post", 1))
+    out = _sp.run([sys.executable, str(Path(__file__).parent / "backlinks.py"), "referrers",
+                   "--file", str(log), "--format", "combined", "--site", "oursite.test"],
+                  capture_output=True, text=True)
+    d = _js.loads(out.stdout)
+    rc = {r["path"]: r for r in d.get("reclaim_candidates", [])}
+    check("a genuine referral landing on a 404 is a reclaim candidate",
+          rc.get("/old-guide", {}).get("status") == 404 and rc["/old-guide"]["visits"] == 3)
+    check("its referring domain is named", "forum.test" in rc.get("/old-guide", {}).get("referrers", []))
+    check("a referral landing on a redirect is listed as redirected", rc.get("/moved", {}).get("status") == 301)
+    check("CONTROL: 200 and 304 landings are not candidates", "/fine" not in rc and "/cached" not in rc)
+    saved = Path(td) / "ref.json"
+    saved.write_text(out.stdout)
+    import backlinks as _bl
+    sm = ["https://oursite.test/guides/old-guide-2026", "https://oursite.test/maps/dust2"]
+    def fake_chain(u):
+        return [{"url": u, "status": 404, "location": None, "error": None}]
+    rec = _bl.reclaim_rows(d["reclaim_candidates"], "https://oursite.test", sm, chain=fake_chain)
+    r0 = next(r for r in rec if r["path"] == "/old-guide")
+    check("the still-dead target gets a 301 suggestion by slug", r0["suggest_301_to"] ==
+          "https://oursite.test/guides/old-guide-2026")
+    def fixed_chain(u):
+        return [{"url": u, "status": 200, "location": None, "error": None}]
+    rec = _bl.reclaim_rows(d["reclaim_candidates"], "https://oursite.test", sm, chain=fixed_chain)
+    check("CONTROL: a target that answers 200 now is already reclaimed",
+          next(r for r in rec if r["path"] == "/old-guide")["state"] == "already_fixed")
+
+print("\n9. unlinked mentions - a page that names us without linking is a prospect")
+import backlinks as _bl
+D, B = "nova.app", "Nova"
+c = _bl.classify_mention_page
+r = c('<p>We tried <a href="https://www.nova.app/x" rel="nofollow ugc">Nova</a>.</p>',
+      "https://blog.test/p", D, B)
+check("a link to us is `linked`, with its rel kept", r["state"] == "linked" and r["rels"] == ["nofollow", "ugc"])
+r = c("<p>Nova is the one we use for this.</p>", "https://blog.test/p", D, B)
+check("a name without a link is `mention_only`", r["state"] == "mention_only")
+r = c("<p>Casanova was a film.</p><!-- Nova -->", "https://blog.test/p", D, B)
+check("CONTROL: a substring or a comment is not a mention", r["state"] == "absent")
+r = c('<script>var x="Nova"</script><p>nothing</p>', "https://blog.test/p", D, B)
+check("CONTROL: a script string is not a mention", r["state"] == "absent")
+check("medium/substack subdomains group to one publisher each",
+      _bl.publisher_key("https://alice.substack.com/p/x") == "alice.substack.com"
+      and _bl.publisher_key("https://medium.com/@bob/x") == "medium.com/@bob"
+      and _bl.publisher_key("https://www.blog.test/a") == "blog.test")
+check("an IP/DNS/scanner listing is a machine listing, not a prospect",
+      _bl.machine_listing("https://ipv4.bgp.he.net/ip/2606:4700::1")
+      and _bl.machine_listing("https://stackray.app/targets/abc/scans")
+      and _bl.machine_listing("https://www.whois.com/whois/nova.app")
+      and _bl.machine_listing("https://urlscan.io/result/x/"))
+check("CONTROL: an ordinary blog post is not a machine listing",
+      not _bl.machine_listing("https://blog.test/2026/10/our-favourite-tools"))
+
 if FAILS:
     print(f"FAILED: {len(FAILS)} -> {FAILS}")
     sys.exit(1)
