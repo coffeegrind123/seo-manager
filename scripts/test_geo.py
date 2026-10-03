@@ -31,7 +31,160 @@ def stub(**kw):
     return lambda q, **_: base
 
 
+def test_measurement() -> None:
+    """2026-10-03: what a citation IS (cleaned, resolved, classified), how sure
+    a rate is, and when an engine's silence is the parser's fault."""
+    saved = dict(G.ENGINES)
+    try:
+        print("\nregistrable domain - a public suffix is not a site:")
+        check("bbc.co.uk stays bbc.co.uk", G._registrable("news.bbc.co.uk") == "bbc.co.uk",
+              G._registrable("news.bbc.co.uk"))
+        check("abc.net.au stays abc.net.au", G._registrable("www.abc.net.au") == "abc.net.au")
+        check("ox.ac.uk stays ox.ac.uk", G._registrable("www.ox.ac.uk") == "ox.ac.uk")
+        check("CONTROL: sub.example.com is example.com", G._registrable("a.b.example.com") == "example.com")
+        G.ENGINES.clear()
+        G.ENGINES["fake"] = stub(references=[{"domain": "other.co.uk", "url": "https://other.co.uk/"}])
+        check("another .co.uk site citing is NOT us",
+              G.ask("q", "mysite.co.uk", use_cache=False)["cited_by"] == [])
+        print("\nan EMPTY overview block is no answer surface, not an uncited answer:")
+        import json as _j
+        from providers import HttpResult
+        real_http, real_secret = G.http, G.read_secret
+        try:
+            G.read_secret = lambda *a, **k: "k"
+            G.http = lambda url, **kw: HttpResult(status=200, body=_j.dumps(
+                {"ai_overview": {"error": "An AI Overview is not available for this search"}}).encode())
+            r = G.engine_google_ai_overview("q")
+            check("an error-only ai_overview block has_answer=False",
+                  r["state"] == "answered" and r["has_answer"] is False, r)
+            G.http = lambda url, **kw: HttpResult(status=200, body=_j.dumps(
+                {"ai_overview": {"text_blocks": [{"snippet": "an answer"}],
+                                 "references": [{"link": "https://a.test/x"}]}}).encode())
+            r = G.engine_google_ai_overview("q")
+            check("CONTROL: a populated block is an answer with its reference",
+                  r["has_answer"] is True and r["references"][0]["domain"] == "a.test", r)
+        finally:
+            G.http, G.read_secret = real_http, real_secret
+        print("\nURL hygiene - one page, one key:")
+        check("utm_* and the text fragment are stripped",
+              G._clean_url("https://Example.com/a?utm_source=openai&x=1#:~:text=foo")
+              == "https://example.com/a?x=1", G._clean_url("https://Example.com/a?utm_source=openai&x=1#:~:text=foo"))
+        check("a Google /url?q= wrapper is unwrapped without a request",
+              G._unwrap("https://www.google.com/url?q=https://site.test/p&sa=U") == "https://site.test/p")
+        check("CONTROL: an ordinary URL is unchanged by unwrapping",
+              G._unwrap("https://site.test/p") == "https://site.test/p")
+
+        print("\ncitation source kinds (gap domains are not all one thing):")
+        k = G.classify_source
+        check("reddit is a forum", k("reddit.com", "https://www.reddit.com/r/x/comments/1") == "forum")
+        check("a forum. host is a forum", k("forum.example.com", "https://forum.example.com/t/1") == "forum")
+        check("youtube is video", k("youtube.com", "https://www.youtube.com/watch?v=1") == "video")
+        check("github is developer", k("github.com", "https://github.com/a/b") == "developer")
+        check("a docs. host is developer", k("docs.example.com", "https://docs.example.com/x") == "developer")
+        check("wikipedia is reference", k("wikipedia.org", "https://en.wikipedia.org/wiki/X") == "reference")
+        check("a .gov is institutional", k("nih.gov", "https://www.nih.gov/x") == "institutional")
+        check("a .ac.uk is institutional", k("ox.ac.uk", "https://www.ox.ac.uk/x") == "institutional")
+        check("amazon is ecommerce", k("amazon.com", "https://www.amazon.com/dp/B0") == "ecommerce")
+        check("prnewswire is pr", k("prnewswire.com", "https://www.prnewswire.com/news/x") == "pr")
+        check("g2 is reviews", k("g2.com", "https://www.g2.com/products/x/reviews") == "reviews")
+        check("a 'best X' listicle path is a listicle",
+              k("someblog.test", "https://someblog.test/best-vpn-for-gaming") == "listicle")
+        check("a vs page is comparison",
+              k("someblog.test", "https://someblog.test/x-vs-y") == "comparison")
+        check("CONTROL: an unremarkable page is other",
+              k("someblog.test", "https://someblog.test/about") == "other")
+
+        print("\nlist rank - where in a list we are named:")
+        pats = G._name_patterns("nova.app", "Nova")
+        txt = "Options:\n1. Acme does it.\n2. Nova is good.\n3. Zed.\n\nAlso Nova in prose."
+        check("rank is the list position of the first item naming us", G._list_rank(txt, pats) == 2)
+        check("a prose-only mention has no rank (None, never 0)",
+              G._list_rank("Nova is fine in prose.", pats) is None)
+        check("bullets are ranked too", G._list_rank("- A\n- B\n- Nova\n", pats) == 3)
+
+        print("\nretrieved vs cited - a page the engine READ is not a page it CITED:")
+        G.ENGINES.clear()
+        G.ENGINES["fake"] = stub(references=[{"domain": "play-cs.com", "url": "https://play-cs.com"}],
+                                 retrieved=[{"domain": "example.com", "url": "https://example.com/a"}])
+        r = G.ask("q", "example.com", use_cache=False)
+        row = r["results"][0]
+        check("retrieved but not cited is its own rung",
+              row["cited"] is False and row["retrieved_not_cited"] is True, row)
+        check("and it does not count as a citation", r["cited_by"] == [])
+
+        print("\nrates carry intervals, and small samples are labelled:")
+        seq = iter([True, True, False])
+
+        def flaky(q, **_):
+            hit = next(seq)
+            refs = [{"domain": "example.com", "url": "https://example.com"}] if hit else \
+                   [{"domain": "other.test", "url": "https://other.test"}]
+            return {"state": "answered", "has_answer": True, "text": "x", "references": refs}
+        G.ENGINES.clear()
+        G.ENGINES["fake"] = flaky
+        r = G.ask("q", "example.com", use_cache=False, runs=3)
+        rr = r["results"][0]["runs"]
+        check("2/3 carries a Wilson interval", rr["ci95"] and rr["ci95"][0] < 0.67 < rr["ci95"][1], rr)
+        check("n=3 is labelled a small sample", rr["small_sample"] is True, rr)
+        check("2/3 is not a STABLE band", rr["stable"] is False, rr)
+
+        print("\nparser-drift control: an engine that answers and never cites anything")
+        G.ENGINES.clear()
+        G.ENGINES["fake"] = stub(text="an answer with no sources at all", references=[])
+        sw = G.sweep("example.com", [f"q{i}" for i in range(6)], use_cache=False)
+        check("6 answers with ZERO citations marks the engine's parser suspect",
+              "fake" in sw["parser_suspect_engines"], sw.get("parser_suspect_engines"))
+        check("and its not-cited answers leave the rate (unknown, not zero)",
+              sw["answers_seen"] == 0 and sw["citation_rate"] is None, sw)
+        G.ENGINES["fake"] = stub(references=[{"domain": "a.test", "url": "https://a.test"}])
+        sw = G.sweep("example.com", [f"q{i}" for i in range(6)], use_cache=False)
+        check("CONTROL: an engine that cites someone else is not suspect",
+              sw["parser_suspect_engines"] == [] and sw["answers_seen"] == 6, sw)
+
+        print("\ndiff - paired questions, exact test, refusal when too few move:")
+        def mk(flags):
+            return {"check": "geo-sweep", "per_question": [
+                {"query": f"q{i}", "counts": {"fake": [1 if f else 0, 1]}} for i, f in enumerate(flags)]}
+        d = G.diff_sweeps(mk([0] * 10), mk([1] * 8 + [0] * 2))
+        e = d["engines"]["fake"]
+        check("8 of 10 questions flipping to cited is a significant gain",
+              e["verdict"] == "gained" and e["p_holm"] < 0.05, e)
+        d = G.diff_sweeps(mk([0] * 10), mk([1] * 3 + [0] * 7))
+        e = d["engines"]["fake"]
+        check("3 flips cannot be tested (fewer than 6 discordant)", e["verdict"] == "too_few_changes", e)
+        d = G.diff_sweeps(mk([0, 1]), {"check": "geo-sweep", "per_question": [{"query": "zz", "counts": {}}]})
+        check("no shared questions refuses", d["engines"] == {} and d["paired_questions"] == 0, d)
+
+        print("\ngap - Search Console joined to the answer surface:")
+        gsc = {"rows": [
+            {"keys": ["play cs"], "clicks": 10, "impressions": 400, "ctr": 0.025, "position": 2.1},
+            {"keys": ["cs maps"], "clicks": 1, "impressions": 300, "ctr": 0.003, "position": 9.0},
+            {"keys": ["cs guide"], "clicks": 50, "impressions": 500, "ctr": 0.1, "position": 1.5},
+            {"keys": ["cs mods"], "clicks": 20, "impressions": 300, "ctr": 0.066, "position": 3.0},
+            {"keys": ["tiny"], "clicks": 0, "impressions": 3, "ctr": 0, "position": 5.0}]}
+        obs = {"play cs": {"state": "answered", "has_answer": True, "cited": False,
+                           "competitors": ["a.test"]},
+               "cs maps": {"state": "answered", "has_answer": True, "cited": False,
+                           "competitors": ["b.test"]},
+               "cs guide": {"state": "answered", "has_answer": True, "cited": True, "competitors": []},
+               "cs mods": {"state": "answered", "has_answer": False}}
+        g = G.gap_tiers(gsc, obs, min_impressions=25)
+        t = {r["query"]: r["tier"] for r in g["rows"]}
+        check("top-4 rank, competitor cited -> B (ranks_not_cited)", t.get("play cs") == "B", t)
+        check("rank 5-20, competitor cited -> A", t.get("cs maps") == "A", t)
+        check("cited -> C only if CTR is below its position baseline, else cited",
+              t.get("cs guide") in ("C", "cited"), t)
+        check("no overview -> D", t.get("cs mods") == "D", t)
+        check("under min impressions is not judged", "tiny" not in t, t)
+        check("an unanswerable query is X, never a tier",
+              G.gap_tiers(gsc, {"play cs": {"state": "failing"}}, 25)["rows"][0]["tier"] == "X")
+    finally:
+        G.ENGINES.clear()
+        G.ENGINES.update(saved)
+
+
 def main() -> int:
+    test_measurement()
     saved = dict(G.ENGINES)
     try:
         print("cannot_ask must never become not_cited - the whole point:")
@@ -101,6 +254,35 @@ def main() -> int:
                     "combatskirmish.net", None)
     check("ours is surfaced", len(m) == 1 and "Combatskirmish" in m[0])
     check("a competitor's sentence is not", not any("Play-cs" in x for x in m))
+
+    print("\nmention matching - a name, not a substring:")
+    check("a brand inside a longer word is not a mention",
+          G._mentions("Casanova is a film. Nothing else here.", "nova.app", "Nova") == [],
+          G._mentions("Casanova is a film. Nothing else here.", "nova.app", "Nova"))
+    check("CONTROL: the brand as a word IS a mention",
+          len(G._mentions("Try Nova for this. Or not.", "nova.app", "Nova")) == 1)
+    check("a citation LINK is not a prose mention",
+          G._mentions("Use a VPN [1](https://nova.app/guide). It works.", "nova.app", None) == [],
+          G._mentions("Use a VPN [1](https://nova.app/guide). It works.", "nova.app", None))
+    check("a bare URL is not a prose mention either",
+          G._mentions("See https://www.nova.app/x for details.", "nova.app", None) == [])
+    check("CONTROL: the domain written in prose IS a mention",
+          len(G._mentions("Nova.app has a guide. Fine.", "nova.app", None)) == 1)
+    check("another domain ENDING in ours is not us",
+          G._mentions("Play at supernova.app today.", "nova.app", None) == []
+          and G._mentions("Play at play-nova.app today.", "nova.app", None) == [])
+    check("the brand as another site's label is not us",
+          G._mentions("Nova.io is unrelated.", "nova.app", "Nova") == [])
+    check("a blank or one-letter alias matches nothing",
+          G._mentions("Anything at all here.", "x.test", " , a") == [])
+    check("comma-separated aliases are each matched",
+          len(G._mentions("CS Skirmish works. Combat Skirmish too.", "cs.test",
+                          "Combat Skirmish, CS Skirmish")) == 2)
+    check("a CJK brand matches without ASCII word boundaries",
+          len(G._mentions("推荐使用新星平台。", "nova.app", "新星")) == 1)
+    check("the returned sentence is verbatim, link and all",
+          G._mentions("Nova is good [1](https://nova.app). End.", "nova.app", "Nova")
+          == ["Nova is good [1](https://nova.app)."])
 
     print("\nextractability - an assistant lifts a SENTENCE, not a page:")
     with tempfile.TemporaryDirectory() as td:

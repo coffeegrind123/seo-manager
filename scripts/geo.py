@@ -47,6 +47,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from controls import Controls, refuse, uniform_verdict  # noqa: E402
 from providers import cache_get, cache_put, http, read_secret  # noqa: E402
+from providers import registrable  # noqa: E402
+import stats  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 CACHE_TTL = 6 * 3600
@@ -77,8 +79,162 @@ def _host(u: str) -> str:
 
 
 def _registrable(h: str) -> str:
-    parts = [p for p in (h or "").split(".") if p]
-    return ".".join(parts[-2:]) if len(parts) >= 2 else h
+    return registrable(h)
+
+
+# ---------------------------------------------------------- citation hygiene
+
+# Engines decorate the links they cite: `utm_source=openai` on every ChatGPT
+# link, `#:~:text=` scroll-to-text fragments on Google's. Left in, one page is
+# three different "sources" and per-URL counts fragment.
+_TRACKING = re.compile(r"^(utm_[a-z]+|gclid|fbclid|msclkid|srsltid|ved|sa|usg)$", re.I)
+
+
+def _clean_url(u: str) -> str:
+    try:
+        p = urllib.parse.urlsplit(u or "")
+    except ValueError:
+        return u or ""
+    if not p.scheme:
+        return u or ""
+    q = [(k, v) for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+         if not _TRACKING.match(k)]
+    return urllib.parse.urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path,
+                                    urllib.parse.urlencode(q), ""))
+
+
+def _unwrap(u: str) -> str:
+    """Google's /url?q= wrapper carries its target in the query - read it, no
+    request needed."""
+    try:
+        p = urllib.parse.urlsplit(u or "")
+    except ValueError:
+        return u or ""
+    if p.netloc.lower().endswith("google.com") and p.path in ("/url", "/goto"):
+        q = dict(urllib.parse.parse_qsl(p.query))
+        tgt = q.get("q") or q.get("url")
+        if tgt and tgt.startswith("http"):
+            return tgt
+    return u
+
+
+# Gemini grounding cites `vertexaisearch.cloud.google.com/grounding-api-redirect/
+# ...` instead of the page; only a request reveals the target (its Location).
+# One non-following GET each, capped per process so a big sweep cannot turn
+# into a crawl of Google's redirector.
+_REDIRECT_HOSTS = {"vertexaisearch.cloud.google.com"}
+_RESOLVE_CAP = 12
+_resolved: dict[str, str | None] = {}
+
+
+def _resolve_wrapper(u: str) -> str | None:
+    if u in _resolved:
+        return _resolved[u]
+    if len(_resolved) >= _RESOLVE_CAP:
+        return None
+    r = http(u, timeout=15, follow=False)
+    loc = r.get("location") or (r.get("headers") or {}).get("location")
+    _resolved[u] = loc if loc and loc.startswith("http") else None
+    return _resolved[u]
+
+
+def _ref(url: str, fallback_domain: str = "") -> dict:
+    """One cited link -> {url, domain, wrapped}. A wrapper that cannot be
+    resolved keeps its own host and says so, rather than inventing a target."""
+    u = _unwrap(url or "")
+    wrapped = False
+    if _host(u) in _REDIRECT_HOSTS:
+        tgt = _resolve_wrapper(u)
+        if tgt:
+            u = tgt
+        else:
+            wrapped = True
+    u = _clean_url(u)
+    return {"url": u, "domain": _host(u) or fallback_domain, "unresolved_wrapper": wrapped}
+
+
+# Where an answer engine's sources come from, by KIND. A gap domain is not one
+# thing: a forum thread is earned by participation, a review site by a listing,
+# a listicle by outreach, a reference page by notability. Order matters - first
+# match wins. Lists are small and named (elmohq/elmo's taxonomy, MIT, reduced to
+# the hosts that recur in answer citations); host-prefix and TLD rules carry the
+# long tail, and a page-type rule on the PATH catches listicles and comparisons
+# on otherwise unremarkable blogs.
+SOURCE_HOSTS = {
+    "forum": {"reddit.com", "quora.com", "stackexchange.com", "stackoverflow.com",
+              "discord.com", "steamcommunity.com", "news.ycombinator.com", "ycombinator.com",
+              "tripadvisor.com", "producthunt.com", "indiehackers.com", "lemmy.world"},
+    "video": {"youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "twitch.tv", "dailymotion.com"},
+    "pr": {"prnewswire.com", "businesswire.com", "globenewswire.com", "einpresswire.com",
+           "accesswire.com", "newswire.com", "prweb.com"},
+    "reviews": {"g2.com", "capterra.com", "trustpilot.com", "trustradius.com", "getapp.com",
+                "softwareadvice.com", "yelp.com", "sitejabber.com", "alternativeto.net",
+                "slant.co", "clutch.co", "gartner.com"},
+    "ecommerce": {"amazon.com", "ebay.com", "etsy.com", "walmart.com", "aliexpress.com",
+                  "bestbuy.com", "target.com", "shopify.com", "temu.com"},
+    "social": {"x.com", "twitter.com", "facebook.com", "instagram.com", "linkedin.com",
+               "pinterest.com", "threads.net", "bsky.app", "medium.com", "substack.com"},
+    "developer": {"github.com", "gitlab.com", "bitbucket.org", "npmjs.com", "pypi.org",
+                  "dev.to", "readthedocs.io", "mozilla.org"},
+    "reference": {"wikipedia.org", "wikidata.org", "britannica.com", "wiktionary.org",
+                  "fandom.com", "wikihow.com", "investopedia.com", "merriam-webster.com"},
+}
+_PREFIX_KIND = [
+    (re.compile(r"^(forums?|community|discuss|boards?)\."), "forum"),
+    (re.compile(r"^(shop|store|shopping|checkout)\."), "ecommerce"),
+    (re.compile(r"^(docs?|developers?|dev|api|apis|sdks?|engineering)\."), "developer"),
+    (re.compile(r"^(press|newsroom)\."), "pr"),
+]
+_INSTITUTIONAL = re.compile(r"\.(gov|edu|mil|int)(\.[a-z]{2})?$|\.(ac|gob|govt|go)\.[a-z]{2}$")
+_LISTICLE = re.compile(r"(^|[/\-_])(best|top-\d+|\d+-best)([/\-_]|$)", re.I)
+_COMPARISON = re.compile(r"(^|[/\-_])(vs|versus|alternatives?|comparison|compare)([/\-_]|$)", re.I)
+
+
+def classify_source(domain: str, url: str = "") -> str:
+    host = (_host(url) if url else "") or (domain or "").lower()
+    reg = _registrable(host)
+    for kind, hosts in SOURCE_HOSTS.items():
+        if reg in hosts or host in hosts:
+            return kind
+    for rx, kind in _PREFIX_KIND:
+        if rx.match(host):
+            return kind
+    if _INSTITUTIONAL.search(host):
+        return "institutional"
+    path = urllib.parse.urlsplit(url).path if url else ""
+    if _COMPARISON.search(path):
+        return "comparison"
+    if _LISTICLE.search(path):
+        return "listicle"
+    return "other"
+
+
+_LIST_ITEM = re.compile(r"^[ \t]*(?:(\d{1,2})[.)]|[-*•])[ \t]+(.*)$")
+
+
+def _list_rank(text: str, patterns) -> int | None:
+    """Rank of the first LIST ITEM naming us; None for a prose-only mention.
+    Numbering restarts on an explicit '1.' or when prose follows a blank line
+    (limelit-co/open's listRanks rule)."""
+    rank, prev_blank = 0, False
+    for line in (text or "").split("\n"):
+        if not line.strip():
+            prev_blank = True
+            continue
+        m = _LIST_ITEM.match(line)
+        if not m:
+            if prev_blank:
+                rank = 0
+            prev_blank = False
+            continue
+        if m.group(1) == "1":
+            rank = 0
+        rank += 1
+        prev_blank = False
+        prose = _URL_SPAN.sub(" ", m.group(2))
+        if any(r.search(prose) for r in patterns):
+            return rank
+    return None
 
 
 # ------------------------------------------------------------------- engines
@@ -123,8 +279,15 @@ def engine_google_ai_overview(query: str, gl="us", hl="en") -> dict:
             flatten(b.get("list"), out)
         return out
 
+    body = " ".join(flatten(text, []))
+    if not body.strip() and not refs:
+        # An overview block with nothing in it - SerpApi returns `{"error": "An AI
+        # Overview is not available..."}` here - is NO answer surface. Read as an
+        # answer, it was a confident "not cited" for an overview that never rendered.
+        return {"state": "answered", "has_answer": False, "text": "", "references": [],
+                "detail": str(ai.get("error") or "empty ai_overview block")[:200]}
     return {"state": "answered", "has_answer": True,
-            "text": " ".join(flatten(text, []))[:6000],
+            "text": body[:6000],
             "references": [{"domain": _host(x.get("link", "")), "url": x.get("link"),
                             "source": x.get("source") or x.get("title")} for x in refs]}
 
@@ -210,6 +373,16 @@ def _searchapi_engine(engine: str):
         # answering (`search_queries`, measured live 2026-09-20 - the first one
         # carried "official", the post-5.6 pattern). Coverage planning, never a
         # page-per-query list; see workflow-geo-scan.md.
+        # RETRIEVED, never cited: ChatGPT's `web_results` and Perplexity's
+        # `search_results` are pages read while answering (elmohq/elmo and
+        # niubigeo both keep them apart from `reference_links`). Mapped from
+        # their payloads; unprobed here, so the field names are documented
+        # assumptions until a key exists.
+        got_ret = d.get("web_results") or d.get("search_results") or []
+        if isinstance(got_ret, list):
+            out["retrieved"] = [{"domain": _host(x.get("link") or x.get("url") or ""),
+                                 "url": x.get("link") or x.get("url")}
+                                for x in got_ret if isinstance(x, dict)]
         if isinstance(d.get("search_queries"), list):
             out["fan_out_queries"] = [q for q in d["search_queries"] if isinstance(q, str)][:12]
         return out
@@ -345,11 +518,49 @@ def _mentions(text: str, domain: str, brand: str | None) -> list[str]:
     claim about a site is true needs the site's own ground truth and a judgement;
     what this can do honestly is surface the exact sentences so the judgement is
     made on the real words rather than on a summary of them."""
-    needles = {domain.lower(), _registrable(domain.lower())}
-    if brand:
-        needles.add(brand.lower())
-    return [s.strip() for s in _SENT.split(text or "")
-            if any(n and n in s.lower() for n in needles)][:8]
+    rx = _name_patterns(domain, brand)
+    if not rx:
+        return []
+    out = []
+    for s in _SENT.split(text or ""):
+        prose = _URL_SPAN.sub(lambda m: " " * len(m.group(0)), s)
+        if any(r.search(prose) for r in rx):
+            out.append(s.strip())
+    return out[:8]
+
+
+# A citation is not a mention. Link targets and bare URLs are blanked before
+# matching, so `[1](https://us.example/x)` counts on the CITED rung only - left
+# in, every cited answer also read as "mentioned" and the two rungs merged.
+_URL_SPAN = re.compile(r"\]\([^)\s]*\)|<https?://[^>\s]*>|\b(?:https?://|www\.)[^\s)\]>\"']+",
+                       re.I)
+_CJK = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
+
+
+def _name_patterns(domain: str, brand: str | None) -> list[re.Pattern]:
+    """How we are NAMED: the domain and its registrable form, plus every brand
+    alias (comma-separated). A name is a token, not a substring: `nova` inside
+    `Casanova`, `nova.app` inside `supernova.app` or `play-nova.app`, and the
+    brand `Nova` as the label of `nova.io` are all somebody else.
+
+    Terms under 3 characters are dropped - a blank alias matched every answer
+    in elmo before it was guarded, and a 1-2 letter one nearly does. CJK names
+    have no ASCII word edges, so they match anywhere."""
+    pats = []
+    doms = {d for d in (domain.lower().strip(), _registrable(domain.lower().strip())) if d}
+    for d in sorted(doms, key=len, reverse=True):
+        pats.append(re.compile(r"(?<![a-z0-9.\-])" + re.escape(d) + r"(?![a-z0-9\-])(?!\.[a-z0-9])",
+                               re.I))
+    for alias in (brand or "").split(","):
+        alias = " ".join(alias.split())
+        if len(alias) < 3 and not (alias and _CJK.search(alias)):
+            continue
+        body = re.escape(alias).replace(r"\ ", r"\s+")
+        if _CJK.search(alias):
+            pats.append(re.compile(body, re.I))
+        else:
+            pats.append(re.compile(r"(?<![a-z0-9])" + body + r"(?![a-z0-9])(?!\.[a-z0-9])", re.I))
+    return pats
 
 
 def _observe(fn, name: str, query: str, gl: str, hl: str, use_cache: bool) -> dict:
@@ -367,20 +578,43 @@ def _observe(fn, name: str, query: str, gl: str, hl: str, use_cache: bool) -> di
 
 def _observation(got: dict, name: str, domain: str, brand: str | None) -> dict:
     """One engine answer -> one observation. Never a verdict on its own."""
-    refs = got.get("references") or []
-    raw = [_registrable(r["domain"]) for r in refs if r.get("domain")]
+    refs = [_ref(r.get("url") or "", r.get("domain") or "") for r in got.get("references") or []]
     furniture = ENGINE_FURNITURE.get(name, set())
+    raw = [_registrable(r["domain"]) for r in refs if r.get("domain")]
     doms = [d for d in raw if d not in furniture]
+    urls: dict[str, str] = {}
+    for r in refs:
+        d = _registrable(r["domain"])
+        if d and d not in furniture and d not in urls:
+            urls[d] = r["url"]
     ours = _registrable(domain)
     cited = ours in doms
+    # RETRIEVED is the rung below CITED: pages the engine read while answering
+    # (ChatGPT's `web_results`, Perplexity's `search_results`) and did not put
+    # in front of the user. Kept apart - merging them inflated "cited" in
+    # every tool niubigeo's source classes were written to correct.
+    retrieved = [_registrable(_ref(r.get("url") or "", r.get("domain") or "")["domain"])
+                 for r in got.get("retrieved") or []]
+    retrieved = [d for d in retrieved if d and d not in furniture]
     sentences = _mentions(got.get("text", ""), domain, brand)
     return {"cited": cited,
+            "retrieved": ours in retrieved,
             "fan_out_queries": got.get("fan_out_queries"),
             "citation_position": (doms.index(ours) + 1) if cited else None,
             "cited_domains": doms,
+            "domain_urls": urls,
+            "references_seen": len(raw),
+            "unresolved_wrappers": sum(1 for r in refs if r.get("unresolved_wrapper")),
             "engine_furniture_excluded": sorted(set(raw) & furniture),
             "sentences_naming_us": sentences,
+            "list_rank": _list_rank(got.get("text", ""), _name_patterns(domain, brand)),
             "answer_excerpt": (got.get("text") or "")[:400]}
+
+
+# Rate bands for the "is this stable" reading: a band name is only reported as
+# settled when BOTH ends of the Wilson interval fall in it.
+PARSER_MIN = 5
+RATE_BANDS = [(0.5, "usually_cited"), (1e-9, "sometimes_cited"), (0.0, "not_cited")]
 
 
 def ask(query: str, domain: str, *, brand: str | None = None,
@@ -464,16 +698,29 @@ def ask(query: str, domain: str, *, brand: str | None = None,
                 if x not in sentences:
                     sentences.append(x)
         last = answered[-1]
+        band = stats.stable_band(n_cited, len(answered), RATE_BANDS)
+        domain_urls: dict[str, str] = {}
+        for o in answered:
+            for d, u in o["domain_urls"].items():
+                domain_urls.setdefault(d, u)
+        ranks = [o["list_rank"] for o in answered if o.get("list_rank")]
         rows.append({
             "engine": name, "state": "answered", "has_answer": True,
             # `cited` is CITED IN AT LEAST ONE RUN - the answer to "can this engine
             # cite us". How often is `runs.rate`; the two are reported together
             # so neither can be read alone.
             "cited": n_cited > 0,
+            "retrieved_not_cited": any(o["retrieved"] and not o["cited"] for o in answered),
             "runs": {"requested": runs, "answered": len(answered),
                      "no_answer_surface": surfaceless, "cited": n_cited,
                      "rate": round(n_cited / len(answered), 3),
+                     "ci95": band["ci"], "band": band["band"], "stable": band["stable"],
+                     "small_sample": stats.small_sample(len(answered)),
                      "single_observation": len(answered) == 1},
+            "references_seen": sum(o["references_seen"] for o in answered),
+            "unresolved_wrappers": sum(o["unresolved_wrappers"] for o in answered),
+            "domain_urls": domain_urls,
+            "best_list_rank": min(ranks) if ranks else None,
             "citation_position": next((o["citation_position"] for o in answered
                                        if o["cited"]), None),
             "citations": len(last["cited_domains"]),
@@ -575,12 +822,30 @@ def sweep(domain: str, questions: list[str], *, brand=None, engines=None,
                       examples=[r.get("reason") for r in refused][:3])
 
     ours = _registrable(_host(domain) or domain)
+    # PARSER-DRIFT CONTROL. An engine that answered at least PARSER_MIN
+    # distinct questions and returned ZERO references across all of them is
+    # far likelier to have renamed a payload field than to cite nobody - and
+    # read naively, every one of those answers is a confident "not cited".
+    # Its answers leave the rate (unknown, not zero) and the engine is named.
+    per_engine: dict[str, list[int]] = {}
+    for r in asked:
+        for e in r["results"]:
+            if e["state"] == "answered" and e.get("has_answer"):
+                q = per_engine.setdefault(e["engine"], [0, 0])
+                q[0] += 1
+                q[1] += e.get("references_seen", 0)
+    suspect = sorted(k for k, (nq, refs) in per_engine.items() if nq >= PARSER_MIN and refs == 0)
     share: dict[str, int] = {}
+    urls: dict[str, str] = {}
     surfaced = cited = 0
     for r in asked:
         for e in r["results"]:
             if e["state"] != "answered" or not e.get("has_answer"):
                 continue
+            if e["engine"] in suspect:
+                continue
+            for d, u in (e.get("domain_urls") or {}).items():
+                urls.setdefault(d, u)
             # Every RUN that produced an answer is one answer. With --runs N a
             # question contributes up to N answers per engine, and the rate is
             # over answers, so it stays a rate and never a count of questions.
@@ -592,8 +857,21 @@ def sweep(domain: str, questions: list[str], *, brand=None, engines=None,
             for d, n in e["domain_run_counts"].items():
                 share[d] = share.get(d, 0) + n
     top = sorted(share.items(), key=lambda kv: -kv[1])
+    lo, hi = stats.wilson(cited, surfaced)
+    kinds: dict[str, int] = {}
+    for d, n in top:
+        if d != ours:
+            k = classify_source(d, urls.get(d, ""))
+            kinds[k] = kinds.get(k, 0) + n
     return {
         "ok": True, "check": "geo-sweep", "domain": ours,
+        "parser_suspect_engines": suspect,
+        "parser_suspect_rule": (f"an engine that answered >= {PARSER_MIN} questions with zero "
+                                f"references in all of them is a likely broken reader; its "
+                                f"answers are excluded from every rate below"),
+        "citation_rate_ci95": [round(lo, 4), round(hi, 4)] if lo is not None else None,
+        "small_sample": stats.small_sample(surfaced),
+        "competitor_citations_by_kind": dict(sorted(kinds.items(), key=lambda kv: -kv[1])),
         "runs_per_engine": max(1, int(runs or 1)),
         "questions_asked": len(asked), "questions_refused": len(refused),
         "answers_seen": surfaced,
@@ -601,7 +879,8 @@ def sweep(domain: str, questions: list[str], *, brand=None, engines=None,
         "answers_citing_us": cited,
         "citation_rate": (round(cited / surfaced, 3) if surfaced else None),
         "share_of_voice": [{"domain": d, "answers_citing_it": n,
-                            "share": round(n / surfaced, 3) if surfaced else None}
+                            "share": round(n / surfaced, 3) if surfaced else None,
+                            "kind": classify_source(d, urls.get(d, "")), "example": urls.get(d)}
                            for d, n in top[:20]],
         "our_rank_in_share_of_voice": (
             next((i + 1 for i, (d, _n) in enumerate(top) if d == ours), None)),
@@ -614,6 +893,11 @@ def sweep(domain: str, questions: list[str], *, brand=None, engines=None,
                           "mentioned_by": r.get("mentioned_by") or [],
                           "rates": {e["engine"]: e["runs"]["rate"] for e in r["results"]
                                     if e["state"] == "answered" and e.get("has_answer")},
+                          # [cited, answered] per engine - what `diff` pairs on.
+                          "counts": {e["engine"]: [e["runs"]["cited"], e["runs"]["answered"]]
+                                     for e in r["results"]
+                                     if e["state"] == "answered" and e.get("has_answer")
+                                     and e["engine"] not in suspect},
                           "no_answer_surface": r.get("no_answer_surface") or [],
                           "could_not_ask": r["could_not_ask"]} for r in asked],
         "reading": (
@@ -628,6 +912,183 @@ def sweep(domain: str, questions: list[str], *, brand=None, engines=None,
             "non-deterministic system sampled once. Re-run with --runs 3+ before "
             "reading a movement in `citation_rate` as a change."),
     }
+
+
+# ------------------------------------------------------------------ diff
+# Below this many DISCORDANT questions an exact test cannot reach p < 0.05 even
+# when every one moved the same way (5 unanimous flips: p = 0.0625), so the
+# engine is reported as too few changes rather than tested.
+MIN_DISCORDANT = 6
+
+
+def diff_sweeps(before: dict, after: dict) -> dict:
+    """Did citation change between two sweeps? Questions answered by the same
+    engine in BOTH runs are paired; each pair votes up, down or same, and the
+    votes get an exact sign test (McNemar when each side is one run). Engines
+    are Holm-corrected together. A rate compared across different question
+    sets is not a change - it is a different denominator."""
+    def table(sw):
+        out = {}
+        for q in sw.get("per_question") or []:
+            for eng, (c, n) in (q.get("counts") or {}).items():
+                if n:
+                    out.setdefault(eng, {})[q["query"]] = c / n
+        return out
+    b, a = table(before), table(after)
+    engines, pvals = {}, []
+    paired_total = 0
+    for eng in sorted(set(b) & set(a)):
+        qs = sorted(set(b[eng]) & set(a[eng]))
+        paired_total += len(qs)
+        up = sum(1 for q in qs if a[eng][q] > b[eng][q])
+        down = sum(1 for q in qs if a[eng][q] < b[eng][q])
+        row = {"paired_questions": len(qs), "gained": up, "lost": down,
+               "unchanged": len(qs) - up - down}
+        if up + down < MIN_DISCORDANT:
+            row.update(verdict="too_few_changes", p=None,
+                       why=f"{up + down} question(s) moved; an exact test needs {MIN_DISCORDANT}+ "
+                           f"to be able to reach p < 0.05")
+        else:
+            row["p"] = stats.mcnemar_exact(down, up)
+            pvals.append((eng, row["p"]))
+        engines[eng] = row
+    if pvals:
+        for (eng, _p), adj in zip(pvals, stats.holm([p_ for _e, p_ in pvals])):
+            r = engines[eng]
+            r["p_holm"] = round(adj, 6)
+            r["verdict"] = (("gained" if r["gained"] > r["lost"] else "lost") if adj < 0.05
+                            else "no_detectable_change")
+    return {"ok": True, "check": "geo-diff", "paired_questions": paired_total,
+            "engines": engines,
+            "unpaired_engines": sorted(set(a) ^ set(b)),
+            "reading": ("Only questions both runs asked the same engine are compared. "
+                        "`too_few_changes` is not 'no change' - it is a sample that cannot "
+                        "tell. Engines are Holm-corrected together.")}
+
+
+# ------------------------------------------------------------------- gap
+POS_BUCKETS = [(1, 1.5, "1"), (1.5, 2.5, "2"), (2.5, 3.5, "3"), (3.5, 5.5, "4-5"),
+               (5.5, 10.5, "6-10"), (10.5, 20.5, "11-20"), (20.5, 1e9, "21+")]
+
+
+def _bucket(pos: float) -> str:
+    for lo, hi, name in POS_BUCKETS:
+        if lo <= pos < hi:
+            return name
+    return "21+"
+
+
+def _gsc_query_rows(gsc: dict) -> list[dict]:
+    dims = gsc.get("dimensions") or gsc.get("request", {}).get("dimensions") or ["query"]
+    qi = dims.index("query") if "query" in dims else 0
+    out = []
+    for r in gsc.get("rows") or []:
+        keys = r.get("keys") or []
+        if len(keys) <= qi:
+            continue
+        out.append({"query": keys[qi], "clicks": float(r.get("clicks") or 0),
+                    "impressions": float(r.get("impressions") or 0),
+                    "position": float(r.get("position") or 0)})
+    return out
+
+
+def gap_tiers(gsc: dict, obs: dict[str, dict], min_impressions: int = 25) -> dict:
+    """Search Console rows joined to the answer surface for the same query.
+
+        B  ranks 1-4, an overview exists, and it cites someone else (or nobody):
+           the page Google already trusts is not the one its answer quotes
+        A  ranks 5-20 and a competitor is cited: the answer is the way in
+        C  cited, but CTR below what OUR OWN no-overview queries earn at that
+           position: cited and still losing the click
+        D  no answer surface on this query
+        X  could not ask, or no observation: unknown, never a tier
+
+    The C baseline is the median CTR of this site's own no-overview queries
+    in the same position bucket - derived from the data, never a CTR curve
+    from somebody else's study. Under 3 such queries it is unknown."""
+    rows = [r for r in _gsc_query_rows(gsc) if r["impressions"] >= min_impressions]
+    for r in rows:
+        r["ctr"] = r["clicks"] / r["impressions"] if r["impressions"] else 0.0
+        r["bucket"] = _bucket(r["position"])
+    base: dict[str, list[float]] = {}
+    for r in rows:
+        o = obs.get(r["query"]) or {}
+        if o.get("state") == "answered" and not o.get("has_answer"):
+            base.setdefault(r["bucket"], []).append(r["ctr"])
+
+    def median(xs):
+        xs = sorted(xs)
+        return xs[len(xs) // 2] if len(xs) % 2 else (xs[len(xs) // 2 - 1] + xs[len(xs) // 2]) / 2
+
+    out = []
+    for r in rows:
+        o = obs.get(r["query"])
+        row = {k: r[k] for k in ("query", "clicks", "impressions", "position", "bucket")}
+        row["ctr"] = round(r["ctr"], 4)
+        if not o or o.get("state") != "answered":
+            row.update(tier="X", why="no usable observation - unknown")
+        elif not o.get("has_answer"):
+            row.update(tier="D", why="no answer surface")
+        elif o.get("cited"):
+            b = base.get(r["bucket"], [])
+            if len(b) >= 3:
+                bl = median(b)
+                row["baseline_ctr"] = round(bl, 4)
+                row.update(tier="C" if r["ctr"] < bl else "cited",
+                           why=("cited, CTR below this site's no-overview median at this position"
+                                if r["ctr"] < bl else "cited, CTR at or above baseline"))
+            else:
+                row.update(tier="cited", why="cited; too few no-overview queries in this bucket "
+                                              "for a CTR baseline")
+        elif r["position"] <= 4.5:
+            row.update(tier="B", why="ranks top-4, the overview cites " +
+                       (", ".join(o.get("competitors") or []) or "no one"))
+        elif r["position"] <= 20.5:
+            row.update(tier="A", why="ranks 5-20, the overview cites " +
+                       (", ".join(o.get("competitors") or []) or "no one"))
+        else:
+            row.update(tier="not_cited", why="ranks beyond page 2 and is not cited")
+        out.append(row)
+    order = {"B": 0, "A": 1, "C": 2, "D": 3, "cited": 4, "not_cited": 5, "X": 6}
+    out.sort(key=lambda x: (order.get(x["tier"], 9), -x["impressions"]))
+
+    # AI-Overview impact at equal position: pooled clicks/impressions for
+    # queries WITH an overview against those without, per position bucket.
+    impact = []
+    for _lo, _hi, name in POS_BUCKETS:
+        with_ = [r for r in rows if r["bucket"] == name and (obs.get(r["query"]) or {}).get("has_answer")]
+        without = [r for r in rows if r["bucket"] == name
+                   and (obs.get(r["query"]) or {}).get("state") == "answered"
+                   and not (obs.get(r["query"]) or {}).get("has_answer")]
+        if not with_ or not without:
+            continue
+        cmp_ = stats.compare_rates(int(sum(r["clicks"] for r in without)),
+                                   int(sum(r["impressions"] for r in without)),
+                                   int(sum(r["clicks"] for r in with_)),
+                                   int(sum(r["impressions"] for r in with_)))
+        impact.append({"bucket": name, "queries_without": len(without), "queries_with": len(with_),
+                       "ctr_without": cmp_["before"]["rate"], "ctr_with": cmp_["after"]["rate"],
+                       "verdict": cmp_["verdict"], "ci95_difference": cmp_["ci95"]})
+    tiers = {}
+    for r in out:
+        tiers[r["tier"]] = tiers.get(r["tier"], 0) + 1
+    return {"ok": True, "check": "geo-gap", "queries": len(out), "tiers": tiers, "rows": out,
+            "ai_overview_ctr_impact": impact,
+            "impact_caveat": ("Impressions are not independent trials (one searcher can see a "
+                              "result many times), so the interval is approximate. Queries with "
+                              "an overview also differ in intent from those without; read a "
+                              "difference as a lead, not a measured cause.")}
+
+
+def _obs_from_ask(r: dict, engine: str) -> dict:
+    for e in r.get("results") or []:
+        if e["engine"] != engine:
+            continue
+        if e["state"] != "answered":
+            return {"state": e["state"]}
+        return {"state": "answered", "has_answer": bool(e.get("has_answer")),
+                "cited": bool(e.get("cited")), "competitors": e.get("competitors_cited") or []}
+    return {"state": "failing"}
 
 
 # ------------------------------------------------------- extractable answers
@@ -1044,6 +1505,25 @@ def run_control() -> dict:
                 "quoting a 60-word sentence means quoting a paragraph")
         c.check("an_empty_directory_refuses",
                 extractable(str(d / "nope")).get("control_failed") is True)
+    # 2026-10-03 readers, each both ways.
+    c.check("registrable_keeps_a_public_suffix_site_whole",
+            _registrable("news.bbc.co.uk") == "bbc.co.uk" and _registrable("a.example.com") == "example.com")
+    c.check("a_citation_link_is_not_a_prose_mention",
+            _mentions("See [1](https://x.test/a).", "x.test", None) == []
+            and len(_mentions("X.test explains it.", "x.test", None)) == 1)
+    c.check("a_brand_inside_a_word_is_not_a_mention",
+            _mentions("Casanova.", "nova.app", "Nova") == [] and len(_mentions("Nova.", "nova.app", "Nova")) == 1)
+    c.check("tracking_and_text_fragment_stripped",
+            _clean_url("https://a.test/p?utm_source=openai#:~:text=x") == "https://a.test/p")
+    c.check("source_kinds_discriminate",
+            classify_source("reddit.com", "https://reddit.com/r/x") == "forum"
+            and classify_source("plainblog.test", "https://plainblog.test/about") == "other")
+    d_ = diff_sweeps({"per_question": [{"query": f"q{i}", "counts": {"e": [0, 1]}} for i in range(9)]},
+                     {"per_question": [{"query": f"q{i}", "counts": {"e": [1, 1]}} for i in range(9)]})
+    c.check("diff_detects_a_unanimous_9_question_gain", d_["engines"]["e"]["verdict"] == "gained")
+    d_ = diff_sweeps({"per_question": [{"query": "q", "counts": {"e": [0, 1]}}]},
+                     {"per_question": [{"query": "q", "counts": {"e": [1, 1]}}]})
+    c.check("diff_refuses_to_test_one_flip", d_["engines"]["e"]["verdict"] == "too_few_changes")
     return c.verdict(engines=sorted(ENGINES))
 
 
@@ -1084,6 +1564,22 @@ def main() -> int:
     a3.add_argument("--root", required=True)
     a3.add_argument("--limit", type=int, default=400)
 
+    d1 = sub.add_parser("diff", help="two sweeps -> paired, exact-tested citation change")
+    d1.add_argument("--before", required=True)
+    d1.add_argument("--after", required=True)
+
+    g1 = sub.add_parser("gap", help="Search Console queries x the answer surface: who ranks "
+                                    "and is not quoted")
+    g1.add_argument("--domain", required=True)
+    g1.add_argument("--gsc", required=True, help="JSON from `gsc.py query --dimensions query`")
+    g1.add_argument("--engine", default="google_ai_overview")
+    g1.add_argument("--top", type=int, default=30, help="ask about the N highest-impression queries")
+    g1.add_argument("--min-impressions", type=int, default=25)
+    g1.add_argument("--brand")
+    g1.add_argument("--gl", default="us")
+    g1.add_argument("--hl", default="en")
+    g1.add_argument("--runs", type=int, default=1)
+
     sub.add_parser("control", help="prove cannot_ask never becomes not_cited")
 
     a = ap.parse_args()
@@ -1096,6 +1592,29 @@ def main() -> int:
     elif a.action == "ask":
         out = ask(a.query, a.domain, brand=a.brand, engines=a.engine, gl=a.gl, hl=a.hl,
                   use_cache=not a.no_cache, runs=a.runs)
+    elif a.action == "diff":
+        out = diff_sweeps(json.loads(Path(a.before).read_text(encoding="utf-8")),
+                          json.loads(Path(a.after).read_text(encoding="utf-8")))
+    elif a.action == "gap":
+        gsc = json.loads(Path(a.gsc).read_text(encoding="utf-8"))
+        rows = sorted(_gsc_query_rows(gsc), key=lambda r: -r["impressions"])
+        rows = [r for r in rows if r["impressions"] >= a.min_impressions][: a.top]
+        if not rows:
+            out = refuse("geo-gap", "no Search Console query rows at --min-impressions - "
+                                    "nothing to join (check the export has the query dimension)")
+        elif a.engine not in ENGINES:
+            out = refuse("geo-gap", f"unknown engine {a.engine}")
+        else:
+            obs = {r["query"]: _obs_from_ask(
+                ask(r["query"], a.domain, brand=a.brand, engines=[a.engine], gl=a.gl, hl=a.hl,
+                    runs=a.runs), a.engine) for r in rows}
+            if not any(o.get("state") == "answered" for o in obs.values()):
+                out = refuse("geo-gap", f"{a.engine} answered none of {len(rows)} queries - "
+                                        f"cannot ask is not 'not cited'",
+                             states=sorted({o.get('state') for o in obs.values()}))
+            else:
+                out = {**gap_tiers(gsc, obs, a.min_impressions), "engine": a.engine,
+                       "asked": len(rows)}
     else:
         qs, err = ([], None)
         if a.bank:
