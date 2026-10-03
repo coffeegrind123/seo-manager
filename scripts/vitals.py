@@ -732,6 +732,110 @@ def lcp_subparts(origin: str, form_factor: str = "PHONE") -> dict:
             **out}
 
 
+CRUX_HISTORY_ENDPOINT = "https://chromeuxreport.googleapis.com/v1/records:queryHistoryRecord"
+HISTORY_METRICS = ("largest_contentful_paint", "interaction_to_next_paint", "cumulative_layout_shift")
+# A trend needs enough weeks to have a "before" and an "after" that do not
+# overlap; 8 is two non-overlapping 4-week windows.
+TREND_MIN_POINTS = 8
+TREND_MIN_RELATIVE = 0.05
+
+
+def _num(v):
+    try:
+        return None if v is None or v == "NaN" else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _trend(values: list) -> dict:
+    """Lower is better for all three vitals. A trend must beat the series' own
+    week-to-week noise (2x the median absolute weekly change) AND move 5% - a
+    25-week series of a 28-day rolling window wobbles, and every wobble read as
+    a trend is a regression report about nothing."""
+    pts = [v for v in values if v is not None]
+    if len(pts) < TREND_MIN_POINTS:
+        return {"trend": "insufficient", "measured_weeks": len(pts),
+                "why": f"{len(pts)} measured week(s); a trend needs {TREND_MIN_POINTS}"}
+    first, last = sum(pts[:4]) / 4, sum(pts[-4:]) / 4
+    steps = sorted(abs(b - a) for a, b in zip(pts, pts[1:]))
+    noise = steps[len(steps) // 2] if steps else 0.0
+    diff = last - first
+    rel = abs(diff) / first if first else 0.0
+    beats = abs(diff) > 2 * noise and rel >= TREND_MIN_RELATIVE
+    return {"trend": ("improving" if diff < 0 else "worsening") if beats else "flat",
+            "first4_mean": round(first, 4), "last4_mean": round(last, 4),
+            "change": round(diff, 4), "relative_change": round(rel, 3),
+            "weekly_noise": round(noise, 4), "measured_weeks": len(pts)}
+
+
+def _crux_date(d: dict | None) -> str | None:
+    if not d:
+        return None
+    return f"{d.get('year'):04d}-{d.get('month'):02d}-{d.get('day'):02d}"
+
+
+def parse_crux_history(record: dict) -> dict:
+    """CrUX History API record -> per-metric weekly p75 points and a trend.
+    p75s for CLS arrive as STRINGS; a missing week is null/NaN and stays a gap."""
+    periods = (record or {}).get("collectionPeriods") or []
+    ends = [_crux_date((p or {}).get("lastDate")) for p in periods]
+    out = {}
+    for name, m in ((record or {}).get("metrics") or {}).items():
+        p75s = [_num(v) for v in ((m or {}).get("percentilesTimeseries") or {}).get("p75s") or []]
+        points = [{"period_end": ends[i] if i < len(ends) else None, "p75": v}
+                  for i, v in enumerate(p75s)]
+        latest = next((v for v in reversed(p75s) if v is not None), None)
+        out[name] = {"points": points, "latest_p75": latest, **_trend(p75s)}
+    return {"metrics": out, "periods": len(periods)}
+
+
+def _crux_post(endpoint: str, body: dict, check: str) -> tuple[dict | None, dict | None, str]:
+    """POST to a CrUX endpoint with the API key. Returns (json, None, source) or
+    (None, refusal, source). Same credential rules as lcp_subparts."""
+    try:
+        from pagecheck import psi_token
+    except Exception as e:                                        # noqa: BLE001
+        return None, refuse(check, f"cannot import pagecheck: {e}"), ""
+    tok, source = psi_token()
+    if not tok or not tok.startswith("key:"):
+        return None, {"ok": False, "check": check, "state": "no_key",
+                      "error": ("CrUX API needs GOOGLE_API_KEY (or ~/.google_api_key); the PSI "
+                                f"service-account path does not reach it ({source})"),
+                      "note": "a missing credential is 'cannot ask', not a bad score"}, source
+    r = http(endpoint + "?key=" + tok[4:], data=json.dumps(body).encode(),
+             headers={"Content-Type": "application/json"}, method="POST", timeout=60)
+    j = r.json() or {}
+    if r.get("status") == 404:
+        return None, {"ok": True, "check": check, "state": "no_record",
+                      "note": "CrUX has no record here - too little traffic. An unanswered "
+                              "question, not a failing score."}, source
+    if not r.ok:
+        return None, {"ok": False, "check": check, "state": "failing", "status": r.get("status"),
+                      "error": str((j.get("error") or {}).get("message", ""))[:300]}, source
+    return j, None, source
+
+
+def crux_history(target: str, form_factor: str = "PHONE") -> dict:
+    """25 weekly points of field p75 for an ORIGIN (or one URL with --url).
+    Did the site actually get faster after the fix, in real users' hands -
+    the question a lab run cannot answer."""
+    is_url = urllib.parse.urlsplit(target).path not in ("", "/")
+    o = urllib.parse.urlsplit(target)
+    key = {"url": target} if is_url else {"origin": f"{o.scheme or 'https'}://{o.netloc or o.path}"}
+    j, refusal, source = _crux_post(CRUX_HISTORY_ENDPOINT,
+                                    {**key, "formFactor": form_factor,
+                                     "metrics": list(HISTORY_METRICS)}, "vitals-history")
+    if refusal:
+        return {**refusal, **key, "form_factor": form_factor}
+    out = parse_crux_history(j.get("record") or {})
+    return {"ok": True, "check": "vitals-history", "state": "answered", **key,
+            "form_factor": form_factor, "credential": source, **out,
+            "reading": ("Each point is a 28-day rolling p75 ending that week, so consecutive "
+                        "points overlap and a change takes ~4 weeks to show fully. A trend is "
+                        "called only when the last-4 mean differs from the first-4 mean by more "
+                        "than twice the median weekly wobble and by 5%+; lower is better.")}
+
+
 # -------------------------------------------------------------------- control
 CONTROL_HTML = """<!doctype html><html><head>
 <title>T</title>
@@ -869,6 +973,14 @@ def run_control() -> dict:
             "no subparts must never read as four zeros")
     c.check("an_empty_record_is_not_a_fast_site",
             parse_lcp_subparts({})["subparts_reported"] == [])
+    hh = parse_crux_history({"metrics": {"largest_contentful_paint": {"percentilesTimeseries": {
+        "p75s": [3000] * 4 + [3000] * 13 + [2000] * 4}}}})
+    c.check("history_calls_a_real_fall_improving",
+            hh["metrics"]["largest_contentful_paint"]["trend"] == "improving")
+    hh = parse_crux_history({"metrics": {"largest_contentful_paint": {"percentilesTimeseries": {
+        "p75s": [2500, None, 2400]}}}})
+    c.check("history_with_three_weeks_is_insufficient_not_a_trend",
+            hh["metrics"]["largest_contentful_paint"]["trend"] == "insufficient")
     return c.verdict(images_parsed=len(p.images))
 
 
@@ -924,6 +1036,11 @@ def main() -> int:
                    help="also decompose LCP into its four CrUX subparts (TTFB, load delay, "
                         "load duration, render delay) - image LCP only")
 
+    h = sub.add_parser("history", help="CrUX weekly p75 history + a noise-aware trend "
+                                       "(needs GOOGLE_API_KEY)")
+    h.add_argument("target", help="origin, or one URL")
+    h.add_argument("--form-factor", default="PHONE", choices=["PHONE", "DESKTOP", "TABLET"])
+
     sub.add_parser("control", help="prove the parser and grouper discriminate")
 
     a = ap.parse_args()
@@ -936,6 +1053,8 @@ def main() -> int:
         if a.subparts:
             out["lcp_subparts"] = lcp_subparts(
                 a.origin, "PHONE" if a.strategy == "mobile" else "DESKTOP")
+    elif a.cmd == "history":
+        out = crux_history(a.target, a.form_factor)
     else:
         urls, err = _read_urls(a)
         out = (refuse("vitals-sweep", err) if err else

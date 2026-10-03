@@ -90,6 +90,33 @@ def main() -> int:
     check("ttfb threshold is Google's 800ms", LIMITS["ttfb_ms"] == 800)
     check("dom threshold is near Lighthouse's warning", 1200 <= LIMITS["dom_nodes"] <= 1800)
 
+    print("\nCrUX history - a trend is called only when it beats the week-to-week noise:")
+    import vitals as V
+
+    def rec(lcp):
+        n = len(lcp)
+        return {"collectionPeriods": [{"firstDate": {"year": 2026, "month": 1, "day": 1},
+                                       "lastDate": {"year": 2026, "month": 1, "day": 1 + i}}
+                                      for i in range(n)],
+                "metrics": {"largest_contentful_paint": {"percentilesTimeseries": {"p75s": lcp}},
+                            "cumulative_layout_shift": {"percentilesTimeseries":
+                                                        {"p75s": ["0.05"] * n}}}}
+    h = V.parse_crux_history(rec([3000, 3050, 2980, 3020] + [3000] * 17 + [2200, 2250, 2180, 2210]))
+    check("an 800ms LCP fall far beyond weekly noise is improving",
+          h["metrics"]["largest_contentful_paint"]["trend"] == "improving", h["metrics"])
+    h = V.parse_crux_history(rec([3000, 2600, 3300, 2700, 3200, 2650, 3250, 2800, 3100, 2900,
+                                  3050, 2750, 3150, 2700, 3200, 2600, 3300, 2750, 3150, 2900,
+                                  2900, 2800, 2950, 2850, 2700]))
+    check("a 200ms drift inside 400ms weekly swings is flat, not a trend",
+          h["metrics"]["largest_contentful_paint"]["trend"] == "flat", h["metrics"])
+    h = V.parse_crux_history(rec([None, None, 2500, 2400, None, 2300]))
+    check("too few measured weeks is insufficient, never a trend",
+          h["metrics"]["largest_contentful_paint"]["trend"] == "insufficient", h["metrics"])
+    check("CLS p75s arrive as STRINGS and are read as numbers",
+          h["metrics"]["cumulative_layout_shift"]["latest_p75"] == 0.05, h["metrics"])
+    check("a missing week is a gap, not a zero",
+          h["metrics"]["largest_contentful_paint"]["points"][0]["p75"] is None)
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")
