@@ -217,6 +217,13 @@ def run_control(path: Path, timeout: int = 120, argv: str = "control") -> dict:
                 "detail": (body or (p.stderr or "").strip())[:300] or "no output"}
     if j.get("ok"):
         return {"state": "pass", "checks": len(j.get("checks") or {}) or None}
+    if j.get("transient"):
+        # A LIVE probe whose source refused (429, 5xx, no route). The control
+        # could not run, which is not the same as running and failing - the
+        # audit's own rule ("cannot ask" never shares a path with "the answer
+        # is no") applied to the audit.
+        return {"state": "unreachable", "reason": j.get("reason"),
+                "checks": len(j.get("checks") or {}) or None}
     return {"state": "fail", "failed": j.get("failed") or j.get("reason"),
             "checks": len(j.get("checks") or {}) or None}
 
@@ -254,6 +261,7 @@ def audit(run: bool = True, timeout: int = 120, directory: Path | None = None) -
     declared_only = by.get("declared", [])
     declared = proven + declared_only
     broken = by.get("fail", []) + by.get("unreadable", []) + by.get("timeout", [])
+    unreachable = by.get("unreachable", [])
     uncontrolled = by.get("absent", [])
 
     # The audit needs its own control, or it is exactly the instrument it is
@@ -269,7 +277,7 @@ def audit(run: bool = True, timeout: int = 120, directory: Path | None = None) -
     # catch. `no_subcommands` does not count - that is a structural n/a, not a gap.
     absent = by.get("absent", [])
     return {
-        "ok": detector_ok and not broken and not absent,
+        "ok": detector_ok and not broken and not absent and not unreachable,
         "check": "controls-audit",
         "mode": "executed" if run else "static",
         "controls_executed": bool(run),
@@ -285,11 +293,16 @@ def audit(run: bool = True, timeout: int = 120, directory: Path | None = None) -
         "control": {"known_controlled": known_good, "detector_found_them": detector_ok,
                     "note": "if this is false the audit itself is the broken reader"},
         "summary": {"proven": len(proven), "declared": len(declared),
-                    "broken": len(broken), "uncontrolled": len(uncontrolled),
+                    "broken": len(broken), "unreachable": len(unreachable),
+                    "uncontrolled": len(uncontrolled),
                     "total": len(rows)},
         "uncontrolled": uncontrolled,
         "absent": absent,
         "broken": broken,
+        "unreachable": unreachable,
+        "unreachable_means": ("a LIVE control whose source refused (rate limit, 5xx, no route) - "
+                              "the instrument cannot prove itself TODAY; re-run later. Not a "
+                              "reader bug, and not a pass."),
         "rows": rows,
         "note": ("`absent` is not a bug report about the script's answers - it means "
                  "nothing in the script can distinguish 'found nothing' from 'the "

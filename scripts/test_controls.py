@@ -100,6 +100,25 @@ def main() -> int:
         f2 = audit(run=False, directory=d)
         check("removing it restores the clean verdict", f2["ok"] is True, f2["summary"])
 
+    print("\na live source refusing is UNREACHABLE, never 'broken':")
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        body = ('import argparse, json, sys\n'
+                'ap = argparse.ArgumentParser()\n'
+                's = ap.add_subparsers(dest="c")\n'
+                's.add_parser("control")\n'
+                'ap.parse_args()\n'
+                'print(json.dumps({TEXT}))\n'
+                'sys.exit(1)\n')
+        (d / "limited.py").write_text(body.replace("{TEXT}", '{"ok": False, "transient": True, '
+                                                             '"reason": "HTTP 429"}'))
+        (d / "wrong.py").write_text(body.replace("{TEXT}", '{"ok": False, "failed": ["x"]}'))
+        f = audit(run=True, directory=d, timeout=30)
+        check("a rate-limited control is named unreachable", f["unreachable"] == ["limited.py"], f)
+        check("and is NOT counted broken", f["broken"] == ["wrong.py"], f["broken"])
+        check("the audit stays not-ok: an unreachable instrument proves nothing today",
+              f["ok"] is False)
+
     print("\nthe primitives:")
     empty = Controls("x")
     check("an empty control set is not a pass", empty.ok is False,

@@ -154,6 +154,13 @@ def run_control() -> dict:
     ws = wiki_search("Counter-Strike", limit=3)
     c.check("title_resolution_returns_candidates",
             bool(ws.get("results") or ws.get("titles") or ws.get("ok")), str(ws)[:200])
+    refused = [x.get("status") for x in (pv, miss, ws)
+               if x.get("ok") is False and x.get("status") in (0, 429, 500, 502, 503, 504)]
+    if refused and not c.ok:
+        # The source refused, so the probe never ran - that is unreachable,
+        # not a broken reader.
+        return c.verdict(transient=True, reason=f"live source refused: HTTP {refused}",
+                         note="re-run later; a refusal is not a reader bug")
     return c.verdict(note="these are LIVE probes of keyless sources; a failure here is "
                           "usually reachability or a changed feed shape, not your site")
 
@@ -182,7 +189,14 @@ def pageviews(article, days=90, lang="en", project=None):
         f"{project}/all-access/user/{title}/daily/"
         f"{start.strftime('%Y%m%d')}/{end.strftime('%Y%m%d')}"
     )
-    status, body = fetch(url)
+    # Wikimedia rate-limits in time windows; a 429 here is followed by a 200
+    # (or the real 404) seconds later - measured 2026-10-03 after a burst of
+    # probes. Bounded retry, same as newsvolume.
+    for attempt in range(3):
+        status, body = fetch(url)
+        if status not in (429, 503) or attempt == 2:
+            break
+        time.sleep(3 * (attempt + 1))
     if status == 404:
         return {
             "ok": False,
