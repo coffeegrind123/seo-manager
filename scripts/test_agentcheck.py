@@ -298,6 +298,167 @@ check("CONTROL: a file with no named group cannot escape", not _escapes(NO_NAMED
 check("CONTROL: the probe finds nothing when `*` disallows nothing",
       not _escapes("User-agent: *\nAllow: /\n\nUser-agent: GPTBot\nAllow: /\n"))
 
+print("\nline splitting (RFC 9309 / Google's parser: CR, LF, CRLF only)")
+
+# `str.splitlines()` also breaks on U+2028, U+2029, U+0085, VT, FF and the
+# C0 separators. Every one of those turns the tail of a COMMENT into a live
+# rule that no real crawler reads - a phantom `Disallow: /` reported as policy.
+for sep, label in ((" ", "U+2028"), (" ", "U+2029"), ("\x85", "NEL"),
+                   ("\x0b", "VT"), ("\x0c", "FF"), ("\x1c", "FS")):
+    t = f"User-agent: GPTBot\n# note{sep}Disallow: /\nAllow: /\n"
+    gg = ac.parse_robots(t)
+    check(f"a {label} inside a comment does not create a rule",
+          gg and gg[0]["rules"] == [("allow", "/")], str(gg))
+check("CONTROL: CRLF still splits",
+      ac.parse_robots("User-agent: *\r\nDisallow: /x\r\n")[0]["rules"] == [("disallow", "/x")])
+check("CONTROL: a bare CR still splits",
+      ac.parse_robots("User-agent: *\rDisallow: /x\r")[0]["rules"] == [("disallow", "/x")])
+gb = ac.parse_robots("User-agent:\nDisallow: /\n\nUser-agent: *\nAllow: /\n")
+check("an EMPTY User-agent value matches no crawler",
+      ac.allowed(gb, "GPTBot", "/x")["allowed"] is True, str(ac.allowed(gb, "GPTBot", "/x")))
+check("a leading BOM does not hide the first User-agent",
+      ac.parse_robots("﻿User-agent: GPTBot\nDisallow: /\n")[0]["agents"] == ["gptbot"])
+
+
+print("\nRFC 9309 2.2.1: every group matching a crawler is COMBINED")
+CF = (Path(__file__).resolve().parent.parent / "assets" / "fixtures" / "agentcheck"
+      / "cloudflare-managed-robots.txt").read_text(encoding="utf-8")
+gcf = ac.parse_robots(CF)
+check("Cloudflare-managed: the origin's Disallow survives the prepended `*` group",
+      ac.allowed(gcf, "Googlebot", "/lp")["allowed"] is False, str(ac.allowed(gcf, "Googlebot", "/lp")))
+check("CONTROL: and the managed Allow still opens everything else",
+      ac.allowed(gcf, "Googlebot", "/pricing")["allowed"] is True)
+check("Cloudflare-managed: GPTBot is closed by its own named group",
+      ac.allowed(gcf, "GPTBot", "/")["allowed"] is False)
+two = ac.parse_robots("User-agent: GPTBot\nDisallow: /a\n\nUser-agent: *\nDisallow: /\n\n"
+                      "User-agent: GPTBot\nDisallow: /b\n")
+check("two groups naming the same crawler combine",
+      not ac.allowed(two, "GPTBot", "/a")["allowed"] and not ac.allowed(two, "GPTBot", "/b")["allowed"]
+      and ac.allowed(two, "GPTBot", "/c")["allowed"])
+
+print("\nCloudflare managed robots.txt, and Content-Signal coverage")
+mg = ac.cloudflare_managed(CF)
+check("the managed block is detected", mg["present"] is True, mg)
+check("and the agents it closes are named", {"gptbot", "claudebot", "google-extended"} <= set(mg["disallows"]),
+      mg)
+check("CONTROL: an ordinary robots.txt is not managed",
+      ac.cloudflare_managed("User-agent: *\nDisallow: /x\n")["present"] is False)
+gaps = ac.content_signal_gaps(gcf)
+check("named groups without the `*` group's Content-Signal are listed",
+      "gptbot" in gaps and "amazonbot" in gaps, gaps)
+check("CONTROL: no `*` signal means no gap to report",
+      ac.content_signal_gaps(ac.parse_robots("User-agent: *\nAllow: /\nUser-agent: GPTBot\nDisallow: /\n")) == [])
+check("CONTROL: a named group that repeats the signal is not a gap",
+      ac.content_signal_gaps(ac.parse_robots(
+          "User-agent: *\nContent-Signal: ai-train=no\nAllow: /\n\n"
+          "User-agent: GPTBot\nContent-Signal: ai-train=no\nDisallow: /x\n")) == [])
+
+print("\nbot-challenge fingerprints (every pattern in a row must match)")
+ch = ac.challenge_vendor
+check("Cloudflare interstitial", ch(403, {"cf-mitigated": "challenge"}, "<html>x</html>") == "cloudflare")
+check("Cloudflare by body", ch(403, {}, "<title>Just a moment...</title> /cdn-cgi/challenge-platform/h/g/orchestrate") == "cloudflare")
+check("DataDome", ch(403, {}, "<script src='https://ct.captcha-delivery.com/c.js'>") == "datadome")
+check("Akamai needs BOTH the phrase and a reference",
+      ch(403, {}, "Access Denied. Reference #18.6f2b1402.1727950000.abc1234") == "akamai"
+      and ch(403, {}, "Access Denied to this page, please log in") is None)
+check("PerimeterX", ch(403, {}, "<div id='px-captcha'></div>") == "perimeterx")
+check("a long real page mentioning 'Just a moment' is not a challenge",
+      ch(200, {}, "<title>Just a moment</title>" + " word" * 400) is None)
+check("CONTROL: an ordinary 200 is no challenge", ch(200, {}, "<html><p>hello</p></html>") is None)
+
+print("\nreachability verdict: a spoofed AI UA is only evidence when spoofed Googlebot passes")
+B = {"status": 200, "text_len": 5000, "challenge": None}
+OK = {"status": 200, "text_len": 4900, "challenge": None}
+NO = {"status": 403, "text_len": 20, "challenge": None}
+v = ac.reach_verdict(B, OK, {"GPTBot": NO, "OAI-SearchBot": OK})
+check("browser 200 + googlebot 200 + GPTBot 403 = an edge rule against GPTBot",
+      v["state"] == "measured" and v["bots"]["GPTBot"] == "refused" and v["bots"]["OAI-SearchBot"] == "served",
+      v)
+v = ac.reach_verdict(B, NO, {"GPTBot": NO})
+check("spoofed Googlebot ALSO refused = the edge verifies bots by IP: cannot ask from here",
+      v["state"] == "cannot_ask" and v["bots"] == {}, v)
+v = ac.reach_verdict(NO, OK, {"GPTBot": NO})
+check("the browser control refused = no baseline, cannot ask", v["state"] == "cannot_ask", v)
+v = ac.reach_verdict(B, OK, {"GPTBot": {"status": 200, "text_len": 300, "challenge": None}})
+check("a 200 carrying a fraction of the page is `differs`, not `served`", v["bots"]["GPTBot"] == "differs", v)
+v = ac.reach_verdict(B, OK, {"GPTBot": {"status": None, "text_len": 0, "challenge": None}})
+check("no answer at all is `silent`, never `refused`", v["bots"]["GPTBot"] == "silent", v)
+v = ac.reach_verdict(B, OK, {"GPTBot": {"status": 200, "text_len": 900, "challenge": "cloudflare"}})
+check("a 200 challenge page is `challenged`", v["bots"]["GPTBot"] == "challenged", v)
+
+print("\nllms.txt read classification - a CDN 403 is not an absent file")
+lc = ac.classify_llms_read
+check("404 is absent", lc(404, "text/html", "") == "absent")
+check("403 is blocked, not absent", lc(403, "text/html", "denied") == "blocked")
+check("406 is blocked, not absent", lc(406, "", "") == "blocked")
+check("200 HTML is a soft-404, not a file", lc(200, "text/html", "<!doctype html><html>") == "html_served")
+check("200 text is present", lc(200, "text/plain", "# Site\n> x\n") == "present")
+check("5xx is a failed read", lc(503, "", "") == "failed")
+
+print("\nai-catalog.json (ARD) validation - the conformance suite's two tiers")
+import json as _json
+CFCAT = _json.loads((Path(__file__).resolve().parent.parent / "assets" / "fixtures" / "agentcheck"
+                     / "cloudflare-ai-catalog.json").read_text(encoding="utf-8"))
+v = ac.validate_ai_catalog(CFCAT)
+check("Cloudflare's live catalog (extension media types) has NO errors", v["errors"] == [], v)
+good = {"specVersion": "1.0", "entries": [{
+    "identifier": "urn:air:example.com:docs", "displayName": "Docs",
+    "type": "application/mcp-server-card+json", "url": "https://example.com/mcp.json",
+    "representativeQueries": ["how do I", "what is"]}]}
+v = ac.validate_ai_catalog(good)
+check("a well-formed catalog has no errors and no warnings", v == {"errors": [], "warnings": []}, v)
+bad = {"specVersion": "0.9", "collections": [], "entries": [{
+    "identifier": "example", "type": "not a media type", "url": "x", "data": {},
+    "representativeQueries": ["one"]}]}
+v = ac.validate_ai_catalog(bad)
+for frag in ("specVersion", "identifier", "displayName", "exactly one"):
+    check(f"bad catalog ERRORS on `{frag}`", any(frag in e for e in v["errors"]), v)
+for frag in ("collections", "media type", "representativeQueries"):
+    check(f"bad catalog only WARNS on `{frag}`",
+          any(frag in w for w in v["warnings"]) and not any(frag in e for e in v["errors"]), v)
+check("a renamed type is a warning naming its replacement",
+      any("mcp-server-card+json" in w for w in ac.validate_ai_catalog({"specVersion": "1.0", "entries": [{
+          "identifier": "urn:air:a.b:c", "displayName": "x", "type": "application/mcp-server+json",
+          "url": "u", "representativeQueries": ["a", "b"]}]})["warnings"]))
+check("a non-object is one error, not a crash", ac.validate_ai_catalog([1])["errors"] != [])
+
+print("\nUCP profile (/.well-known/ucp) validation - the shape the spec has")
+ucp = {"ucp": {"version": "2026-08-25", "supported_versions": {"2026-08-25": "https://ucp.dev/x"},
+               "services": {"dev.ucp.shopping": [{"version": "2026-08-25", "transport": "rest",
+                                                  "endpoint": "https://shop.example/ucp"}]},
+               "capabilities": {"dev.ucp.shopping.checkout": [
+                   {"version": "2026-08-25", "spec": "https://ucp.dev/s", "schema": "https://ucp.dev/j"}]}}}
+r = ac.validate_ucp(ucp)
+check("a spec-shaped profile validates", r["errors"] == [] and r["capabilities"] == 1, r)
+r = ac.validate_ucp({"version": "1", "merchant": {}, "capabilities": []})
+check("the flat shape the spec never had is `missing-ucp-root`", "missing-ucp-root" in r["errors"], r)
+r = ac.validate_ucp({"ucp": {"version": "Aug 2026", "services": {"s": [{"transport": "rest"}]},
+                             "capabilities": {"c": [{"version": "x"}]}}})
+check("bad version, rest without endpoint, capability without spec/schema are all named",
+      any("version" in e for e in r["errors"]) and any("endpoint" in e for e in r["errors"])
+      and any("spec" in e for e in r["errors"]), r)
+
+print("\nWebMCP entry points")
+w = ac.webmcp_scan("<script>(document.modelContext ?? navigator.modelContext).registerTool({});"
+                   "x.registerTool({})</script>")
+check("document.modelContext is the current entry point", w["entry_point"] == "document", w)
+check("registerTool call sites are counted", w["register_tool_calls"] == 2, w)
+check("navigator-only is reported as legacy",
+      ac.webmcp_scan("<script>navigator.modelContext.provideContext({})</script>")["entry_point"] == "navigator_legacy")
+check("CONTROL: a page with neither says none",
+      ac.webmcp_scan("<p>modelContext is a word here</p>")["entry_point"] is None)
+
+
+print("\nGoogle's user-triggered fetchers 'generally ignore robots.txt' - no false 'blocked'")
+import agentcheck as _ac
+gr = _ac.parse_robots("User-agent: *\nDisallow: /\n")
+rows = _ac.policy_rows(gr, "/")
+ga = next(r for r in rows if r["bot"] == "Google-Agent")
+check("Google-Agent under Disallow is reported robots_applies=False, not blocked",
+      ga["robots_applies"] is False and ga["allowed"] is None, ga)
+cu = next(r for r in rows if r["bot"] == "Claude-User")
+check("CONTROL: Claude-User (honours robots) is still blocked", cu["allowed"] is False, cu)
+
 print()
 if FAILS:
     print(f"FAILED {len(FAILS)}: {', '.join(FAILS)}")

@@ -53,6 +53,16 @@ check("robots/prefix match refused", C.robots_allows("https://x.test/about"), Fa
 check("robots/allowed path permitted", C.robots_allows("https://x.test/guides/x"), True)
 C._robots_cache["https://y.test"] = ""
 check("robots/no robots.txt means allowed", C.robots_allows("https://y.test/any"), True)
+# One robots.txt reader in this skill, not two: the fetcher's courtesy check
+# shares agentcheck's RFC 9309 parser. The hand-rolled one ignored Allow, split
+# lines on U+2028, and re-opened a group on every User-agent line.
+C._robots_cache["https://z.test"] = "User-agent: *\nDisallow: /\nAllow: /blog/\n"
+check("robots/longest Allow beats a shorter Disallow", C.robots_allows("https://z.test/blog/post"), True)
+check("robots/CONTROL: the Disallow still applies elsewhere", C.robots_allows("https://z.test/shop"), False)
+C._robots_cache["https://w.test"] = "User-agent: *\n# note\u2028Disallow: /\nAllow: /\n"
+check("robots/a U+2028 in a comment is not a rule", C.robots_allows("https://w.test/x"), True)
+C._robots_cache["https://v.test"] = "User-agent: GPTBot\nUser-agent: *\nDisallow: /private\n"
+check("robots/consecutive User-agent lines share the block", C.robots_allows("https://v.test/private"), False)
 
 # 4. EVERY unread result is offered for browser escalation, including
 #    robots-disallowed ones, with the reason preserved. robots.txt governs

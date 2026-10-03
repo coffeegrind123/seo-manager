@@ -12,8 +12,15 @@ you - and those need completely different fixes.
   page       what an agent gets from one URL: agent-UX semantics, token budget,
              whether the content survives without JavaScript, WebMCP tools
   llms       /llms.txt and /llms-full.txt - presence and well-formedness, with
-             no citation claim attached to either (see the note below)
-  all        the three together for one origin
+             no citation claim attached to either (see the note below); a CDN
+             403/406 is `blocked` (unknown), never `absent`
+  reach      what each AI-crawler UA is SERVED, against a browser control and a
+             forged-Googlebot control (an edge that refuses forged Googlebot is
+             verifying by IP, and then a forged AI UA's refusal means nothing)
+  discovery  Agentmap / ai-catalog.json (ARD), the /.well-known documents agents
+             look for (api-catalog, OAuth metadata, A2A card, UCP) - optional
+             surfaces, where only a 200 that is NOT the document is a finding
+  all        all five together for one origin
 
 THE POLICY CHECK IS THE ONE THAT PAYS. Blocking `ai_search` while allowing
 `ai_training` is the worst reachable configuration and it is easy to arrive at
@@ -78,11 +85,24 @@ def _finding(sev, rule, detail, fix=None, **extra):
 # -------------------------------------------------------------- robots.txt
 
 
+_ROBOTS_EOL = re.compile(r"\r\n|\n|\r")
+
+
+def robots_lines(text: str) -> list[str]:
+    """Split robots.txt the way crawlers do: CR, LF or CRLF, nothing else.
+
+    `str.splitlines()` also breaks on U+2028/2029, NEL, VT, FF and the C0
+    separators, so the tail of a comment becomes a live rule no crawler reads.
+    A leading BOM is dropped, as Google's parser does - left in place it glues
+    onto the first field name and the whole first group vanishes."""
+    return _ROBOTS_EOL.split((text or "").lstrip("﻿"))
+
+
 def parse_robots(text: str) -> list[dict]:
     """robots.txt -> groups of {agents, rules}. Consecutive User-agent lines
     share one rule block, which is the part naive parsers get wrong."""
     groups, cur, expecting_agent = [], None, False
-    for raw in text.splitlines():
+    for raw in robots_lines(text):
         line = raw.split("#", 1)[0].strip()
         if not line or ":" not in line:
             continue
@@ -170,19 +190,32 @@ def _match_len(pattern: str, path: str) -> int:
 
 def allowed(groups: list[dict], ua: str, path: str = "/") -> dict:
     """Google's rule: most-specific UA group wins; within it, longest match wins;
-    a tie goes to Allow."""
+    a tie goes to Allow.
+
+    EVERY group naming that same most-specific token is COMBINED first (RFC
+    9309 2.2.1). Cloudflare's managed robots.txt prepends its own `User-agent:
+    *` group with `Allow: /` ahead of the origin's `*` group, and reading only
+    the first one reported the origin's `Disallow: /lp` as open."""
     ua = ua.lower()
-    best, best_len = None, -1
-    for g in groups:
+
+    def spec(g):
+        best = -1
         for a in g["agents"]:
+            if not a:
+                continue          # `User-agent:` with no value names nobody
             if a == "*":
-                if best_len < 0:
-                    best, best_len = g, 0
+                best = max(best, 0)
             elif ua.startswith(a) or a in ua:
-                if len(a) > best_len:
-                    best, best_len = g, len(a)
-    if best is None:
+                best = max(best, len(a))
+        return best
+
+    scored = [(spec(g), g) for g in groups]
+    best_len = max((n for n, _ in scored), default=-1)
+    if best_len < 0:
         return {"allowed": True, "matched_group": None, "reason": "no matching group"}
+    chosen = [g for n, g in scored if n == best_len]
+    best = {"agents": sorted({a for g in chosen for a in g["agents"]}),
+            "rules": [r for g in chosen for r in g["rules"]]}
 
     win, win_len, win_dir = True, -1, None
     for field, value in best["rules"]:
@@ -298,7 +331,66 @@ def run_control() -> dict:
     c.check("link_header_reads_rel_and_type", lk[1]["rel"] == "alternate"
             and lk[1]["type"] == "text/markdown")
     c.check("an_empty_link_header_is_an_empty_list", parse_link_header("") == [])
+    # 2026-10-03 readers, each fired both ways.
+    cf = ("User-agent: *\nAllow: /\n# BEGIN Cloudflare Managed content\nUser-agent: GPTBot\n"
+          "Disallow: /\n# END Cloudflare Managed Content\nUser-agent: *\nDisallow: /lp\n")
+    gcf = parse_robots(cf)
+    c.check("combined_star_groups_keep_the_origin_disallow",
+            allowed(gcf, "Googlebot", "/lp")["allowed"] is False
+            and allowed(gcf, "Googlebot", "/ok")["allowed"] is True)
+    c.check("managed_block_found_and_not_invented",
+            cloudflare_managed(cf)["disallows"] == ["gptbot"]
+            and cloudflare_managed("User-agent: *\nAllow: /\n")["present"] is False)
+    c.check("challenge_fingerprint_fires_and_stays_quiet",
+            challenge_vendor(403, {"cf-mitigated": "challenge"}, "") == "cloudflare"
+            and challenge_vendor(200, {}, "<p>hello</p>") is None)
+    ok_ = {"status": 200, "text_len": 1000, "challenge": None}
+    no_ = {"status": 403, "text_len": 10, "challenge": None}
+    c.check("reach_refuses_when_forged_googlebot_is_refused",
+            reach_verdict(ok_, no_, {"X": no_})["state"] == "cannot_ask")
+    c.check("reach_reads_a_refusal_when_the_control_passes",
+            reach_verdict(ok_, ok_, {"X": no_})["bots"] == {"X": "refused"})
+    c.check("llms_cdn_403_is_blocked_not_absent",
+            classify_llms_read(403, "", "") == "blocked" and classify_llms_read(404, "", "") == "absent")
+    c.check("ucp_flat_shape_rejected_spec_shape_accepted",
+            validate_ucp({"merchant": {}})["errors"] == ["missing-ucp-root"]
+            and validate_ucp({"ucp": {"version": "2026-08-25", "services": {},
+                                      "capabilities": {}}})["errors"] == [])
+    c.check("ard_extension_media_type_is_not_an_error_but_a_bad_id_is",
+            validate_ai_catalog({"specVersion": "1.0", "entries": [{
+                "identifier": "urn:air:a.b:c", "displayName": "x", "type": "text/plain",
+                "url": "u", "representativeQueries": ["a", "b"]}]}) == {"errors": [], "warnings": []}
+            and validate_ai_catalog({"specVersion": "1.0", "entries": [{
+                "identifier": "nope", "displayName": "x", "type": "text/plain",
+                "url": "u"}]})["errors"] != [])
     return c.verdict(groups_parsed=len(g))
+
+
+# Fetchers Google documents as user-triggered, which "generally ignore
+# robots.txt rules" (developers.google.com/crawling/docs/crawlers-fetchers/
+# google-user-triggered-fetchers, read 2026-10-03). A Disallow does not stop
+# them, so reporting one as "blocked" claims a block that does not happen.
+ROBOTS_NOT_BINDING = {"google-agent", "google-gemininotebook", "google-notebooklm"}
+
+
+def policy_rows(groups: list[dict], path: str = "/") -> list[dict]:
+    rows = []
+    for _key, name, cat, _dns in BOTS:
+        if not cat.startswith("ai_"):
+            continue
+        explicit = any(name.lower() in a or a in name.lower()
+                       for g in groups for a in g["agents"] if a and a != "*")
+        if name.lower() in ROBOTS_NOT_BINDING:
+            rows.append({"bot": name, "category": cat, "allowed": None, "robots_applies": False,
+                         "explicit_rule": explicit,
+                         "reason": "user-triggered Google fetcher - Google says these generally "
+                                   "ignore robots.txt, so a rule here neither blocks nor admits it"})
+            continue
+        verdict = allowed(groups, name, path)
+        rows.append({"bot": name, "category": cat, "allowed": verdict["allowed"],
+                     "robots_applies": True, "explicit_rule": explicit,
+                     "reason": verdict["reason"]})
+    return rows
 
 
 def check_policy(origin: str, path: str = "/") -> dict:
@@ -330,17 +422,11 @@ def check_policy(origin: str, path: str = "/") -> dict:
             "Serve it as text/plain. Crawlers parse this as garbage and fall back to "
             "crawling everything, or nothing."))
 
-    rows, by_cat = [], {}
-    for _key, name, cat, _dns in BOTS:
-        if not cat.startswith("ai_"):
-            continue
-        verdict = allowed(groups, name, path)
-        explicit = any(name.lower() in a or a in name.lower()
-                       for g in groups for a in g["agents"] if a != "*")
-        row = {"bot": name, "category": cat, "allowed": verdict["allowed"],
-               "explicit_rule": explicit, "reason": verdict["reason"]}
-        rows.append(row)
-        by_cat.setdefault(cat, []).append(row)
+    rows = policy_rows(groups, path)
+    by_cat = {}
+    for row in rows:
+        if row["robots_applies"]:
+            by_cat.setdefault(row["category"], []).append(row)
 
     summary = {c: {"allowed": sum(1 for r_ in v if r_["allowed"]), "total": len(v)}
                for c, v in by_cat.items()}
@@ -382,7 +468,7 @@ def check_policy(origin: str, path: str = "/") -> dict:
                       for r in g["rules"] if r[0] == "disallow" and r[1]]
     escapes = []
     for r_ in rows:
-        if not r_["explicit_rule"]:
+        if not r_["explicit_rule"] or not r_["robots_applies"]:
             continue
         got = [d for d in star_disallows
                if allowed(groups, r_["bot"], d)["allowed"]]
@@ -457,9 +543,59 @@ def check_policy(origin: str, path: str = "/") -> dict:
                 "If exclusion is the intent, Disallow is the enforceable instruction."))
             break
 
+    managed = cloudflare_managed(body)
+    if managed["present"]:
+        search_keys = {n.lower() for _k, n, c, _d in BOTS if c == "ai_search"}
+        closed_search = [a for a in managed["disallows"] if a in search_keys]
+        findings.append(_finding(
+            "high" if closed_search else "info", "cloudflare_managed_robots",
+            "robots.txt carries Cloudflare's MANAGED block, injected at the edge - it is "
+            "not in the origin's file. It closes: " + (", ".join(managed["disallows"]) or "nothing")
+            + (f". That includes citing crawler(s) {closed_search}." if closed_search else "."),
+            "Change it in the Cloudflare dashboard (Security Settings > robots.txt), not in "
+            "the repo. Editing the origin file cannot remove a rule the edge prepends."))
+
+    gaps = content_signal_gaps(groups)
+    if gaps:
+        findings.append(_finding(
+            "low", "content_signal_not_in_named_groups",
+            f"the `*` group declares a Content-Signal, but {len(gaps)} named group(s) do not: "
+            + ", ".join(gaps[:8]),
+            "A crawler reads only the most specific group naming it, so the `*` signal says "
+            "nothing to these agents. Repeat the line in each named group if it is meant for them."))
+
+    # The same URL can serve a DIFFERENT robots.txt to a crawler UA (a CDN
+    # rule, a bot-management layer, a server that varies on User-Agent). What a
+    # browser reads is then not what the crawler obeys. Forged UAs, so a
+    # difference is reported as evidence of variation, never as what the real
+    # crawler definitely receives.
+    import hashlib
+    probe_uas = {"Googlebot": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
+    for _k, name, cat, _d in BOTS:
+        if cat == "ai_search" and len(probe_uas) < 6:
+            probe_uas[name] = f"Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; {name}/1.0)"
+    base_hash = hashlib.sha256(body.encode()).hexdigest()
+    varies = []
+    for name, ua in probe_uas.items():
+        rr = http(url, timeout=20, ua=ua, retries=0)
+        txt = rr.text() if rr.get("status") == 200 else ""
+        if rr.get("status") != 200 or hashlib.sha256(txt.encode()).hexdigest() != base_hash:
+            varies.append({"ua": name, "status": rr.get("status"),
+                           "same_body": False, "bytes": len(txt.encode())})
+    if varies:
+        findings.append(_finding(
+            "medium", "robots_varies_by_user_agent",
+            f"robots.txt differs for {len(varies)} crawler UA(s) vs a browser: "
+            + ", ".join(f"{v['ua']} (HTTP {v['status']}, {v['bytes']}B)" for v in varies[:6]),
+            "The rules evaluated above are what a BROWSER reads. A crawler may be served "
+            "something else, or refused. Sent from here these UAs are forgeries, so an edge "
+            "that verifies bots by IP will treat them differently from the real crawlers - "
+            "confirm with `agentcheck.py reach` and the access log before acting."))
+
     findings.sort(key=lambda f: (SEVERITY_ORDER.get(f["severity"], 9), f["rule"]))
     return {
         "ok": True, "check": "agent-policy", "robots_url": url, "status": 200,
+        "cloudflare_managed": managed, "robots_by_user_agent": varies,
         "path_tested": path,
         "verdict": ("fail" if any(f["severity"] in ("critical", "high") for f in findings)
                     else "warn" if findings else "pass"),
@@ -477,6 +613,454 @@ def check_policy(origin: str, path: str = "/") -> dict:
     }
 
 
+# ------------------------------------------------- edge-layer and discovery
+
+
+_CF_BEGIN = re.compile(r"(?im)^\s*#\s*BEGIN Cloudflare Managed content\s*$")
+_CF_END = re.compile(r"(?im)^\s*#\s*END Cloudflare Managed content\s*$")
+
+
+def cloudflare_managed(body: str) -> dict:
+    """Cloudflare's managed robots.txt is PREPENDED at the edge between
+    `# BEGIN Cloudflare Managed content` / `# END ...` markers (Cloudflare's
+    docs, read 2026-10-03). It exists only in the live response, never in the
+    origin's file, so an owner reading their repo sees rules nobody serves and
+    misses the ones that are. The agents it closes are named for that reason."""
+    b, e = _CF_BEGIN.search(body or ""), _CF_END.search(body or "")
+    if not b:
+        return {"present": False, "disallows": []}
+    inner = body[b.end(): e.start() if e and e.start() > b.end() else len(body)]
+    closed = sorted({a for g in parse_robots(inner) for a in g["agents"]
+                     if a != "*" and ("disallow", "/") in g["rules"]})
+    return {"present": True, "closed_by_end_marker": bool(e), "disallows": closed}
+
+
+def content_signal_gaps(groups: list[dict]) -> list[str]:
+    """Named groups that do not carry the `*` group's Content-Signal.
+
+    A crawler obeys ONLY the most specific group naming it, so a signal written
+    once under `User-agent: *` says nothing to GPTBot the moment GPTBot has a
+    group of its own - which is exactly the layout Cloudflare's managed file
+    produces."""
+    if not any(g.get("content_signal") for g in groups if "*" in g["agents"]):
+        return []
+    named = {}
+    for g in groups:
+        for a in g["agents"]:
+            if a and a != "*":
+                named[a] = named.get(a, False) or bool(g.get("content_signal"))
+    return sorted(a for a, has in named.items() if not has)
+
+
+# Bot-challenge interstitials, as published by each vendor. EVERY pattern in a
+# row must match the first 64 KB (unescaped), and the page must carry under 120
+# visible words: a real article that merely says "Just a moment" is not a
+# challenge, and calling it one hides a page that was served. Table adapted
+# from jianruntech/geo-score's CHALLENGES (MIT), checked against each vendor's
+# documented markers.
+CHALLENGES = [
+    ("cloudflare", [r"cf[-_]chl|/cdn-cgi/challenge-platform/|<title>\s*Just a moment"]),
+    ("aws_waf", [r"awswaf|reportChallengeError"]),
+    ("akamai", [r"Access Denied",
+                r"Reference\s*#|errors\.edgesuite\.net|\d{1,3}\.[0-9a-f]{6,8}\.\d{10}\.[0-9a-f]{6,10}"]),
+    ("fastly", [r"/_fs-ch-|<title>\s*Client Challenge"]),
+    ("perimeterx", [r"px-captcha|_pxJsClientSrc"]),
+    ("datadome", [r"captcha-delivery\.com"]),
+    ("imperva", [r"_Incapsula_Resource", r"incident_id|Incapsula incident"]),
+]
+
+
+def _visible_words(doc: str) -> int:
+    return len(re.sub(r"\s+", " ", TAG_RE.sub(" ", SCRIPT_RE.sub(" ", doc or ""))).split())
+
+
+def challenge_vendor(status, headers: dict | None, body: str) -> str | None:
+    h = {k.lower(): str(v).lower() for k, v in (headers or {}).items()}
+    if h.get("cf-mitigated") == "challenge":
+        return "cloudflare"
+    head = __import__("html").unescape((body or "")[:65536])
+    if _visible_words(head) >= 120:
+        return None
+    for vendor, pats in CHALLENGES:
+        if all(re.search(p_, head, re.I) for p_ in pats):
+            return vendor
+    return None
+
+
+def _visible_len(doc: str) -> int:
+    return len(re.sub(r"\s+", " ", TAG_RE.sub(" ", SCRIPT_RE.sub(" ", doc or ""))).strip())
+
+
+def reach_verdict(browser: dict, googlebot: dict, bots: dict[str, dict]) -> dict:
+    """What each crawler UA is served - only when the probe can tell.
+
+    A UA string sent from this container is a FORGERY of that crawler, and an
+    edge that verifies bots by IP (Cloudflare verified bots, Akamai, reddit's
+    edge - measured 2026-10-03: 403 to spoofed GPTBot AND to spoofed Googlebot)
+    refuses forgeries whatever its AI policy is. So spoofed Googlebot is the
+    control: if the edge lets a forged Googlebot through it is not verifying,
+    and a refusal of a forged AI UA is a rule about that UA. If it refuses
+    forged Googlebot too, the AI rows say nothing, and this answers cannot_ask
+    rather than reporting a block it cannot see."""
+    def fetched(r):
+        return r.get("status") is not None
+
+    if not fetched(browser) or browser.get("status") != 200 or browser.get("challenge"):
+        return {"state": "cannot_ask", "bots": {},
+                "reason": f"the browser control was not served the page "
+                          f"(HTTP {browser.get('status')}, challenge={browser.get('challenge')}) "
+                          f"- there is no baseline to compare a crawler against"}
+    if not fetched(googlebot) or googlebot.get("status") != 200 or googlebot.get("challenge"):
+        return {"state": "cannot_ask", "bots": {},
+                "reason": f"a forged Googlebot UA was refused too (HTTP {googlebot.get('status')}, "
+                          f"challenge={googlebot.get('challenge')}): the edge verifies crawlers by "
+                          f"IP, so a forged AI UA's refusal says nothing about how the REAL "
+                          f"crawler is treated. Read the access log (crawllog.py) instead."}
+    base = browser.get("text_len") or 0
+    out = {}
+    for name, r in bots.items():
+        if not fetched(r):
+            out[name] = "silent"
+        elif r.get("challenge"):
+            out[name] = "challenged"
+        elif not (200 <= (r.get("status") or 0) < 300):
+            out[name] = "refused"
+        elif abs((r.get("text_len") or 0) - base) <= max(400, 0.25 * base):
+            out[name] = "served"
+        else:
+            out[name] = "differs"
+    return {"state": "measured", "bots": out, "baseline_text_len": base}
+
+
+def classify_llms_read(status, ctype: str, body: str) -> str:
+    """absent / blocked / html_served / present / failed - five states, because
+    'a CDN refused a script UA' and 'there is no file' are opposite findings
+    that a bare `status != 200` reports identically."""
+    if status in (404, 410):
+        return "absent"
+    if status in (401, 403, 406, 429):
+        return "blocked"
+    if status != 200:
+        return "failed"
+    head = (body or "").lstrip("﻿ \t\r\n")[:200].lower()
+    if head.startswith("<!doctype") or head.startswith("<html") or (
+            "html" in (ctype or "").lower() and "<" in head[:1]):
+        return "html_served"
+    return "present"
+
+
+# Agentic Resource Discovery. Ported from the spec's own conformance suite
+# (ards-project/ard-spec, conformance/bin/conformance-test `validate_manifest`
+# and `classify_media_type`), which Lighthouse's `ard-schema` audit ports
+# directly. Two tiers, because the suite has two: an ERROR makes the catalog
+# invalid, a WARNING does not. A third-party port that turned "unregistered
+# media type" into an error rejected Cloudflare's own live catalog.
+AIR_ID = re.compile(r"^urn:air:([a-zA-Z0-9.-]+)(?::([a-zA-Z0-9._:-]+))?:([a-zA-Z0-9._-]+)$")
+_RN = r"[0-9A-Za-z][0-9A-Za-z!#$&^_.+\-]{0,126}"
+_TOK = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+"
+_QS = r'"(?:[\t !#-\[\]-~]|\\[\t !-~])*"'
+_MEDIA = re.compile(rf"(?P<t>{_RN})/(?P<s>{_RN})(?P<p>(?:[ \t]*;[ \t]*{_TOK}[ \t]*=[ \t]*(?:{_TOK}|{_QS}))*)")
+_MPARAM = re.compile(rf"[ \t]*;[ \t]*(?P<n>{_TOK})[ \t]*=[ \t]*(?P<v>{_TOK}|{_QS})")
+
+
+def _parse_media(mt: str):
+    m = _MEDIA.fullmatch(mt or "")
+    if not m:
+        return None
+    params = tuple(sorted((x.group("n").lower(), x.group("v")) for x in _MPARAM.finditer(m.group("p"))))
+    if len({n for n, _ in params}) != len(params):
+        return None
+    return f"{m.group('t').lower()}/{m.group('s').lower()}", params
+
+
+AIR_TYPES = (
+    "application/ai-catalog+json", "application/agent-card+json",
+    "application/a2a-agent-card+json", "application/mcp-server-card+json",
+    "application/agent-skills+zip", "application/agent-skills+gzip",
+    'text/markdown; profile="urn:air:agent-skills"',
+    "application/ai-registry", "application/ai-registry+json",
+)
+_AIR_KEYS = {_parse_media(t) for t in AIR_TYPES}
+_AIR_PARAMS = {base: dict(p) for base, p in _AIR_KEYS}
+AIR_RENAMED = {"application/mcp-server+json": "application/mcp-server-card+json"}
+
+
+def classify_media_type(mt) -> str | None:
+    """None when fine; a warning message otherwise. Never an error - the suite
+    permits extension types without registration."""
+    if not isinstance(mt, str):
+        return f"media type must be a string, got {type(mt).__name__}"
+    parsed = _parse_media(mt)
+    if parsed is None:
+        return f"media type {mt!r} is not a valid IANA media type"
+    if parsed in _AIR_KEYS:
+        return None
+    base, params = parsed
+    if base in AIR_RENAMED:
+        return f"media type {mt!r} was renamed by ADR-0008 - use {AIR_RENAMED[base]!r}"
+    if base in _AIR_PARAMS:
+        want = _AIR_PARAMS[base]
+        if dict(params) != want:
+            return f"media type {mt!r} is a standard discovery type with different parameters (want {want})"
+    return None
+
+
+def validate_ai_catalog(doc) -> dict:
+    errs, warns = [], []
+    if not isinstance(doc, dict):
+        return {"errors": ["catalog is not a JSON object"], "warnings": []}
+    if doc.get("specVersion") != "1.0":
+        errs.append(f"specVersion must be \"1.0\" (got {doc.get('specVersion')!r})")
+    if "collections" in doc:
+        warns.append("top-level `collections` was removed in ADR-0003; ignored, model "
+                     "hierarchies inside entries")
+    entries = doc.get("entries")
+    if not isinstance(entries, list):
+        errs.append("entries[] is required and must be an array")
+        return {"errors": errs, "warnings": warns}
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict):
+            errs.append(f"entries[{i}] is not an object")
+            continue
+        ident = e.get("identifier")
+        if not ident:
+            errs.append(f"entries[{i}].identifier is missing")
+        elif not AIR_ID.match(str(ident)):
+            errs.append(f"entries[{i}].identifier {ident!r} is not urn:air:<publisher>:<namespace>:<name>")
+        if not e.get("displayName"):
+            errs.append(f"entries[{i}].displayName is missing")
+        if not e.get("type"):
+            errs.append(f"entries[{i}].type (media type) is missing")
+        else:
+            w = classify_media_type(e["type"])
+            if w:
+                warns.append(f"entries[{i}]: {w}")
+        if ("url" in e) == ("data" in e):
+            errs.append(f"entries[{i}] must carry exactly one of url / data")
+        q = e.get("representativeQueries")
+        if q is None:
+            warns.append(f"entries[{i}] has no representativeQueries - valid, but not findable by search")
+        elif not isinstance(q, list) or not all(isinstance(x, str) for x in q):
+            errs.append(f"entries[{i}].representativeQueries must be an array of strings")
+        elif not 2 <= len(q) <= 5:
+            warns.append(f"entries[{i}].representativeQueries has {len(q)}; 2-5 are recommended")
+        tm = e.get("trustManifest")
+        if tm is not None and not isinstance(tm, dict):
+            errs.append(f"entries[{i}].trustManifest must be an object")
+        elif isinstance(tm, dict) and not tm.get("identity"):
+            errs.append(f"entries[{i}].trustManifest is missing identity")
+    return {"errors": errs, "warnings": warns}
+
+
+UCP_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def validate_ucp(doc) -> dict:
+    """Universal Commerce Protocol profile, in the shape the spec HAS
+    (ucp.dev/latest/specification/overview): a root `ucp` object with a dated
+    `version`, and `services` / `capabilities` keyed by reverse-domain name,
+    each a LIST of version variants. A flat {version, merchant, capabilities[]}
+    is the shape the spec never had - a checker expecting it reported real
+    Shopify profiles as broken (claude-seo, fixed 2026-09-23)."""
+    errs = []
+    root = doc.get("ucp") if isinstance(doc, dict) else None
+    if not isinstance(root, dict):
+        return {"errors": ["missing-ucp-root"], "capabilities": 0, "services": 0}
+    if not UCP_DATE.match(str(root.get("version") or "")):
+        errs.append(f"ucp.version must be a YYYY-MM-DD date (got {root.get('version')!r})")
+    caps = root.get("capabilities") if isinstance(root.get("capabilities"), dict) else {}
+    svcs = root.get("services") if isinstance(root.get("services"), dict) else {}
+    for name, variants in svcs.items():
+        for v in variants if isinstance(variants, list) else [variants]:
+            t = (v or {}).get("transport") if isinstance(v, dict) else None
+            if t not in ("rest", "mcp", "a2a", "embedded"):
+                errs.append(f"service {name}: transport {t!r} is not rest|mcp|a2a|embedded")
+            elif t != "embedded" and not v.get("endpoint"):
+                errs.append(f"service {name}: a {t} transport needs an endpoint")
+    for name, variants in caps.items():
+        for v in variants if isinstance(variants, list) else [variants]:
+            missing = [k for k in ("version", "spec", "schema")
+                       if not (isinstance(v, dict) and v.get(k))]
+            if missing:
+                errs.append(f"capability {name}: missing {', '.join(missing)}")
+    return {"errors": errs, "version": root.get("version"),
+            "capabilities": len(caps), "services": len(svcs),
+            "capability_names": sorted(caps)}
+
+
+def webmcp_scan(doc: str) -> dict:
+    """`document.modelContext` is the current WebMCP entry point;
+    `navigator.modelContext` alone is the legacy one. Only script bodies are
+    read - the word in prose is not an API call."""
+    scripts = " ".join(re.findall(r"<script\b[^>]*>(.*?)</script\s*>", doc or "", re.S | re.I))
+    doc_api = bool(re.search(r"\bdocument\.modelContext\b", scripts))
+    nav_api = bool(re.search(r"\bnavigator\.modelContext\b", scripts))
+    return {"entry_point": "document" if doc_api else "navigator_legacy" if nav_api else None,
+            "register_tool_calls": len(re.findall(r"\bregisterTool\s*\(", scripts)),
+            "provide_context_calls": len(re.findall(r"\bprovideContext\s*\(", scripts))}
+
+
+GOOGLEBOT_UA = ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; "
+                "+http://www.google.com/bot.html) Chrome/131.0.0.0 Safari/537.36")
+
+
+def _fetch_for_reach(url: str, ua: str) -> dict:
+    r = http(url, timeout=25, ua=ua, retries=1, retry_on=(502, 503, 504))
+    st = r.get("status")
+    body = r.text() if st is not None else ""
+    return {"status": st, "text_len": _visible_len(body),
+            "challenge": challenge_vendor(st, r.get("headers") or {}, body) if st else None}
+
+
+def check_reach(url: str, categories=("ai_search", "ai_user")) -> dict:
+    """Fetch one URL as a browser (control), a forged Googlebot (control), and
+    each AI crawler UA in the given classes; classify what each was served."""
+    browser = _fetch_for_reach(url, BROWSER_UA)
+    googlebot = _fetch_for_reach(url, GOOGLEBOT_UA)
+    bots = {}
+    for _k, name, cat, _d in BOTS:
+        if cat in categories and name not in bots:
+            ua = f"Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; {name}/1.0; +bot)"
+            bots[name] = _fetch_for_reach(url, ua)
+    v = reach_verdict(browser, googlebot, bots)
+    out = {"ok": True, "check": "agent-reach", "url": url, **v,
+           "controls": {"browser": browser, "forged_googlebot": googlebot}}
+    if v["state"] == "cannot_ask":
+        out["control_failed"] = True
+        return out
+    by = {}
+    for name, state in v["bots"].items():
+        by.setdefault(state, []).append(name)
+    out["by_state"] = by
+    findings = []
+    cat_of = {n: c for _k, n, c, _d in BOTS}
+    shut = [n for n in by.get("refused", []) + by.get("challenged", []) if cat_of.get(n) == "ai_search"]
+    if shut:
+        findings.append(_finding(
+            "high", "edge_refuses_citing_crawler_ua",
+            f"the edge refuses or challenges citing-crawler UA(s) {shut} while it serves a "
+            f"browser AND a forged Googlebot - a UA-based rule aimed at these crawlers",
+            "robots.txt can say Allow and this still makes the site uncitable. Look for an "
+            "'AI bots' block in the CDN/WAF (Cloudflare AI Crawl Control, a bot-fight rule)."))
+    if by.get("differs"):
+        findings.append(_finding(
+            "medium", "crawler_served_different_content",
+            f"{by['differs']} were served markedly different visible text from the browser",
+            "Either cloaking, or a degraded bot variant. Diff the two responses before acting."))
+    out["findings"] = findings
+    out["verdict"] = ("fail" if any(f["severity"] in ("critical", "high") for f in findings)
+                      else "warn" if findings else "pass")
+    out["note"] = ("Every crawler UA here is a forgery sent from this machine; the forged-Googlebot "
+                   "control establishes that the edge does not verify by IP, which is what lets "
+                   "a refusal be read as a rule. The real crawlers' experience is in the access "
+                   "log (crawllog.py) - this is the cheap pre-check, not the proof.")
+    return out
+
+
+WELL_KNOWN = [
+    ("/.well-known/api-catalog", "RFC 9727 API catalog", "linkset+json"),
+    ("/.well-known/oauth-protected-resource", "RFC 9728 protected-resource metadata", "json"),
+    ("/.well-known/oauth-authorization-server", "RFC 8414 authorization-server metadata", "json"),
+    ("/.well-known/agent-card.json", "A2A agent card", "json"),
+    ("/.well-known/ucp", "Universal Commerce Protocol profile", "json"),
+    ("/.well-known/ai-catalog.json", "Agentic Resource Discovery catalog", "json"),
+]
+
+
+def _json_or_none(r):
+    try:
+        return json.loads(r.text())
+    except Exception:
+        return None
+
+
+def check_discovery(origin: str) -> dict:
+    """Machine discovery surfaces: Agentmap / ai-catalog (ARD), the
+    /.well-known documents agents look for, and a UCP profile.
+
+    Every one is OPTIONAL - absence is never a finding. What IS a finding is a
+    surface that answers 200 with the wrong thing: a catch-all host returns its
+    HTML shell for every /.well-known path, and Lighthouse counts any 200 at
+    /.well-known/ai-catalog.json as a catalog and fails it. So a random path is
+    probed first; if it also answers 200, every 200 below is suspect."""
+    o = origin.rstrip("/")
+    import secrets
+    probe = http(f"{o}/{secrets.token_hex(6)}-not-found-probe", timeout=20, ua=BROWSER_UA,
+                 follow=False)
+    catch_all = probe.get("status") == 200
+    out = {"ok": True, "check": "agent-discovery", "origin": o,
+           "unknown_path_status": probe.get("status"), "catch_all_host": catch_all,
+           "documents": {}, "findings": []}
+    if probe.get("status") is None:
+        out.update(ok=False, control_failed=True,
+                   reason=f"the origin did not answer at all ({probe.get('error')})")
+        return out
+
+    rob = http(f"{o}/robots.txt", timeout=20, ua=BROWSER_UA)
+    agentmaps = (re.findall(r"(?im)^\s*agentmap:\s*(\S+)", rob.text())
+                 if rob.get("status") == 200 else [])
+    home = http(o + "/", timeout=25, ua=BROWSER_UA)
+    link_rel = re.findall(r'<link\b[^>]*\brel=["\']?ai-catalog["\']?[^>]*>', home.text() or "", re.I)
+    link_href = [m for tag in link_rel for m in re.findall(r'href=["\']([^"\']+)', tag)]
+    hdr = [l["target"] for l in parse_link_header((home.get("headers") or {}).get("link", ""))
+           if "ai-catalog" in (l.get("rel") or "")]
+    out["catalog_signals"] = {"robots_agentmap": agentmaps, "link_rel": link_href, "link_header": hdr}
+
+    for path, label, want in WELL_KNOWN:
+        r = http(o + path, timeout=20, ua=BROWSER_UA, follow=False)
+        st, ctype = r.get("status"), (r.get("ctype") or "").lower()
+        rec = {"label": label, "status": st, "content_type": ctype.split(";")[0] or None}
+        if st == 200:
+            doc = _json_or_none(r)
+            rec["json"] = doc is not None
+            if doc is None:
+                rec["state"] = "html_or_garbage"
+                out["findings"].append(_finding(
+                    "medium" if path.endswith("ai-catalog.json") else "low",
+                    "well_known_soft_200",
+                    f"{path} answers 200 with a non-JSON body ({ctype or 'no type'})"
+                    + (" - the host is a catch-all" if catch_all else ""),
+                    "Return 404 for well-known paths you do not serve. Lighthouse's "
+                    "ard-schema audit FAILS a 200 at ai-catalog.json instead of marking it N/A."))
+            else:
+                rec["state"] = "present"
+                if path.endswith("ai-catalog.json"):
+                    rec.update(validate_ai_catalog(doc))
+                elif path.endswith("/ucp"):
+                    rec.update(validate_ucp(doc))
+                if rec.get("errors"):
+                    out["findings"].append(_finding(
+                        "medium", "well_known_invalid",
+                        f"{path} is JSON but invalid: " + "; ".join(rec["errors"][:4])))
+                if want == "linkset+json" and "linkset" not in ctype:
+                    out["findings"].append(_finding(
+                        "low", "api_catalog_content_type",
+                        f"{path} is served as {ctype or 'no type'}; RFC 9727 specifies "
+                        f"application/linkset+json"))
+        else:
+            rec["state"] = "absent" if st in (404, 410) else "unknown"
+        out["documents"][path] = rec
+
+    for href in agentmaps + link_href + hdr:
+        u = urllib.parse.urljoin(o + "/", href)
+        r = http(u, timeout=20, ua=BROWSER_UA)
+        doc = _json_or_none(r) if r.get("status") == 200 else None
+        vr = (validate_ai_catalog(doc) if doc is not None
+              else {"errors": [f"HTTP {r.get('status')} or not JSON"], "warnings": []})
+        errs = vr["errors"]
+        out["documents"][u] = {"label": "ai-catalog via signal", "status": r.get("status"), **vr}
+        if errs:
+            out["findings"].append(_finding(
+                "medium", "signalled_catalog_invalid",
+                f"an ai-catalog the site POINTS to is unusable ({u}): " + "; ".join(errs[:3])))
+    out["verdict"] = ("fail" if any(f["severity"] in ("critical", "high") for f in out["findings"])
+                      else "warn" if out["findings"] else "pass")
+    out["framing"] = ("All of these are optional machine-discovery surfaces. None is a Google "
+                      "ranking or citation signal; absence is never a finding. A 200 that is "
+                      "not the document IS one, because it fails the audits that read it.")
+    return out
+
+
 # ----------------------------------------------------------------- llms.txt
 
 
@@ -488,6 +1072,12 @@ def check_llms(origin: str) -> dict:
         st = r.get("status")
         rec = {"url": url, "status": st, "bytes": len(r.get("body") or b""),
                "content_type": (r.get("ctype") or "").split(";")[0] or None}
+        rec["read"] = classify_llms_read(st, r.get("ctype") or "", r.text() if st == 200 else "")
+        if rec["read"] == "blocked":
+            out["findings"].append(_finding(
+                "info", "llms_txt_blocked_at_edge",
+                f"{name} answered HTTP {st} to a desktop-browser request - a CDN/WAF "
+                f"refusal, so whether the file EXISTS is unknown, not 'absent'"))
         if st == 200:
             body = r.text()
             is_html = "html" in (rec["content_type"] or "") or body.lstrip()[:1] == "<"
@@ -518,9 +1108,11 @@ def check_llms(origin: str) -> dict:
                         f"{name} lists no markdown links - an index with nothing in it"))
         out["files"][name] = rec
 
-    present = [n for n, v in out["files"].items() if v.get("status") == 200]
+    present = [n for n, v in out["files"].items() if v.get("read") == "present"]
     out["present"] = present
-    if not present:
+    unknown = [n for n, v in out["files"].items() if v.get("read") in ("blocked", "failed")]
+    out["unknown"] = unknown
+    if not present and not unknown:
         out["findings"].append(_finding(
             "low", "no_llms_txt",
             "neither /llms.txt nor /llms-full.txt exists",
@@ -659,7 +1251,8 @@ def check_page(url: str) -> dict:
     # --- WebMCP: an opportunity, never a failure
     forms = re.findall(r"<form\b[^>]*>", doc, re.I)
     webmcp_forms = [f for f in forms if re.search(r"\btool(name|description)\s*=", f, re.I)]
-    webmcp_js = bool(re.search(r"navigator\.modelContext|provideContext\s*\(", doc))
+    wm = webmcp_scan(doc)
+    webmcp_js = bool(wm["entry_point"] or wm["provide_context_calls"])
 
     # --- markdown availability (agents prefer a clean source)
     md_link = re.search(
@@ -713,6 +1306,12 @@ def check_page(url: str) -> dict:
                          "status": "RFC 8288 service discovery - informational; absence "
                                    "is the norm on a content site"},
         "webmcp": {"forms_with_tools": len(webmcp_forms), "js_api_referenced": webmcp_js,
+                   "entry_point": wm["entry_point"],
+                   "register_tool_calls": wm["register_tool_calls"],
+                   "entry_point_note": ("feature-detect `document.modelContext ?? "
+                                        "navigator.modelContext`; navigator-only is the "
+                                        "legacy entry point") if wm["entry_point"] ==
+                   "navigator_legacy" else None,
                    "status": "proposed standard, Chrome origin trial - absence is an "
                              "opportunity, never a defect"},
         "findings": findings,
@@ -749,7 +1348,16 @@ def main():
 
     sub.add_parser("control", help="prove the robots reader discriminates")
 
-    al = sub.add_parser("all", help="policy + llms + one page")
+    rc = sub.add_parser("reach", help="what each AI-crawler UA is served, with a "
+                                      "forged-Googlebot control")
+    rc.add_argument("url")
+    rc.add_argument("--all-classes", action="store_true",
+                    help="also probe ai_training UAs (default: ai_search + ai_user)")
+
+    dc = sub.add_parser("discovery", help="Agentmap / ai-catalog, /.well-known docs, UCP")
+    dc.add_argument("origin")
+
+    al = sub.add_parser("all", help="policy + llms + one page + reach + discovery")
     al.add_argument("origin")
     al.add_argument("--page", help="page to sample (default: the origin itself)")
 
@@ -762,15 +1370,22 @@ def main():
         out = check_page(a.url)
     elif a.cmd == "llms":
         out = check_llms(a.origin)
+    elif a.cmd == "reach":
+        out = check_reach(a.url, ("ai_search", "ai_user", "ai_training") if a.all_classes
+                          else ("ai_search", "ai_user"))
+    elif a.cmd == "discovery":
+        out = check_discovery(a.origin)
     else:
         pol, llm = check_policy(a.origin), check_llms(a.origin)
         pg_ = check_page(a.page or a.origin)
-        worst = [d.get("verdict") for d in (pol, llm, pg_)]
-        out = {"ok": all(d.get("ok") for d in (pol, llm, pg_)),
+        rc_, dc_ = check_reach(a.page or a.origin), check_discovery(a.origin)
+        parts = (pol, llm, pg_, rc_, dc_)
+        worst = [d.get("verdict") for d in parts]
+        out = {"ok": all(d.get("ok") for d in (pol, llm, pg_, dc_)),
                "check": "agent-all", "origin": a.origin,
                "verdict": ("fail" if "fail" in worst else
                            "warn" if "warn" in worst else "pass"),
-               "policy": pol, "llms": llm, "page": pg_}
+               "policy": pol, "llms": llm, "page": pg_, "reach": rc_, "discovery": dc_}
 
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if out.get("ok") else 1

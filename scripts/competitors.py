@@ -114,18 +114,11 @@ def robots_allows(url: str, ua: str = "*") -> bool:
     if not body:
         return True                     # no robots.txt = allowed
     path = urllib.parse.urlparse(url).path or "/"
-    active, disallowed = False, []
-    for line in body.splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line or ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        k, v = k.strip().lower(), v.strip()
-        if k == "user-agent":
-            active = v == "*" or v.lower() in ua.lower()
-        elif k == "disallow" and active and v:
-            disallowed.append(v)
-    return not any(path.startswith(d) for d in disallowed)
+    # The shared RFC 9309 reader, not a second one: groups, longest match, Allow,
+    # CR/LF-only line splitting. This fetcher sends a browser UA and names no
+    # product token, so only the `*` group can apply to it.
+    from agentcheck import parse_robots, allowed
+    return allowed(parse_robots(body), "seo-manager-fetch", path)["allowed"]
 
 
 def _sanitise_heading(h: str) -> str:
