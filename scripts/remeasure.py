@@ -47,6 +47,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from controls import Controls, refuse  # noqa: E402
+import stats  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 DIRECTIONS = ("increase", "decrease", "unchanged")
@@ -238,6 +239,12 @@ def record(a) -> dict:
         if err:
             return refuse("remeasure-record", f"metric {a.metric!r} not found: {err}",
                           hint="run the command yourself and copy the exact JSON path")
+        if getattr(a, "denominator", None):
+            a.baseline_n, derr = dig(got["data"], a.denominator, False)
+            if derr:
+                return refuse("remeasure-record", f"denominator {a.denominator!r} not found: {derr}")
+    if getattr(a, "denominator", None) and getattr(a, "baseline_n", None) is None:
+        return refuse("remeasure-record", "--denominator needs --baseline-n when --baseline is given")
 
     d = load(a.root)
     if a.id in d["hypotheses"] and not a.force:
@@ -252,6 +259,8 @@ def record(a) -> dict:
         "baseline": baseline, "baseline_source": source, "recorded_at": now(),
         "expect": a.expect, "min_change": a.min_change,
         "missing_is_zero": bool(getattr(a, "missing_is_zero", False)),
+        "denominator": getattr(a, "denominator", None),
+        "baseline_n": getattr(a, "baseline_n", None),
         "not_before": (date.today() + timedelta(days=days)).isoformat(),
         "after": a.after, "note": a.note, "state": "open", "checks": [],
     }
@@ -288,7 +297,34 @@ def close(a) -> dict:
                      "was dropped is the part worth keeping")}
 
 
-def _verdict(row: dict, value: float) -> tuple[str, str]:
+def _rate_verdict(row: dict, x: float, n: float) -> tuple[str, str]:
+    """A RATE hypothesis (`--denominator`): the move must clear min_change AND
+    be outside noise - the Newcombe 95% interval of the difference must exclude
+    zero. 3/10 -> 5/10 moves 0.2 and is a coin toss."""
+    cmp_ = stats.compare_rates(int(row["baseline"]), int(row["baseline_n"]), int(x), int(n))
+    if cmp_["verdict"] == "unknown":
+        return "unmeasured", "an empty denominator is no measurement"
+    delta, mind, exp = cmp_["point"], row["min_change"], row["expect"]
+    lo, hi = cmp_["ci95"]
+    desc = (f"{row['baseline']:g}/{row['baseline_n']:g} -> {x:g}/{n:g} "
+            f"(change {delta:+.4f}, 95% CI [{lo}, {hi}])")
+    if exp == "unchanged":
+        return (("refuted", f"{desc}: a real move beyond the {mind:g} tolerance")
+                if cmp_["verdict"] != "no_detectable_change" and abs(delta) >= mind
+                else ("confirmed", f"{desc}: no move beyond noise and tolerance"))
+    if cmp_["verdict"] == "no_detectable_change":
+        return "no_detectable_change", f"{desc}: the interval spans zero - noise at this n"
+    if abs(delta) < mind:
+        return "no_change", f"{desc}: real, but under the {mind:g} threshold"
+    wanted_up = exp == "increase"
+    if (delta > 0) == wanted_up:
+        return "confirmed", f"{desc} ({exp} predicted)"
+    return "refuted", f"{desc}, the OPPOSITE of the predicted {exp}"
+
+
+def _verdict(row: dict, value: float, n: float | None = None) -> tuple[str, str]:
+    if row.get("denominator"):
+        return _rate_verdict(row, value, n or 0)
     base, mind, exp = row["baseline"], row["min_change"], row["expect"]
     delta = value - base
     moved = abs(delta) >= mind
@@ -349,8 +385,17 @@ def check(a) -> dict:
                 "note": ("the metric path is missing from the output - that is a changed "
                          "tool or a failed read, NEVER a value of zero")}
 
-    verdict, why = _verdict(row, value)
-    entry = {"at": now(), "state": verdict, "value": value,
+    n = None
+    if row.get("denominator"):
+        n, nerr = dig(got["data"], row["denominator"], False)
+        if nerr:
+            entry = {"at": now(), "state": "unmeasured", "reason": f"denominator: {nerr}"}
+            row["checks"].append(entry)
+            save(a.root, d)
+            return {"ok": False, "check": "remeasure-check", "id": a.id, "state": "unmeasured",
+                    "question": row["question"], "reason": f"denominator: {nerr}"}
+    verdict, why = _verdict(row, value, n)
+    entry = {"at": now(), "state": verdict, "value": value, "n": n,
              "baseline": row["baseline"], "delta": value - row["baseline"], "why": why}
     row["checks"].append(entry)
     if verdict in ("confirmed", "refuted"):
@@ -580,6 +625,11 @@ def _parser() -> argparse.ArgumentParser:
                    help="the metric lives in a SPARSE map where absence genuinely means "
                         "zero (e.g. crawllog top_silos). Off by default: as a default it "
                         "turns every renamed key and failed read into a zero.")
+    r.add_argument("--denominator",
+                   help="dotted path to the metric's DENOMINATOR (e.g. answers_seen for "
+                        "answers_citing_us): the check then needs a statistically real move, "
+                        "not just one past --min-change (which is then on the RATE)")
+    r.add_argument("--baseline-n", type=float, help="the denominator, when --baseline is given")
     r.add_argument("--note")
     r.add_argument("--force", action="store_true", help="overwrite an existing baseline")
     r.add_argument("--timeout", type=int, default=900)

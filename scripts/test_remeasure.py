@@ -45,6 +45,24 @@ def main() -> int:
     check("the three verdicts are distinct values",
           len({R._verdict(row(), v)[0] for v in (130, 60, 105)}) == 3)
 
+    print("\na RATE metric needs its denominator, and a significant move:")
+    rr = row(baseline=3, baseline_n=10, min_change=0.1, expect="increase", denominator="n")
+    check("3/10 -> 5/10 moved 0.2 but is noise at n=10 -> no_detectable_change",
+          R._verdict(rr, 5, 10)[0] == "no_detectable_change", R._verdict(rr, 5, 10))
+    rr = row(baseline=30, baseline_n=1000, min_change=0.05, expect="increase", denominator="n")
+    check("30/1000 -> 120/1000 is a confirmed increase", R._verdict(rr, 120, 1000)[0] == "confirmed",
+          R._verdict(rr, 120, 1000))
+    check("and a large opposite move refutes",
+          R._verdict(row(baseline=120, baseline_n=1000, min_change=0.05, expect="increase",
+                         denominator="n"), 30, 1000)[0] == "refuted")
+    check("a significant move under min_change is still no_change",
+          R._verdict(row(baseline=300, baseline_n=10000, min_change=0.05, expect="increase",
+                         denominator="n"), 400, 10000)[0] == "no_change")
+    check("an empty denominator is unmeasured, never a verdict",
+          R._verdict(rr, 5, 0)[0] == "unmeasured")
+    check("CONTROL: without a denominator the plain threshold rule still applies",
+          R._verdict(row(), 130)[0] == "confirmed")
+
     print("\na missing metric is NOT a zero - this one reports a collapse that")
     print("never happened, and it looks exactly like a real finding:")
     check("present is read", R.dig({"a": {"b": 5}}, "a.b") == (5, None))
