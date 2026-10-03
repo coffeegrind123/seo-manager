@@ -276,6 +276,15 @@ BOTS = [
      [".googlebot.com", ".google.com"]),
     ("gemini-deep-research", "Gemini-Deep-Research", "ai_user", [".googlebot.com", ".google.com"]),
     ("notebooklm", "Google-NotebookLM", "ai_user", [".googlebot.com", ".google.com"]),
+    # Renamed 2026-07-16 (developers.google.com/crawling/docs/changelog); the
+    # old token above still arrives during the transition, so both rows stay.
+    ("gemininotebook", "Google-GeminiNotebook", "ai_user", [".googlebot.com", ".google.com"]),
+    # Google's agentic browser fetcher - user-triggered, and Google says these
+    # "generally ignore robots.txt rules" (user-triggered-fetchers page).
+    ("google-agent", "Google-Agent", "ai_user", [".googlebot.com", ".google.com"]),
+    # OpenAI: validates landing pages submitted as ChatGPT ads (openai.com bots
+    # page). An ad-safety check like AdsBot-Google - never a citation signal.
+    ("oai-adsbot", "OAI-AdsBot", "seo_tool", []),
     # Anthropic's page lists ClaudeBot / Claude-User / Claude-SearchBot and no
     # "Claude-Web"; the community list has it as undocumented. Training bucket.
     ("claude-web", "Claude-Web", "ai_training", []),
@@ -324,6 +333,7 @@ OPERATORS = [
     ("deepseekbot", "DeepSeek"), ("doubaobot", "ByteDance"), ("ai2bot", "Ai2"),
     ("tavilybot", "Tavily"), ("firecrawlagent", "Firecrawl"), ("crawl4ai", "Crawl4AI"),
     ("googleagent-", "Google"), ("gemini-deep-research", "Google"), ("notebooklm", "Google"),
+    ("gemininotebook", "Google"), ("google-agent", "Google"), ("oai-adsbot", "OpenAI"),
     ("claude-web", "Anthropic"),
     ("yandexbot", "Yandex"), ("baiduspider", "Baidu"),
     ("duckduckbot", "DuckDuckGo"), ("duckassistbot", "DuckDuckGo"),
@@ -686,6 +696,11 @@ def run_control() -> dict:
             and "SPOOFED" in dis["reason"])
     c.check("witness_verdicts_are_three_distinct_states",
             len({str(combine_witnesses(x, y)["verified"]) for x in (V, S, U) for y in (V, S, U)}) == 3)
+    fr = facet_report({"/s?color=a": 5, "/s?color=b": 5, "/s?size=1": 5, "/s?sort=x": 5,
+                       "/s?color=a&size=1&sort=x": 5, "/plain": 9})
+    c.check("facets_flag_a_trap_and_skip_a_plain_path",
+            fr["paths"][0]["flags"] == ["many_variants", "many_params", "facet_keys"]
+            and not any(x["path"] == "/plain" for x in fr["paths"]))
     return c.verdict(bots_in_registry=len(BOTS))
 
 
@@ -1632,6 +1647,132 @@ def cmd_urls(a):
         print(f"{n}\t{uri}")
 
 
+# Query keys that FILTER or ORDER a listing - each combination is a new URL to
+# a crawler and, usually, the same content. Tracking keys mint duplicates too,
+# but the fix differs (strip at the edge vs canonical/robots), so they are named
+# apart.
+FACET_KEYS = {"color", "colour", "size", "sort", "order", "orderby", "dir", "filter", "brand",
+              "price", "min_price", "max_price", "view", "layout", "per_page", "limit", "page",
+              "category", "cat", "tag", "material", "rating", "availability", "in_stock",
+              "type", "style", "fit", "q", "search", "mode", "lang"}
+TRACKING_KEYS_RX = re.compile(r"^(utm_[a-z]+|gclid|fbclid|msclkid|mc_[a-z]+|ref|ref_src|"
+                              r"sessionid|session_id|sid|phpsessid|jsessionid)$", re.I)
+
+
+def facet_report(counts: dict) -> dict:
+    """`urls --keep-query` counts -> per-path parameter waste. Pure.
+
+    A path whose hits are spread over many query variants is a crawl trap
+    candidate: the crawler is enumerating filter combinations instead of
+    reading pages. Flags (each independent):
+      many_variants    5+ distinct query strings on one path
+      many_params      a URL carrying 3+ parameters
+      facet_keys       parameters that filter/sort a listing
+      tracking_params  parameters that only label a click source"""
+    import urllib.parse as up
+    by: dict = {}
+    total = 0
+    for uri, n in counts.items():
+        total += n
+        path, _, q = uri.partition("?")
+        row = by.setdefault(path, {"path": path, "hits": 0, "param_hits": 0, "variants": set(),
+                                   "keys": Counter(), "max_params": 0})
+        row["hits"] += n
+        if not q:
+            continue
+        row["param_hits"] += n
+        row["variants"].add(q)
+        pairs = up.parse_qsl(q, keep_blank_values=True)
+        row["max_params"] = max(row["max_params"], len(pairs))
+        for k, _v in pairs:
+            row["keys"][k.lower()] += n
+    paths = []
+    for r in by.values():
+        if not r["variants"]:
+            continue
+        keys = set(r["keys"])
+        facets = sorted(k for k in keys if k in FACET_KEYS)
+        tracking = sorted(k for k in keys if TRACKING_KEYS_RX.match(k))
+        flags = []
+        if len(r["variants"]) >= 5:
+            flags.append("many_variants")
+        if r["max_params"] >= 3:
+            flags.append("many_params")
+        if facets:
+            flags.append("facet_keys")
+        if tracking:
+            flags.append("tracking_params")
+        paths.append({"path": r["path"], "hits": r["hits"], "param_hits": r["param_hits"],
+                      "variants": len(r["variants"]), "max_params": r["max_params"],
+                      "facet_keys": facets, "tracking_keys": tracking,
+                      "top_keys": [k for k, _n in r["keys"].most_common(6)], "flags": flags})
+    paths.sort(key=lambda r: -r["param_hits"])
+    ph = sum(r["param_hits"] for r in paths)
+    return {"total_hits": total, "param_hits": ph,
+            "param_hit_share": round(ph / total, 3) if total else None, "paths": paths}
+
+
+def cmd_facets(a):
+    counts: Counter = Counter()
+    try:
+        fh = sys.stdin if a.urls == "-" else open(a.urls, "r", encoding="utf-8")
+        for line in fh:
+            line = line.rstrip("\n")
+            if "\t" in line:
+                n, u = line.split("\t", 1)
+                counts[u] += int(n)
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"ok": False, "error": f"cannot read {a.urls}: {exc}"}))
+        sys.exit(2)
+    if not counts:
+        print(json.dumps({"ok": False, "control_failed": True,
+                          "reason": "no `count<TAB>uri` rows - feed it `crawllog.py urls --keep-query` "
+                                    "output; an empty input is not a site without traps"}))
+        sys.exit(2)
+    if not any("?" in u for u in counts):
+        note = ("no URL in the input carries a query string. Either the site has no parameter "
+                "URLs, or the input was made WITHOUT --keep-query (which strips them) - check "
+                "before reading this as clean.")
+    else:
+        note = None
+    rep = facet_report(counts)
+    checked = []
+    if a.check and a.site:
+        # What a crawled variant SAYS about itself: a canonical back to the clean
+        # path or a noindex is a variant Google can fold; a self-canonical 200 is
+        # an indexable duplicate, and that is the waste worth fixing first.
+        import sitecheck
+        variants = sorted(((n, u) for u, n in counts.items() if "?" in u), reverse=True)[: a.check]
+        for n, u in variants:
+            full = a.site.rstrip("/") + u
+            h = sitecheck.hop(full)
+            facts = sitecheck.page_facts(h.get("body", ""), h.get("headers")) if h.get("status") == 200 else {}
+            canon = facts.get("canonical")
+            clean = full.split("?", 1)[0]
+            if h.get("status") != 200:
+                state = f"http_{h.get('status')}"
+            elif facts.get("noindex"):
+                state = "noindex"
+            elif canon and sitecheck.norm_url(up_join(full, canon)) == sitecheck.norm_url(clean):
+                state = "canonicalised"
+            else:
+                state = "indexable_duplicate"
+            checked.append({"url": u, "hits": n, "state": state, "canonical": canon})
+    print(json.dumps({"ok": True, "check": "crawllog-facets", **rep,
+                      "checked_variants": checked, "note": note,
+                      "reading": ("`param_hit_share` is the share of this bot's hits spent on "
+                                  "parameter URLs. Fix order: `indexable_duplicate` variants first "
+                                  "(canonical them to the clean path, or keep crawlers out with a "
+                                  "robots.txt pattern), then strip tracking keys at the edge. A "
+                                  "variant that is canonicalised still costs a fetch - a robots "
+                                  "rule is what saves the budget.")}, indent=2))
+
+
+def up_join(base, ref):
+    import urllib.parse as up
+    return up.urljoin(base, ref)
+
+
 def cmd_gap2(a):
     crawled = {}
     with open(a.crawled, "r", encoding="utf-8") as fh:
@@ -1748,6 +1889,13 @@ def main():
     s.add_argument("--keep-query", action="store_true",
                    help="count URLs WITH their query string (default: strip it)")
     s.set_defaults(fn=cmd_urls)
+
+    s = sub.add_parser("facets", help="faceted-navigation crawl traps from `urls --keep-query`")
+    s.add_argument("--urls", required=True, help="file (or -) of `urls --keep-query` output")
+    s.add_argument("--site", help="origin, for --check")
+    s.add_argument("--check", type=int, default=0,
+                   help="fetch the N most-crawled variants: canonical / noindex / duplicate")
+    s.set_defaults(fn=cmd_facets)
 
     s = sub.add_parser("gap", help="sitemap vs what was actually crawled")
     s.add_argument("--crawled", required=True, help="output of `crawllog.py urls`")

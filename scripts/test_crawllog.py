@@ -221,6 +221,46 @@ if one["bot_hits_net"] is not None:
     failures.append("blind/--bot must not publish a top-level net total")
 os.unlink(log)
 
+# Vendor-documented agents added 2026-10-03, each with the exact UA string the
+# vendor publishes. Google renamed NotebookLM's fetcher on 2026-07-16 and the
+# old token still arrives during the transition, so BOTH must classify.
+DOC_UAS = {
+    "gemininotebook": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/137.0.0.0 Safari/537.36 (compatible; Google-GeminiNotebook; "
+                       "+https://developers.google.com/crawling/docs/crawlers-fetchers/google-gemininotebook)",
+                       "ai_user"),
+    "notebooklm": ("Mozilla/5.0 (compatible; Google-NotebookLM)", "ai_user"),
+    "google-agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko; "
+                     "compatible; Google-Agent; +https://developers.google.com/crawling/docs/"
+                     "crawlers-fetchers/google-agent) Chrome/W.X.Y.Z Safari/537.36", "ai_user"),
+    "oai-adsbot": ("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; OAI-AdsBot/1.0; "
+                   "+https://openai.com/adsbot", "seo_tool"),
+}
+for key, (ua, cat) in DOC_UAS.items():
+    got = crawllog.classify_ua(ua)
+    check(f"documented agent/{key} classifies to its own row", got[0], key)
+    check(f"documented agent/{key} is {cat}", got[2] if len(got) > 2 else None, cat)
+check("documented agent/Google-Agent is not swallowed by googlebot",
+      crawllog.classify_ua(DOC_UAS["google-agent"][0])[0] != "googlebot", True)
+
+# Faceted-navigation crawl traps, from `urls --keep-query` output.
+F = {"/shop?color=red": 40, "/shop?color=blue": 30, "/shop?size=m": 20, "/shop?sort=price": 25,
+     "/shop?color=red&size=m&sort=price": 15, "/shop": 10,
+     "/guide?utm_source=x": 4, "/guide": 50, "/about": 5}
+fr = crawllog.facet_report(F)
+top = fr["paths"][0]
+check("facets/the trap path ranks first", top["path"], "/shop")
+check("facets/its parameterised hits are counted", top["param_hits"], 130)
+check("facets/5+ variants is flagged", "many_variants" in top["flags"], True)
+check("facets/3+ params in one URL is flagged", "many_params" in top["flags"], True)
+check("facets/known facet keys are named", sorted(top["facet_keys"]), ["color", "size", "sort"])
+g = next(x for x in fr["paths"] if x["path"] == "/guide")
+check("facets/a tracking param is tracking, not a facet", g["flags"], ["tracking_params"])
+check("facets/CONTROL a path with no query is not listed",
+      any(x["path"] == "/about" for x in fr["paths"]), False)
+check("facets/share of all bot hits spent on parameter URLs",
+      fr["param_hit_share"], round(134 / 199, 3))
+
 if failures:
     print("FAILED:")
     for f in failures:

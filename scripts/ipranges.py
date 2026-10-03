@@ -73,6 +73,10 @@ OPERATOR_FILES: dict[str, dict[str, str]] = {
         "special-crawlers": GOOGLE_BASE + "special-crawlers.json",
         "user-triggered-fetchers": GOOGLE_BASE + "user-triggered-fetchers.json",
         "user-triggered-fetchers-google": GOOGLE_BASE + "user-triggered-fetchers-google.json",
+        # Named on the user-triggered-fetchers page 2026-10-03 (creationTime
+        # 2026-10-02, 20 prefixes). Missing it made every agent address in it
+        # read as SPOOFED once a Google agent row could reach this table.
+        "user-triggered-agents": GOOGLE_BASE + "user-triggered-agents.json",
     },
     "Microsoft": {"bingbot": "https://www.bing.com/toolbox/bingbot.json"},
 }
@@ -104,6 +108,17 @@ BOT_FILE: dict[str, tuple[str, str]] = {
     "apis-google": ("Google", "special-crawlers"),
     "feedfetcher-google": ("Google", "user-triggered-fetchers"),
     "google-read-aloud": ("Google", "user-triggered-fetchers"),
+    # Google does not say which of its three user-triggered files each agent
+    # uses; `check` matches against all of an operator's files, so the second
+    # element only names where a hit is EXPECTED, never where it must be.
+    # rDNS is not a witness here: user-owned fetchers resolve to
+    # *.gae.googleusercontent.com, which every App Engine tenant can obtain.
+    "google-agent": ("Google", "user-triggered-agents"),
+    "gemininotebook": ("Google", "user-triggered-fetchers-google"),
+    "notebooklm": ("Google", "user-triggered-fetchers-google"),
+    # GoogleAgent-Mariner / -URLContext / Gemini-Deep-Research are NOT on
+    # Google's fetchers page (checked 2026-10-03; they come from the community
+    # list), so they stay UNVERIFIABLE - "spoofed" needs a documented mapping.
     "bingbot": ("Microsoft", "bingbot"),
     "bingpreview": ("Microsoft", "bingbot"),
     "msnbot": ("Microsoft", "bingbot"),
