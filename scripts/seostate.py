@@ -717,6 +717,14 @@ def cmd_record_rank(store: Store, a):
                 "url": item.get("url"),
                 "provider": item.get("provider") or a.provider,
                 "ai_overview": item.get("ai_overview"),
+                # A null position is only readable WITH the depth it was read
+                # at ("not in the top 10" vs "not in the top 100"), and a
+                # position claim must name its exit country. Both were being
+                # dropped here while rankcheck.py sent them.
+                "depth_checked": item.get("depth_checked"),
+                "exit_country": item.get("exit_country"),
+                "rank_state": item.get("rank_state"),
+                "drop_status": item.get("drop_status"),
                 "checked_at": item.get("checked_at") or now(),
             },
         )
@@ -747,6 +755,10 @@ def cmd_rankings(store: Store, a):
                 "checks": len(series),
                 "last_checked": series[-1].get("checked_at"),
                 "url": series[-1].get("url"),
+                "latest_state": series[-1].get("rank_state") or (
+                    "ranked" if last is not None else "unknown_depth"),
+                "latest_depth": series[-1].get("depth_checked"),
+                "latest_exit_country": series[-1].get("exit_country"),
                 "history": [[r.get("checked_at", "")[:10], r.get("position")] for r in series][-30:],
             }
         )

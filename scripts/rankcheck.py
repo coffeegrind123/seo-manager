@@ -35,6 +35,7 @@ HERE = Path(__file__).resolve().parent
 
 import pathlib as _pl
 sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
+from providers import registrable as _shared_registrable  # noqa: E402
 
 
 def run_json(cmd: list[str]) -> dict:
@@ -55,14 +56,7 @@ def state(root: str | None, *args) -> dict:
 
 
 def registrable(host: str) -> str:
-    host = (host or "").lower().lstrip(".")
-    if host.startswith("www."):
-        host = host[4:]
-    parts = host.split(".")
-    two = {"co.uk", "com.au", "co.jp", "co.nz", "com.br", "co.in", "org.uk", "ac.uk"}
-    if len(parts) >= 3 and ".".join(parts[-2:]) in two:
-        return ".".join(parts[-3:])
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+    return _shared_registrable(host)
 
 
 def position_of(results: list[dict], domain: str) -> tuple:
@@ -77,6 +71,49 @@ def position_of(results: list[dict], domain: str) -> tuple:
         if host == domain or host.endswith("." + domain):
             return r.get("position"), r.get("url")
     return None, None
+
+
+# A FALL worth a second look (rankme.fast's rule): out of the top 10, five or
+# more places down, or gone from a depth the old position sat inside.
+TOP = 10
+FALL = 5
+# A second read within this many places of the OLD position says the first
+# read was noise, not a drop.
+VOLATILE_WITHIN = 2
+
+
+def rank_state(position, depth_checked: int) -> str:
+    if position is not None:
+        return "ranked"
+    if not depth_checked:
+        return "not_measured"
+    return "out_of_range"
+
+
+def classify_move(prev, now, depth: int) -> str | None:
+    """'drop', 'unknown_depth', or None. Previously unranked is never a drop:
+    there was no position to lose."""
+    if prev is None:
+        return None
+    if now is None:
+        # Gone from the read - but only a drop if the read went deep enough to
+        # have seen the old position.
+        return "drop" if depth >= prev else "unknown_depth"
+    if now <= prev:
+        return None
+    if (prev <= TOP < now) or (now - prev >= FALL):
+        return "drop"
+    return None
+
+
+def settle_drop(*, prev, first, second, depth: int) -> str:
+    """A candidate drop after a SECOND read: confirmed / volatile / unconfirmed.
+    A failed second read never confirms anything."""
+    if second == "failed":
+        return "unconfirmed"
+    if second is not None and abs(second - prev) <= VOLATILE_WITHIN:
+        return "volatile"
+    return "confirmed" if classify_move(prev, second, depth) == "drop" else "volatile"
 
 
 def run_control() -> dict:
@@ -110,6 +147,12 @@ def run_control() -> dict:
     c.check("registrable_folds_www", registrable("www.example.com") == "example.com")
     c.check("registrable_does_not_over_fold",
             registrable("notexample.com") == "notexample.com")
+    c.check("a_null_with_depth_is_out_of_range_not_a_position", rank_state(None, 20) == "out_of_range")
+    c.check("unranked_before_is_never_a_drop", classify_move(None, None, 20) is None)
+    c.check("a_fall_out_of_the_top_10_is_a_drop", classify_move(7, 14, 20) == "drop")
+    c.check("gone_from_a_read_too_shallow_to_see_it_is_unknown", classify_move(15, None, 10) == "unknown_depth")
+    c.check("a_failed_second_read_never_confirms", settle_drop(prev=7, first=14, second="failed",
+                                                              depth=20) == "unconfirmed")
     return c.verdict(note="the matcher is proven offline; whether the PROVIDER answers is a "
                           "separate question - `serp.py --control` proves the SERP guards")
 
@@ -133,6 +176,10 @@ def main():
                         "Use it to check how the site ranks FROM a market, not as a throttle workaround.")
     p.add_argument("--no-proxy", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-confirm", action="store_true",
+                   help="skip the second read on drop candidates (and the history lookup)")
+    p.add_argument("--confirm-provider",
+                   help="provider for the second read (default: the same ladder again)")
     a = p.parse_args()
 
     if a.control:
@@ -186,9 +233,13 @@ def main():
                           "domain": domain, "depth": a.depth}, indent=2))
         return
 
-    rows, failures = [], []
-    for i, kw in enumerate(keywords):
-        cmd = [sys.executable, str(HERE / "serp.py"), kw, "--provider", provider,
+    prev = {}
+    if not a.no_confirm:
+        hist = state(a.root, "rankings", "--days", "3650")
+        prev = {r["keyword"]: r.get("latest") for r in hist.get("rankings", [])}
+
+    def read(kw: str, prov: str) -> dict:
+        cmd = [sys.executable, str(HERE / "serp.py"), kw, "--provider", prov,
                "--count", str(a.depth), "--target-domain", domain, "--fallback", "--raw"]
         if a.proxy_country:
             cmd += ["--proxy-country", a.proxy_country]
@@ -202,18 +253,46 @@ def main():
                 err = (f"results were not for this query (coverage {rel.get('coverage')}, "
                        f"hit_rate {rel.get('hit_rate')}) - refused rather than recording a "
                        "position off somebody else's SERP")
-            failures.append({"keyword": kw, "error": err})
+            return {"ok": False, "error": err}
+        pos, url = position_of(data.get("results", []), domain)
+        return {"ok": True, "position": pos, "url": url, "provider": data.get("provider"),
+                "depth": len(data.get("results", [])),
+                "ai_overview": (data.get("ai_overview") or {}).get("present")}
+
+    rows, failures, drops = [], [], []
+    for i, kw in enumerate(keywords):
+        got = read(kw, provider)
+        if not got["ok"]:
+            failures.append({"keyword": kw, "error": got["error"]})
         else:
-            pos, url = position_of(data.get("results", []), domain)
-            rows.append({
+            row = {
                 "keyword": kw,
-                "position": pos,
-                "url": url,
-                "provider": data.get("provider"),
-                "depth_checked": len(data.get("results", [])),
-                "ai_overview": (data.get("ai_overview") or {}).get("present"),
+                "position": got["position"],
+                "url": got["url"],
+                "provider": got["provider"],
+                "depth_checked": got["depth"],
+                "rank_state": rank_state(got["position"], got["depth"]),
+                # Unpinned is recorded as such: a position from an exit nobody
+                # chose is a local observation, never a global fact.
+                "exit_country": a.proxy_country or ("none" if a.no_proxy else "unpinned"),
+                "ai_overview": got["ai_overview"],
                 "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            })
+            }
+            move = classify_move(prev.get(kw), got["position"], got["depth"])
+            if move == "unknown_depth":
+                row["drop_status"] = "unknown_depth"
+            elif move == "drop":
+                # ONE read is one sample of a personalised, A/B-tested page.
+                # A drop is reported only after a second read agrees.
+                time.sleep(a.delay)
+                again = read(kw, a.confirm_provider or provider)
+                second = again["position"] if again["ok"] else "failed"
+                row["drop_status"] = settle_drop(prev=prev[kw], first=got["position"],
+                                                 second=second, depth=got["depth"])
+                drops.append({"keyword": kw, "from": prev[kw], "to": got["position"],
+                              "second_read": second, "status": row["drop_status"],
+                              "second_provider": again.get("provider")})
+            rows.append(row)
         if i < len(keywords) - 1:
             time.sleep(a.delay)
 
@@ -235,6 +314,14 @@ def main():
                         "not necessarily outside the top 100. Raise --depth (or use serpapi, which "
                         "buys the full 100 in one credit) before reading it as a drop.",
         "failures": failures,
+        "drops": {st: [d for d in drops if d["status"] == st]
+                  for st in ("confirmed", "volatile", "unconfirmed")},
+        "drop_rule": (f"a candidate is a fall out of the top {TOP}, a fall of {FALL}+ places, or "
+                      f"vanishing from a read deep enough to have seen the old position; it is "
+                      f"CONFIRMED only when a second read agrees. Report confirmed drops; "
+                      f"volatile ones are noise, unconfirmed ones are unknown."),
+        "exit_country": a.proxy_country or "unpinned - every position here is from an exit "
+                                           "nobody chose; name it as such",
         "results": sorted(rows, key=lambda r: (r["position"] is None, r["position"] or 999)),
     }, indent=2, ensure_ascii=False))
     if failures:

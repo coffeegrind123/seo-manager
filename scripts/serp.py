@@ -160,6 +160,7 @@ LYING_COUNTRIES = {"fr": "gb"}
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from controls import Controls, refuse  # noqa: E402
+from providers import registrable as _shared_registrable  # noqa: E402
 
 def verify_exit_countries(codes, tries=3, timeout=35):
     """Ask the pool for an exit in each country on FRESH sessions and report where
@@ -381,14 +382,7 @@ def fetch(url: str, *, data=None, headers=None, timeout=30, proxy: Proxy | None 
 
 
 def registrable(host: str) -> str:
-    host = (host or "").lower().lstrip(".")
-    if host.startswith("www."):
-        host = host[4:]
-    parts = host.split(".")
-    two = {"co.uk", "com.au", "co.jp", "co.nz", "com.br", "co.in", "org.uk", "ac.uk", "gov.uk"}
-    if len(parts) >= 3 and ".".join(parts[-2:]) in two:
-        return ".".join(parts[-3:])
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+    return _shared_registrable(host)
 
 
 def host_of(url: str) -> str:

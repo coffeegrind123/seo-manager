@@ -139,6 +139,34 @@ def http_json(url, **kw):
     return http(url, **kw).json()
 
 
+# ----------------------------------------------------------- registrable domain
+
+# Second-level labels that ccTLD registries sell UNDER (co.uk, com.au, ac.jp,
+# gob.mx...). A two-label cut turned news.bbc.co.uk into `co.uk`, so every
+# .co.uk citation matched every .co.uk site. Not the full Public Suffix List
+# (that is a 250 KB download and an update job); this covers the registry
+# patterns in real use, and `_REGISTRABLE_EXTRA` names the irregular ones.
+_SLD_UNDER_CCTLD = {"co", "com", "net", "org", "gov", "ac", "edu", "ne", "or", "go", "gob",
+                    "govt", "mil", "nic", "ltd", "plc", "sch", "nom", "gen", "biz", "info",
+                    "res", "web", "lg", "ed", "gv", "id", "kr", "nhs", "police", "mod"}
+_REGISTRABLE_EXTRA = {"com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn"}
+
+
+def registrable(host: str) -> str:
+    """eTLD+1 for same-owner matching: `news.bbc.co.uk` -> `bbc.co.uk`."""
+    h = (host or "").lower().strip().lstrip(".").split(":", 1)[0].rstrip(".")
+    if h.startswith("www."):
+        h = h[4:]
+    parts = [x for x in h.split(".") if x]
+    if len(parts) < 2:
+        return h
+    two = ".".join(parts[-2:])
+    if len(parts) >= 3 and (two in _REGISTRABLE_EXTRA or (
+            len(parts[-1]) == 2 and parts[-2] in _SLD_UNDER_CCTLD)):
+        return ".".join(parts[-3:])
+    return two
+
+
 # -------------------------------------------------------------------- cache
 
 
