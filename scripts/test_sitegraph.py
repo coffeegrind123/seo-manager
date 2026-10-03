@@ -309,6 +309,32 @@ check("an offline run says the URL set is complete",
       "OFFLINE" in out["reading"])
 
 print()
+print("\nlink suggestions - which existing page should link to the weak one")
+pages = {
+    "/guides/bunny-hop": "<title>Bunny hop guide for CS 1.6</title><p>x</p>",
+    "/guides/strafe-jump": "<title>Strafe jump and bunny hop timing</title><p>Strafe and bunny hop "
+                           "timing go together.</p>",
+    "/maps/dust2": "<title>Dust2 callouts</title><p>Map guide.</p>",
+    "/guides/already": "<title>Bunny hop already linking</title><a href='/guides/bunny-hop'>bh</a>",
+    "/about": "<title>About us</title>",
+}
+g = build(pages)
+pq = {"/guides/bunny-hop": {"bunny hop": 400.0, "cs bhop": 50.0},
+      "/guides/strafe-jump": {"bunny hop": 30.0, "strafe jump": 900.0},
+      "/maps/dust2": {"dust2 callouts": 500.0}}
+sug = sg.suggest_links(g, [g.uid("/guides/bunny-hop")], pq, set(), per_target=5)
+rows = sug[0]["suggestions"]
+srcs = [r["source"] for r in rows]
+check("a page sharing a QUERY and title words is a high-confidence source",
+      rows and rows[0]["source"] == "/guides/strafe-jump" and rows[0]["confidence"] == "high")
+check("the suggested anchor is the shared query", rows and rows[0]["anchor"] == "bunny hop")
+check("a page ALREADY linking to the target is never suggested", "/guides/already" not in srcs)
+check("an unrelated page is not suggested", "/about" not in srcs and "/maps/dust2" not in srcs)
+check("the target never suggests itself", "/guides/bunny-hop" not in srcs)
+none = sg.suggest_links(g, [g.uid("/about")], pq, set(), per_target=5)
+check("CONTROL: a target nothing relates to gets no suggestions, not padding",
+      none[0]["suggestions"] == [])
+
 if FAILS:
     print(f"FAILED: {len(FAILS)} -> {FAILS}")
     sys.exit(1)

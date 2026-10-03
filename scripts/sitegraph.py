@@ -701,6 +701,130 @@ def cmd_orphans(a) -> dict:
                      "counted as orphans.")}
 
 
+_STOP = set("""the and for with from that this your you are was were how what when where why
+which who into about over under than then them they their there here our out not can all any
+best top guide guides page home site web www com net org""".split())
+
+
+def _tokens(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9À-ɏЀ-ӿ]{3,}", (text or "").lower())
+            if w not in _STOP}
+
+
+def suggest_links(g: "Graph", targets: list[int], page_queries: dict[str, dict[str, float]],
+                  furniture: set[int], per_target: int = 5) -> list[dict]:
+    """For each weak TARGET, which existing pages should link to it, and with
+    what anchor. Evidence, not similarity theatre:
+
+      high    the source and target share a Search Console query AND a title word
+      medium  they share a query, or 3+ title words
+
+    Title words stand in for rankme.fast's heading tokens (titles are far
+    shorter, so its >=2 / >=4 thresholds are scaled to >=1 / >=3). A source
+    that already links to the target is never suggested, nor is furniture -
+    a nav link is not the editorial link that is missing. No shared evidence
+    means no suggestion: an empty list is a finding, padding is not."""
+    links_to: dict[int, set[int]] = defaultdict(set)
+    for src, edges in g.adj.items():
+        for dst, _a, _b in edges:
+            links_to[src].add(dst)
+    out = []
+    for t in targets:
+        turl = g.urls[t]
+        tq = page_queries.get(turl, {})
+        ttok = _tokens((g.meta.get(t) or {}).get("title", ""))
+        rows = []
+        for sid, meta in g.meta.items():
+            if sid == t or sid in furniture or not meta.get("exists", True):
+                continue
+            if t in links_to.get(sid, set()):
+                continue
+            surl = g.urls[sid]
+            sq = page_queries.get(surl, {})
+            shared_q = sorted(set(tq) & set(sq), key=lambda q: -tq[q])
+            shared_t = sorted(ttok & _tokens(meta.get("title", "")))
+            if shared_q and shared_t:
+                conf = "high"
+            elif shared_q or len(shared_t) >= 3:
+                conf = "medium"
+            else:
+                continue
+            anchor = shared_q[0] if shared_q else " ".join(shared_t[:3])
+            row = {"source": surl, "confidence": conf, "anchor": anchor,
+                   "shared_queries": shared_q[:5], "shared_title_words": shared_t[:6],
+                   "source_query_impressions": round(sum(sq.values()), 1)}
+            f = meta.get("file")
+            if f:
+                try:
+                    txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", re.sub(
+                        r"(?is)<(script|style|nav|header|footer)\b.*?</\1>", " ",
+                        Path(f).read_text(encoding="utf-8", errors="replace"))))
+                    m = re.search(r"[^.!?]{0,160}\b" + re.escape(anchor) + r"\b[^.!?]{0,160}[.!?]?",
+                                  txt, re.I)
+                    if m:
+                        row["sentence"] = m.group(0).strip()[:320]
+                except OSError:
+                    pass
+            rows.append(row)
+        rows.sort(key=lambda r: (r["confidence"] != "high", -r["source_query_impressions"],
+                                 -len(r["shared_queries"]), -len(r["shared_title_words"])))
+        out.append({"target": turl, "target_queries": sorted(tq, key=lambda q: -tq[q])[:5],
+                    "suggestions": rows[:per_target]})
+    return out
+
+
+def _page_queries(path: str | None) -> tuple[dict[str, dict[str, float]], str | None]:
+    """`gsc.py query --dimensions page query` -> {path: {query: impressions}}."""
+    if not path:
+        return {}, None
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return {}, f"cannot read {path}: {e}"
+    dims = d.get("dimensions") or (d.get("request") or {}).get("dimensions") or ["page", "query"]
+    if "page" not in dims or "query" not in dims:
+        return {}, f"{path} needs both the page and query dimensions (has {dims})"
+    pi, qi = dims.index("page"), dims.index("query")
+    out: dict[str, dict[str, float]] = defaultdict(dict)
+    for r in d.get("rows") or []:
+        k = r.get("keys") or []
+        if len(k) <= max(pi, qi):
+            continue
+        out[norm(k[pi])][k[qi]] = out[norm(k[pi])].get(k[qi], 0.0) + float(r.get("impressions") or 0)
+    return dict(out), None
+
+
+def cmd_suggest(a) -> dict:
+    g, d = load(a.graph)
+    guard = graph_guard(g, d)
+    if guard:
+        return guard
+    pq, err = _page_queries(a.gsc)
+    if err:
+        return {"ok": False, "control_failed": True, "reason": err}
+    sw = g.site_wide(a.boiler_threshold)
+    furniture = sw | g.section_roots()
+    if a.target:
+        targets = [g._uid[norm(t)] for t in a.target if norm(t) in g._uid]
+        missing = [t for t in a.target if norm(t) not in g._uid]
+    else:
+        inb = g.inbound(contextual_only=True, site_wide=sw)
+        targets = [uid for uid, m in g.meta.items() if m.get("exists", True)
+                   and uid not in furniture and len(inb.get(uid, [])) <= a.near][: a.limit]
+        missing = []
+    res = suggest_links(g, targets, pq, furniture, a.per_target)
+    return {"ok": True, "check": "sitegraph-suggest", "targets": len(res),
+            "targets_not_in_graph": missing,
+            "query_evidence": bool(pq),
+            "with_suggestions": sum(1 for r in res if r["suggestions"]),
+            "suggestions": res,
+            "note": ("Without --gsc only title overlap is available and nothing can be 'high'. "
+                     "Export page x query with `gsc.py query --dimensions page query` and pass "
+                     "it as --gsc." if not pq else
+                     "Ranked by confidence, then by how much search demand the SOURCE page "
+                     "already carries - a link from a page Google shows is worth more.")}
+
+
 def cmd_canonicals(a) -> dict:
     """Does every page's canonical name a URL this tree actually serves?
 
@@ -1023,6 +1147,18 @@ def main() -> None:
         if name in ("broken", "canonicals"):
             p.add_argument("--ignore", help="regex of known-dynamic routes to skip")
         p.set_defaults(fn=fn)
+
+    p = sub.add_parser("suggest", help="which existing pages should link to the weak ones, "
+                                       "with an anchor (evidence: shared GSC queries + titles)")
+    p.add_argument("--graph", required=True)
+    p.add_argument("--gsc", help="JSON from `gsc.py query --dimensions page query`")
+    p.add_argument("--target", action="append", help="URL/path to find links for (repeatable); "
+                                                    "default: contextual orphans + near-orphans")
+    p.add_argument("--near", type=int, default=1)
+    p.add_argument("--per-target", type=int, default=5)
+    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--boiler-threshold", type=float, default=0.3)
+    p.set_defaults(fn=cmd_suggest)
 
     p = sub.add_parser("control", help="fire every parser guarantee at synthetic input")
     p.set_defaults(fn=lambda a: run_control())
