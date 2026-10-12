@@ -90,7 +90,37 @@ def load_keywords(a) -> list[str]:
     if a.file:
         raw = sys.stdin.read() if a.file == "-" else Path(a.file).read_text(encoding="utf-8")
         kws.extend(x.strip() for x in raw.splitlines() if x.strip())
+    kws.extend(headterm_phrases(headterms_path(a)))
     return list(dict.fromkeys(kws))
+
+
+# The owned head terms (.seo/headterms.json, see headterms.py) are snapshotted
+# whether or not anyone added them to the tracked keyword list. Measured
+# 2026-10-12: a site's head phrase dropped to the edge of page 1, and there was
+# no earlier snapshot of its page 1 to diff against - drift had only ever been
+# fed the long-tail keywords research had queued, never the phrases the site
+# exists to rank for. Those are exactly the SERPs worth a history.
+def headterms_path(a) -> str | None:
+    if getattr(a, "no_headterms", False):
+        return None
+    if getattr(a, "headterms_from", None):
+        return a.headterms_from
+    if a.keywords_from:
+        sib = Path(a.keywords_from).resolve().parent / "headterms.json"
+        if sib.is_file():
+            return str(sib)
+    return None
+
+
+def headterm_phrases(path: str | None) -> list[str]:
+    if not path:
+        return []
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        die(f"cannot read head terms {path}: {exc}", hint="--no-headterms to skip them")
+    return [t["phrase"].strip() for t in raw.get("terms") or []
+            if isinstance(t, dict) and isinstance(t.get("phrase"), str) and t["phrase"].strip()]
 
 
 def cmd_snapshot(a):
@@ -156,6 +186,7 @@ def cmd_snapshot(a):
     out.write_text(json.dumps(snap, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps({
         "ok": True, "out": str(out), "keywords_captured": len(snap["keywords"]),
+        "headterms_included": len(headterm_phrases(headterms_path(a))),
         "unread": len(snap["unread"]), "unread_detail": snap["unread"][:10],
         "note": "Unread keywords are EXCLUDED from the snapshot, not stored empty. "
                 "Re-run them before the next comparison or they will look like a "
@@ -191,6 +222,22 @@ def run_control() -> dict:
     entrant = a[:2] + ["https://four.test/w"]
     c.check("a_real_entrant_is_detected",
             set(host_of(u) for u in entrant) - set(same) == {"four.test"})
+
+    # head terms ride along with the keyword list, deduplicated, and can be opted out
+    import tempfile
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory() as d:
+        kf, hf = Path(d) / "keywords.json", Path(d) / "headterms.json"
+        kf.write_text(json.dumps([{"keyword": "long tail one"}, {"keyword": "head phrase"}]))
+        hf.write_text(json.dumps({"terms": [{"phrase": "head phrase", "owner": "/"},
+                                            {"phrase": "second head", "owner": "/b"}]}))
+        ns = SimpleNamespace(keywords=None, keywords_from=str(kf), file=None,
+                             headterms_from=None, no_headterms=False)
+        got = load_keywords(ns)
+        c.check("sibling_headterms_are_snapshotted_and_deduped",
+                got == ["long tail one", "head phrase", "second head"], got)
+        ns.no_headterms = True
+        c.check("no_headterms_opts_out", load_keywords(ns) == ["long tail one", "head phrase"])
 
     # The algorithm-update calendar is a committed asset with no API behind it.
     # If it silently fails to load, every `--updates` correlation comes back
@@ -344,6 +391,8 @@ def main():
     s.add_argument("--keywords", action="append")
     s.add_argument("--keywords-from", help=".seo/keywords.json")
     s.add_argument("--file", help="newline-delimited keywords, or -")
+    s.add_argument("--headterms-from", help="ownership map (default: headterms.json beside --keywords-from)")
+    s.add_argument("--no-headterms", action="store_true", help="do not add the owned head terms")
     s.add_argument("--out", required=True)
     s.add_argument("--depth", type=int, default=10)
     s.add_argument("--daemon", default="http://127.0.0.1:8791")
