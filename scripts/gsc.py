@@ -544,16 +544,16 @@ def run_control():
     key = ("-----BEGIN PRIVATE KEY-----\n"
            + base64.b64encode(der).decode() + "\n-----END PRIVATE KEY-----")
     n, e, d = rsa_key_from_pem(key)
-    sig = rs256(b"combat skirmish", n, d)
+    sig = rs256(b"signed payload", n, d)
     c.check("rs256_signature_verifies_against_its_own_public_key",
-            rs256_verify(b"combat skirmish", sig, n, e),
+            rs256_verify(b"signed payload", sig, n, e),
             "a wrong signature reaches Google as invalid_grant, which reads as a "
             "revoked key rather than as a bug here")
     c.check("CONTROL_a_signature_over_different_bytes_does_NOT_verify",
-            not rs256_verify(b"combat skirmish!", sig, n, e),
+            not rs256_verify(b"signed payload!", sig, n, e),
             "without this the verifier could be returning True unconditionally")
     c.check("CONTROL_a_tampered_signature_does_NOT_verify",
-            not rs256_verify(b"combat skirmish", sig[:-1] + bytes([sig[-1] ^ 1]), n, e))
+            not rs256_verify(b"signed payload", sig[:-1] + bytes([sig[-1] ^ 1]), n, e))
     # The expectation comes from the ENCODER, not from the parser - the two are
     # independent directions, so this is not a control that agrees with the code
     # by construction. A PKCS#1 parser pointed at PKCS#8 reads the version

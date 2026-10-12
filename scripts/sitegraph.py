@@ -2,7 +2,7 @@
 """
 sitegraph.py - the internal link graph, offline or live.
 
-WHY THIS EXISTS (2026-08-31, combatskirmish.net). Twelve guides and a tool page
+WHY THIS EXISTS (2026-08-31, a live site). Twelve guides and a tool page
 sat live for nine days with ZERO impressions. GSC said "URL is unknown to Google,
 never crawled" while the control page was indexed; the origin log said Googlebot
 had fetched 221 distinct URLs of 5,388 and not one of them was a guide. The pages
@@ -210,7 +210,7 @@ class Graph:
 
         `site_wide` cannot see these. A locale nav appears on 100% of that
         locale's pages and on 1.5% of the site, so a site-wide frequency rule
-        never fires. Measured 2026-09-01 on combatskirmish.net: /zh was linked
+        never fires. Measured 2026-09-01 on a live site: one locale home was linked
         from 60 of the 60 pages in its own locale, by a breadcrumb and a logo,
         and every one of the 21 locale homes still reported ZERO contextual
         inlinks - which reads as "the entry point to this language is orphaned"
@@ -270,8 +270,8 @@ class Graph:
         FURNITURE, whatever markup wraps them.
 
         Tag-based detection (<nav>/<footer>) is not enough and this is not
-        hypothetical: combatskirmish.net renders its whole silo nav as
-        `<p class="silonav">`, a plain paragraph. A tag-only rule counted that
+        hypothetical: a real site rendered its whole silo nav as
+        `<p class="sectionnav">`, a plain paragraph. A tag-only rule counted that
         as a contextual link on 3,900 pages and reported the guides silo as
         healthy - the exact opposite of the truth it was written to find. A
         class allowlist would be a per-site guess; frequency is a measurement."""
@@ -671,7 +671,7 @@ def cmd_orphans(a) -> dict:
         # page - is the MOST reachable page on the site. Calling it an orphan is a
         # false positive, and the expensive kind: it pads the count with pages that
         # are fine, so the number stops meaning anything and the real orphan hides
-        # in the list. Measured 2026-09-01 on combatskirmish.net: all 27 "contextual
+        # in the list. Measured 2026-09-01 on a live site: all 27 "contextual
         # orphans" were 5 global-nav hubs (/maps /modes /guides /how-to-play /tools)
         # plus 21 locale homes reached from the language switcher, each carrying
         # 160-4166 inbound links. Zero were unreachable. They are still LISTED,
@@ -830,8 +830,8 @@ def cmd_canonicals(a) -> dict:
 
     A canonical pointing at a URL that 404s makes the page UNINDEXABLE, and it is
     invisible in every per-page review because both halves look fine on their own.
-    It has really shipped here: this repo generates on a case-INSENSITIVE 9p mount
-    and production is case-SENSITIVE, so `cs_Assault` and `cs_assault` wrote to one
+    It has really shipped here: one repo generated on a case-INSENSITIVE filesystem mount
+    and production is case-SENSITIVE, so `Harbor_1` and `harbor_1` wrote to one
     file, the survivor carried the OTHER name's canonical, and both halves of 19
     pairs pointed at a dead URL while sitting in the sitemap.
 
@@ -919,7 +919,7 @@ def cmd_silos(a) -> dict:
         ctx[s].append(len(inb_ctx.get(uid, [])))
         # EXTERNAL-SILO inbound: contextual links arriving from a DIFFERENT silo.
         # This is the one that matters and it is not the same as the others.
-        # Measured 2026-08-31 on combatskirmish.net: every /guides page had 16
+        # Measured 2026-08-31 on a live site: every /guides page had 16
         # contextual inlinks and looked healthy - but all 16 came from inside
         # /guides, because the guides cross-link each other. A silo that only
         # links to itself is an ISLAND: densely connected, and reachable from
@@ -939,7 +939,7 @@ def cmd_silos(a) -> dict:
             "entry_points": sum(1 for v in ext[s] if v > 0),
             # A silo is only an ISLAND if it has (almost) no ENTRY POINT - a page
             # inside it that something outside links to. Median external inbound
-            # alone is not enough: /maps on combatskirmish.net has 3,435 pages whose
+            # alone is not enough: /maps on a live site has 3,435 pages whose
             # MEDIAN external inbound is 0, yet its hub links 2,590 of them and the
             # hub is in the site nav, so every map is one hop from a reachable page.
             # Calling that an island is a false positive - and Googlebot fetched 122
@@ -964,7 +964,7 @@ def cmd_silos(a) -> dict:
                         "INTERNALLY and reached from nowhere else: its pages cross-link "
                         "each other, so every naive inlink count looks healthy while a "
                         "crawler that has never entered the silo has no way in. That is "
-                        "exactly what shipped on combatskirmish.net - 16 inlinks per guide, "
+                        "exactly what shipped on a live site - 16 inlinks per guide, "
                         "all 16 from other guides - and it cost 12 pages nine days of being "
                         "literally unknown to Google.")}
 
@@ -982,8 +982,8 @@ def cmd_depth(a) -> dict:
     # REFUSE rather than report a catastrophe. If the start node was never crawled
     # as a SOURCE it has no outbound edges, so BFS reaches nothing and the result
     # reads "unreachable: 3981" - which looks like the site is broken when in fact
-    # the start page simply is not in the indexed tree. On combatskirmish.net the
-    # homepage lives in frontend/src, not public/seo, so `--start /` hits this
+    # the start page simply is not in the indexed tree. On one real site the
+    # homepage lives in a different source tree from the generated pages, so `--start /` hits this
     # every time. "Cannot ask" must never share a code path with "the answer is no".
     if not g.adj.get(sid):
         return {"ok": False, "control_failed": True,
@@ -1048,7 +1048,7 @@ def cmd_broken(a) -> dict:
             "by_silo": dict(sorted(by_silo.items(), key=lambda kv: -kv[1])),
             "worst": rows[: a.limit],
             "note": ("OFFLINE MODE: a target with no file is not necessarily broken - a "
-                     "server-rendered route (/play, /servers/<x>, /leaderboard) has no file "
+                     "server-rendered route (/app, /items/<x>, /leaderboard) has no file "
                      "on disk by design. Read by_silo first: a whole silo listed here is a "
                      "dynamic route, a lone URL under an otherwise-present silo is a real "
                      "dead link. Use --ignore to pin the known-dynamic ones."
@@ -1082,7 +1082,7 @@ def cmd_report(a) -> dict:
             # line while nine sibling guides sat at 17 inbound each. Nothing
             # reported it; it surfaced only as an odd entry in the orphan list,
             # because it had become furniture by its own success. Now it is stated.
-            # share is over DISTINCT SOURCE PAGES, not edges: /play is linked
+            # share is over DISTINCT SOURCE PAGES, not edges: /app is linked
             # three times on a single page (CTA, nav, footer), so an edge count
             # gives a nonsensical 591% and hides the real concentration.
             "most_linked": [
@@ -1114,7 +1114,7 @@ def main() -> None:
     c.add_argument("--index-name", action="append", default=["index.html", "index.htm"])
     c.add_argument("--rewrite", action="append", default=[], metavar="REGEX=REPL",
                    help="rewrite mapped URLs, e.g. '^/landers/=/' when the generator writes "
-                        "public/seo/landers/x.html but the server serves it at /x. Repeatable. "
+                        "public/pages/landers/x.html but the server serves it at /x. Repeatable. "
                         "Without this those pages look like orphans, which is a mapping "
                         "artifact rather than a finding.")
     c.set_defaults(fn=cmd_crawl)

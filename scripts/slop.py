@@ -248,7 +248,7 @@ STRIP = [
 # <script> (JSON-LD schema included), <style>, and the entire <head> with its
 # <title>, meta description and schema headline.
 #
-# Measured on combatskirmish.net's weapon pages 2026-09-01: awp.html reports 861
+# Measured on a live site's item pages 2026-09-01: one page reports 861
 # "words" raw against 252 of actual prose, and 44 of 44 pages came back `warn`.
 # A uniform verdict across every sample is the signature of an instrument reading
 # the wrong text, not of a corpus-wide defect - the same 44 split 12 pass / 32
@@ -275,8 +275,8 @@ from controls import Controls, uniform_verdict  # noqa: E402
 
 
 CONTROL_CLEAN = """\
-The AWP fires once and reloads. A hit above the waist kills at any range, which
-is why the rifle costs 4750 and why buying one early ends a round if it misses.
+The longbow fires once and reloads. A hit above the waist kills at any range, which
+is why the bow costs 4800 and why buying one early ends a round if it misses.
 Most players learn the angle before they learn the recoil.
 """
 
@@ -297,7 +297,7 @@ CONTROL_HTML = """<!doctype html><html><head>
 <script type="application/ld+json">{"desc":"unlock your true potential, seamlessly"}</script>
 <!-- let's dive in and explore: this isn't merely about aim, it's about mastery -->
 </head><body>
-<p>Dust2 has two bomb sites and a mid corridor. The T spawn is closer to B,
+<p>The harbor has two bomb sites and a mid corridor. The T spawn is closer to B,
 which is why most rounds open with a smoke at the double doors.</p>
 </body></html>
 """
@@ -315,7 +315,7 @@ def _mask(text: str, *, html: bool = False) -> str:
         # HTML only. The markdown STRIP below must NOT run on it: its
         # "4-space indent = code block" rule matches almost every line of
         # generated HTML, which silently deleted two thirds of the prose
-        # (awp.html measured 128 words instead of 252). <pre>/<code> above are
+        # (one page measured 128 words instead of 252). <pre>/<code> above are
         # the HTML spelling of the same exclusion.
         for rx in HTML_STRIP:
             out = rx.sub(lambda m: re.sub(r"\S", " ", m.group(0)), out)
@@ -513,7 +513,7 @@ def corpus(paths, *, share_ratio: float = 0.6) -> dict:
 
     WHY THIS EXISTS. Run `scan` over 44 generated pages and all 44 come back
     `warn`, because a generated page is mostly template: the same h1 shape, the
-    same "Play now - free, no download" CTA, the same `All weapons ->` nav labels
+    same "Play now - free, no download" CTA, the same `All items ->` nav labels
     and the same footer on every page. Counting those per page multiplies ONE
     authoring decision by the page count, and a verdict that is identical for
     every page cannot rank anything - it is the corpus telling you about its
@@ -524,14 +524,14 @@ def corpus(paths, *, share_ratio: float = 0.6) -> dict:
     everywhere), and each page's verdict is recomputed on only the hits that are
     unique to it.
 
-    Measured on combatskirmish.net 2026-09-01, 44 pages: every `unicode_arrow`
-    hit on the site was a navigation label, and on awp.html only 3 of 9
+    Measured on a live site 2026-09-01, 44 pages: every `unicode_arrow`
+    hit on the site was a navigation label, and on one page only 3 of 9
     body-text hits were prose - the rest were the h1, a CTA, three nav links and
     the footer tagline.
 
     LIMIT, stated because it is invisible otherwise: template detection is by
     IDENTICAL string, so a templated line carrying an interpolated value
-    ("AWP - Counter-Strike 1.6") is not recognised as shared even though its
+    ("Longbow - Star-Runner 2.4") is not recognised as shared even though its
     shape is. `files_hit` is reported per rule for exactly that reason - a rule
     firing on 18 of 18 files is templated whether or not the strings match.
     """
@@ -601,7 +601,7 @@ def corpus(paths, *, share_ratio: float = 0.6) -> dict:
         "errors": errors,
         "reading": (
             "RUN THIS PER TIER, not across the whole site: the threshold is a "
-            "fraction of the files given, so mixing 17 weapon pages into a 44-file "
+            "fraction of the files given, so mixing 17 item pages into a 44-file "
             "corpus pushes their shared nav below it and hands them back as if they "
             "were per-page prose. "
             "`template` is one authoring decision repeated - fix it in the generator, "

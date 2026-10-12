@@ -186,7 +186,7 @@ def _timed_get(url: str, timeout: int = 25) -> dict:
     ⚠ THIS IS THE WHOLE REASON THIS FUNCTION EXISTS, and the first version got
     it wrong. Timing a plain `urlopen` measures DNS + TCP + TLS + server +
     download as one number and calls it TTFB. Measured 2026-09-01 from this
-    container: `https://combatskirmish.net/` reported **5,940ms** and the tool
+    container: `https://<the site>/` reported **5,940ms** and the tool
     duly flagged `slow_ttfb`, severity high, "server/CDN work". The control -
     the same probe against cloudflare.com and example.com, plus a raw socket
     breakdown - showed DNS alone took **1,446ms** here while the server itself
@@ -285,11 +285,11 @@ def probe_page(url: str, timeout: int = 25, repeat: int = 2) -> dict:
     ⚠ TTFB IS SAMPLED TWICE, and the finding is raised on the FASTER run.
 
     One sample cannot tell a cold cache from a slow page, and the difference is
-    the whole verdict. Measured 2026-09-01 on combatskirmish.net: `/leaderboard`
+    the whole verdict. Measured 2026-09-01 on a live site: `/leaderboard`
     returned **12,065ms** on the sweep's single sample and **70-94ms** on three
     repeats - it has a 5-minute server-side cache and the sweep happened to miss
     it. Reported as-is that is a false alarm on the site's own leaderboard.
-    `/servers/de_dust2` returned **4,188 / 4,186 / 4,307ms** on the same
+    `/items/harbor_2` returned **4,188 / 4,186 / 4,307ms** on the same
     treatment: reproducible, and a real finding on a 1,404-URL template.
 
     So `ttfb_ms` is the reproducible FLOOR and `ttfb_cold_ms` is the first
@@ -523,8 +523,8 @@ def sweep(urls: list[str], per_template: int = 3, workers: int = 6,
                 rules[f["rule"]] = rules.get(f["rule"], 0) + 1
         # A row must explain its own verdict. A median next to a `fail` reads as
         # a tool bug when the slow sample is the one that fired the rule - and
-        # on a template with per-page query cost (measured: /servers/* ranges
-        # from 74ms to 4,300ms depending on the map) the median is the wrong
+        # on a template with per-page query cost (measured: /items/* ranges
+        # from 74ms to 4,300ms depending on the item) the median is the wrong
         # summary for a rule that triggers on the worst case.
         slowest = max(rs, key=lambda r: r["ttfb_ms"])
         rows.append({
@@ -904,21 +904,21 @@ def run_control() -> dict:
     # reports one row for the site); too fine and every URL is its own (the
     # sweep degenerates into the per-URL run this exists to replace).
     c.check("pages_of_one_silo_share_a_template",
-            template_of("https://x.test/maps/de_dust2")
-            == template_of("https://x.test/maps/cs_office") == "/maps/*",
-            template_of("https://x.test/maps/de_dust2"))
+            template_of("https://x.test/maps/harbor_2")
+            == template_of("https://x.test/maps/harbor_3") == "/maps/*",
+            template_of("https://x.test/maps/harbor_2"))
     c.check("different_silos_do_not_collide",
             template_of("https://x.test/maps/a") != template_of("https://x.test/guides/a"))
     c.check("a_locale_prefix_is_recognised",
-            template_of("https://x.test/zh/maps/a") == "/{locale}/maps/*",
-            template_of("https://x.test/zh/maps/a"))
+            template_of("https://x.test/ja/maps/a") == "/{locale}/maps/*",
+            template_of("https://x.test/ja/maps/a"))
     c.check("a_locale_and_the_root_silo_are_distinct",
-            template_of("https://x.test/zh/maps/a") != template_of("https://x.test/maps/a"))
+            template_of("https://x.test/ja/maps/a") != template_of("https://x.test/maps/a"))
     c.check("the_homepage_is_its_own_template", template_of("https://x.test/") == "/")
     c.check("depth_is_reflected",
             template_of("https://x.test/a/b/c") != template_of("https://x.test/a/b"))
     c.check("a_two_letter_silo_is_not_mistaken_for_a_locale_forever",
-            template_of("https://x.test/zh/") == "/{locale}/",
+            template_of("https://x.test/ja/") == "/{locale}/",
             "a bare locale root must still group, not vanish")
 
     c.check("the_thresholds_are_present", set(LIMITS) >= {"ttfb_ms", "dom_nodes"})

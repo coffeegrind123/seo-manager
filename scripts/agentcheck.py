@@ -460,8 +460,8 @@ def check_policy(origin: str, path: str = "/") -> dict:
     # wrong: the exclusions are right there, a few lines above, in a group that
     # does not apply.
     #
-    # MEASURED 2026-09-01 on combatskirmish.net: GPTBot, Amazonbot and
-    # OAI-SearchBot were all permitted on /g/ (tokenised game binaries), /api/ and
+    # MEASURED 2026-09-01 on a live site: GPTBot, Amazonbot and
+    # OAI-SearchBot were all permitted on /g/ (tokenised binaries), /api/ and
     # /dl/, every one of which the default group disallows. Over the six days
     # 2026-08-26..09-01 Amazonbot made 5,035 requests, 839/day.
     star_disallows = [r[1] for g in groups if "*" in g["agents"]

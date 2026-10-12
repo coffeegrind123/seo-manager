@@ -330,7 +330,7 @@ def run_control() -> dict:
         {"id": "a1b2c3d4", "slug": "how-to-aim", "title": "How To Aim", "created_at": "2026-01-01"},
         {"id": "e5f6a7b8", "slug": "map-callouts", "title": "Map Callouts",
          "created_at": "2026-02-01", "queue_position": 1},
-        {"id": "c9d0e1f2", "keyword": "cs 1.6 online", "domain": "example.com",
+        {"id": "c9d0e1f2", "keyword": "photo editor online", "domain": "example.com",
          "created_at": "2026-03-01"},
     ]
 
@@ -342,7 +342,7 @@ def run_control() -> dict:
     c.check("a_slug_resolves", (find_row(rows, "map-callouts") or {}).get("id") == "e5f6a7b8")
     c.check("a_title_resolves_case_insensitively",
             (find_row(rows, "hOw tO aIm") or {}).get("id") == "a1b2c3d4")
-    c.check("a_keyword_resolves", (find_row(rows, "cs 1.6 online") or {}).get("id") == "c9d0e1f2")
+    c.check("a_keyword_resolves", (find_row(rows, "photo editor online") or {}).get("id") == "c9d0e1f2")
 
     # AI-visibility arithmetic: over answers that existed, across runs, with the
     # single-observation count visible. Each case is a way the rate lies.

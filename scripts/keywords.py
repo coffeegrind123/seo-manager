@@ -199,26 +199,26 @@ def run_control() -> dict:
             "seed" not in _parse_suggestions("google", shapes["google"]))
 
     c.check("transactional_intent_is_recognised",
-            classify_intent("download cs 1.6 setup") == "transactional",
-            classify_intent("download cs 1.6 setup"))
+            classify_intent("download photo editor setup") == "transactional",
+            classify_intent("download photo editor setup"))
     c.check("commercial_intent_is_not_folded_into_transactional",
-            classify_intent("best free cs 1.6 server") == "commercial",
+            classify_intent("best free photo editor app") == "commercial",
             "`free` is a commercial modifier, not an intent to act")
     c.check("comparison_intent_is_recognised",
-            classify_intent("cs 1.6 vs cs source") == "comparison")
+            classify_intent("photo editor vs paint app") == "comparison")
     c.check("an_ordinary_query_is_informational",
             classify_intent("how does recoil work") == "informational")
     c.check("intent_is_not_a_constant",
             len({classify_intent(k) for k in
-                 ("buy cs 1.6 skins", "cs 1.6 vs cs go", "what is cs 1.6")}) >= 3)
+                 ("buy photo editor license", "photo editor vs paint app", "what is a photo editor")}) >= 3)
 
     # Script detection drives market selection. A CJK seed sent to us/en-US
     # returns nothing, which reads as absent demand rather than a wrong question.
-    c.check("cjk_is_detected", script_of("cs1.6网页版") == "cjk", script_of("cs1.6网页版"))
-    c.check("arabic_is_detected", script_of("كونتر سترايك") == "arabic", script_of("كونتر سترايك"))
-    c.check("latin_is_the_default", script_of("counter strike") == "latin")
+    c.check("cjk_is_detected", script_of("photo编辑器") == "cjk", script_of("photo编辑器"))
+    c.check("arabic_is_detected", script_of("محرر الصور") == "arabic", script_of("محرر الصور"))
+    c.check("latin_is_the_default", script_of("photo editor") == "latin")
     c.check("script_detection_is_not_a_constant",
-            len({script_of(k) for k in ("cs1.6网页版", "counter strike")}) == 2)
+            len({script_of(k) for k in ("photo编辑器", "photo editor")}) == 2)
     return c.verdict()
 
 
@@ -547,7 +547,7 @@ def cmd_bing(a):
     """Band a `bing.py queries` export the same way cmd_gsc bands Search Console.
 
     This exists because a program can spend months optimising against the wrong
-    engine without ever noticing. Measured on combatskirmish.net 2026-09-01:
+    engine without ever noticing. Measured on a live site 2026-09-01:
     Bing delivered 57,596 impressions and 4,300 clicks in 29 days while Google
     Search Console reported 545 and 43 for the same window - about 100x - and
     every workflow here had been reading GSC. Whichever engine actually sends
@@ -560,7 +560,7 @@ def cmd_bing(a):
        impressions and taking an IMPRESSION-WEIGHTED position is the only honest
        way to collapse them. A plain mean over rows lets a 3-impression market
        move the headline position as much as a 3,000-impression one.
-    2. Segments by SCRIPT. That is what surfaced the finding above: Chinese
+    2. Segments by SCRIPT. That is what surfaced the finding above: CJK-script
        queries were 15% of queries and 73% of all clicks, converting at 30.3%
        against 2.5% for everything else. A single blended CTR hides a segment
        performing twelve times better than the average - and hides which half of

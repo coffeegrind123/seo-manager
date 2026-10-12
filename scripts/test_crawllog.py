@@ -171,7 +171,7 @@ check("spoof/CONTROL an empty flagged set unmarks nothing",
 # End to end through the CLI, because the guard lives inside cmd_scan and a
 # hand-built namespace would not exercise the code path that produces the JSON.
 # --------------------------------------------------------------------------
-def _line(ua, ip, uri="/maps/de_dust2", status=200):
+def _line(ua, ip, uri="/maps/harbor_2", status=200):
     return json.dumps({
         "ts": 1788000000.0, "status": status, "size": 100, "duration": 0.01,
         "request": {"method": "GET", "uri": uri, "host": "x.test",

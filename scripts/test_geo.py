@@ -104,7 +104,7 @@ def test_measurement() -> None:
 
         print("\nretrieved vs cited - a page the engine READ is not a page it CITED:")
         G.ENGINES.clear()
-        G.ENGINES["fake"] = stub(references=[{"domain": "play-cs.com", "url": "https://play-cs.com"}],
+        G.ENGINES["fake"] = stub(references=[{"domain": "rival.example", "url": "https://rival.example"}],
                                  retrieved=[{"domain": "example.com", "url": "https://example.com/a"}])
         r = G.ask("q", "example.com", use_cache=False)
         row = r["results"][0]
@@ -200,12 +200,12 @@ def main() -> int:
 
         print("\ncitation, both directions:")
         G.ENGINES.clear()
-        G.ENGINES["fake"] = stub(references=[{"domain": "play-cs.com", "url": "https://play-cs.com"}])
+        G.ENGINES["fake"] = stub(references=[{"domain": "rival.example", "url": "https://rival.example"}])
         miss = G.ask("q", "example.com", use_cache=False)
         check("an answer without us is not_cited", miss["not_cited_by"] == ["fake"])
-        check("competitors are named", miss["results"][0]["competitors_cited"] == ["play-cs.com"])
+        check("competitors are named", miss["results"][0]["competitors_cited"] == ["rival.example"])
         G.ENGINES["fake"] = stub(references=[
-            {"domain": "play-cs.com", "url": "https://play-cs.com"},
+            {"domain": "rival.example", "url": "https://rival.example"},
             {"domain": "www.example.com", "url": "https://www.example.com/a"}])
         hit = G.ask("q", "example.com", use_cache=False)
         check("an answer citing us is cited", hit["cited_by"] == ["fake"])
@@ -229,8 +229,8 @@ def main() -> int:
         G.ENGINES["fake"] = stub(references=[
             {"domain": "google.com", "url": "https://google.com/a"},
             {"domain": "google.com", "url": "https://google.com/b"},
-            {"domain": "play-cs.com", "url": "https://play-cs.com"},
-            {"domain": "play-cs.com", "url": "https://play-cs.com/x"}])
+            {"domain": "rival.example", "url": "https://rival.example"},
+            {"domain": "rival.example", "url": "https://rival.example/x"}])
         G.ENGINE_FURNITURE["fake"] = {"google.com"}
         one = G.ask("q", "example.com", use_cache=False)
         check("the engine's own domain is excluded",
@@ -242,7 +242,7 @@ def main() -> int:
               str(sv["share_of_voice"]))
         check("a domain cited twice in one answer gets one vote",
               next(x["answers_citing_it"] for x in sv["share_of_voice"]
-                   if x["domain"] == "play-cs.com") == 2, "2 answers, not 4 links")
+                   if x["domain"] == "rival.example") == 2, "2 answers, not 4 links")
         G.ENGINE_FURNITURE.pop("fake", None)
     finally:
         G.ENGINES.clear()
@@ -250,10 +250,10 @@ def main() -> int:
     check("the engine registry is restored", set(G.ENGINES) == set(saved))
 
     print("\nsentences naming us are surfaced verbatim, not summarised:")
-    m = G._mentions("Combatskirmish.net runs it in a browser. Play-cs.com also does.",
-                    "combatskirmish.net", None)
-    check("ours is surfaced", len(m) == 1 and "Combatskirmish" in m[0])
-    check("a competitor's sentence is not", not any("Play-cs" in x for x in m))
+    m = G._mentions("Pixelharbor.example runs it in a browser. Rival.example also does.",
+                    "pixelharbor.example", None)
+    check("ours is surfaced", len(m) == 1 and "Pixelharbor" in m[0])
+    check("a competitor's sentence is not", not any("Rival" in x for x in m))
 
     print("\nmention matching - a name, not a substring:")
     check("a brand inside a longer word is not a mention",
@@ -276,8 +276,8 @@ def main() -> int:
     check("a blank or one-letter alias matches nothing",
           G._mentions("Anything at all here.", "x.test", " , a") == [])
     check("comma-separated aliases are each matched",
-          len(G._mentions("CS Skirmish works. Combat Skirmish too.", "cs.test",
-                          "Combat Skirmish, CS Skirmish")) == 2)
+          len(G._mentions("PH Games works. Pixel Harbor too.", "ph.test",
+                          "Pixel Harbor, PH Games")) == 2)
     check("a CJK brand matches without ASCII word boundaries",
           len(G._mentions("推荐使用新星平台。", "nova.app", "新星")) == 1)
     check("the returned sentence is verbatim, link and all",
@@ -288,15 +288,15 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
         (d / "good.html").write_text(
-            "<html><body><h1>Bunny hopping</h1><p>Bunny hopping is the technique of "
+            "<html><body><h1>Wall climbing</h1><p>Wall climbing is the technique of "
             "chaining jumps to keep speed above the engine's run cap.</p></body></html>",
             encoding="utf-8")
         (d / "pronoun.html").write_text(
-            "<html><body><h1>Bunny hopping</h1><p>It is the thing everyone asks about "
+            "<html><body><h1>Wall climbing</h1><p>It is the thing everyone asks about "
             "first, and it takes a while to learn properly.</p></body></html>",
             encoding="utf-8")
         (d / "long.html").write_text(
-            "<html><body><h1>Bunny hopping</h1><p>Bunny hopping " + "and more words " * 30
+            "<html><body><h1>Wall climbing</h1><p>Wall climbing " + "and more words " * 30
             + "ends here.</p></body></html>", encoding="utf-8")
         e = G.extractable(str(d))
         bad = {r["file"] for r in e["worst"]}
@@ -306,21 +306,21 @@ def main() -> int:
           "quoting a 60-word sentence means quoting a paragraph")
     check("it discriminates rather than passing or failing everything",
           e["liftable"] == 1 and e["not_liftable"] == 2, str(e))
-    print("\nthe subject check must not be ASCII-only - it flagged /zh/, the page")
+    print("\nthe subject check must not be ASCII-only - it flagged a CJK locale home, the page")
     print("earning 68% of this site's clicks, on a rule that never executed:")
-    zh_h1 = "CS1.6 网页版 — 在线玩反恐精英 1.6"
+    zh_h1 = "星际跑者 2.4 在线版 — 在线玩星际跑者"
     check("a CJK heading matched by its own sentence passes",
-          G._names_subject(zh_h1, "Combat Skirmish 把真正的反恐精英 1.6 带进浏览器。") == (True, "cjk-bigrams"))
+          G._names_subject(zh_h1, "Pixel Harbor 把真正的星际跑者 2.4 带进浏览器。") == (True, "cjk-bigrams"))
     check("a CJK heading NOT matched still fails",
           G._names_subject(zh_h1, "完全无关的一句话关于别的东西。")[0] is False,
           "the bigram path has to discriminate, not just say yes")
     check("Cyrillic goes down the word path",
-          G._names_subject("Играть в Counter-Strike онлайн",
-                           "Counter-Strike запускается в браузере.") == (True, "words"))
+          G._names_subject("Играть в Star-Runner онлайн",
+                           "Star-Runner запускается в браузере.") == (True, "words"))
     check("Cyrillic can still fail",
-          G._names_subject("Играть в Counter-Strike онлайн", "Совершенно другая тема.")[0] is False)
+          G._names_subject("Играть в Star-Runner онлайн", "Совершенно другая тема.")[0] is False)
     check("Latin is unaffected",
-          G._names_subject("Bunny hopping", "Bunny hopping is a technique.") == (True, "words"))
+          G._names_subject("Wall climbing", "Wall climbing is a technique.") == (True, "words"))
     check("no h1 is not-evaluable rather than a failure",
           G._names_subject("", "A sentence.")[1] == "not-evaluable",
           "a check that could not run must not vote")
@@ -335,16 +335,16 @@ def main() -> int:
     check("English is unaffected",
           len([x for x in G._SENT.split("One sentence. Two sentences.") if x.strip()]) == 2)
     check("a dot inside a DOMAIN does not end a sentence",
-          len([x for x in G._SENT.split("Combatskirmish.net runs it.") if x.strip()]) == 1,
+          len([x for x in G._SENT.split("Pixelharbor.example runs it.") if x.strip()]) == 1,
           "relaxing the ASCII rule to \\s* splits on every domain and abbreviation")
-    n, unit, ok_ = G._sentence_length("Combat Skirmishは本物のCounter-Strike 1.6をブラウザに届けます")
+    n, unit, ok_ = G._sentence_length("Pixel Harborは本物のStar-Runner 2.4をブラウザに届けます")
     check("a Japanese sentence is measured in characters", unit == "chars",
           f"got {n} {unit} - by whitespace this reads as 3 'words'")
     check("and a real Japanese sentence is within bounds", ok_ is True, f"{n} chars")
-    n2, unit2, _ = G._sentence_length("Bunny hopping is the technique of chaining jumps.")
+    n2, unit2, _ = G._sentence_length("Wall climbing is the technique of chaining jumps.")
     check("English is still measured in words", unit2 == "words")
     nj, uj, okj = G._sentence_length(
-        "Combat Skirmishは本物のCounter-Strike 1.6をWebAssemblyでブラウザに届けます")
+        "Pixel Harborは本物のStar-Runner 2.4をWebAssemblyでブラウザに届けます")
     check("a mostly-Latin Japanese sentence is STILL measured in characters",
           uj == "chars" and okj is True,
           f"got {nj} {uj} - it is only 28% kana/kanji, so a ratio threshold "
@@ -353,26 +353,26 @@ def main() -> int:
     check("a too-short lead still fails", ok3 is False)
 
     check("a single-sentence paragraph ending in a period IS structured",
-          bool(G._TERM_END.search("Bunny hopping and more words ends here.")),
+          bool(G._TERM_END.search("Wall climbing and more words ends here.")),
           "the split rule finds no boundary here, and using IT to detect structure "
           "waives the length check on most paragraphs on a real site")
     check("a paragraph with no sentence punctuation is NOT structured",
-          not G._TERM_END.search("Combat Skirmish ส่ง Counter-Strike 1.6 เข้าเบราว์เซอร์"),
-          "the dot in `Counter-Strike 1.6` makes a bare terminator search say yes")
+          not G._TERM_END.search("Pixel Harbor ส่ง Star-Runner 2.4 เข้าเบราว์เซอร์"),
+          "the dot in `Star-Runner 2.4` makes a bare terminator search say yes")
     check("a trailing quote or bracket does not hide the terminator",
           bool(G._TERM_END.search('He called it "the technique."')))
 
     print("\nthe subject rule tests whether the SENTENCE stands alone, not whether")
     print("it agrees with the h1's vocabulary:")
     check("a stylish headline does not sink a well-written lead",
-          G._names_subject("A Retro Shooter That Never Needed Replacing",
-                           "Counter-Strike started life in 1999 as a mod for Half-Life.")[0] is True,
+          G._names_subject("A Classic That Never Needed Replacing",
+                           "Star-Runner started life in 1999 as a mod for Moon-Base.")[0] is True,
           "matching only h1 tokens flagged this real page")
     check("an all-caps abbreviation counts as naming the subject",
-          G._names_subject("Play Counter-Strike 1.6 With Friends",
-                           "Organising a game of CS 1.6 meant everyone owning it.")[0] is True)
+          G._names_subject("Play Star-Runner 2.4 With Friends",
+                           "Organising a game of SR 2.4 meant everyone owning it.")[0] is True)
     check("a lead that names nothing still fails",
-          G._names_subject("Play Counter-Strike 1.6 Free",
+          G._names_subject("Play Star-Runner 2.4 Free",
                            "There is no purchase, no subscription and no account.")[0] is False,
           "this is what the rule exists to catch")
     check("an ordinary capitalised opener is not a proper noun",

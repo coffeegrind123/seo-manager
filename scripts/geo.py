@@ -8,9 +8,9 @@ question this site exists to answer, is this site one of the sources it names?**
 
 THE UNIT IS AN ANSWER, NOT A RANKING. A page can sit at position 3 and be absent
 from the overview above it, which is what happened here: measured 2026-09-01,
-Google's AI Overview for "how to play counter strike 1.6 in browser" cited seven
-sources - facebook, play-cs.com, dos.zone, vogons, vpn4games, github, reddit -
-and combatskirmish.net was not among them, while the DR 35 competitor was.
+Google's AI Overview for the site's head query ("how to play <game> in
+browser") cited seven sources - social, forums, a code host and a DR 35
+competitor - and the site was not among them, while the competitor was.
 
 FAIL-CLOSED, STRUCTURALLY. `cannot_ask` and `not_cited` are different states and
 never share a code path. An engine with no key reports `no_key`; an engine that
@@ -462,7 +462,7 @@ def engines_status() -> dict:
     rows = []
     for name, fn in ENGINES.items():
         try:
-            probe = fn("what is counter-strike")
+            probe = fn("what is photosynthesis")
         except Exception as e:                                    # noqa: BLE001
             probe = {"state": "failing", "detail": f"{type(e).__name__}: {e}"}
         rows.append({"engine": name, "state": probe["state"],
@@ -486,7 +486,7 @@ def engines_status() -> dict:
 # 3-"word" fragment for ja, producing three confident findings about the site
 # that were entirely artefacts of this regex.
 # ⚠ TWO ALTERNATIVES, not one relaxed rule. An ASCII terminator must be
-# FOLLOWED BY WHITESPACE or the dot in `Combatskirmish.net` ends a sentence -
+# FOLLOWED BY WHITESPACE or the dot in `Example.com` ends a sentence -
 # which is precisely what a first attempt at this did, silently breaking the
 # "which sentences name us" extraction. CJK and Indic terminators carry no
 # trailing space, so they match zero-width.
@@ -502,7 +502,7 @@ _NOSPACE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0
 #      terminator, so a paragraph that is exactly ONE sentence ending at the end
 #      of the string has no split point, and the length check gets waived on
 #      most paragraphs on the site.
-#   2. "is a terminator present anywhere" - no. The dot in `Counter-Strike 1.6`
+#   2. "is a terminator present anywhere" - no. The dot in `Star-Runner 2.4`
 #      is a terminator by that test, so a Thai paragraph with no sentence
 #      punctuation at all still counted as structured.
 #   3. What actually answers it: either the split produced more than one piece,
@@ -1096,8 +1096,8 @@ _TAG = re.compile(r"<[^>]+>")
 # ⚠ SCRIPT-AWARE ON PURPOSE. The first version tokenised headings with
 # `[a-z0-9]{4,}`, which extracts NOTHING from a pure-CJK heading - so the
 # "does the lead sentence name its own subject" test could not run, and
-# returned False. Measured 2026-09-01: that flagged `/zh/`, the page earning
-# 68% of this site's clicks, as not liftable, on a check that never executed.
+# returned False. Measured 2026-09-01: that flagged a CJK locale homepage, the
+# page earning 68% of this site's clicks, as not liftable, on a check that never executed.
 # "Cannot evaluate" reported as "fails" is the exact error this skill exists to
 # prevent, reproduced from scratch in new code.
 #
@@ -1127,19 +1127,19 @@ def _sentence_length(sentence: str) -> tuple[int, str, bool]:
     return n, "words", 6 <= n <= 45
 
 
-# A capitalised multi-word or hyphenated name - "Counter-Strike", "Combat
-# Skirmish", "Half-Life". Used as a FALLBACK subject signal.
-# Two shapes, because products are named both ways. `Counter-Strike`,
-# `Combat Skirmish`, `Half-Life` - and the all-caps abbreviation with an
-# optional version, `CS 1.6`, which the first pattern misses entirely and which
-# is how half this site's own prose refers to the game.
+# A capitalised multi-word or hyphenated name - "Star-Runner", "Pixel
+# Harbor", "Moon-Base". Used as a FALLBACK subject signal.
+# Two shapes, because products are named both ways. `Star-Runner`,
+# `Pixel Harbor`, `Moon-Base` - and the all-caps abbreviation with an
+# optional version, `SR 2.4`, which the first pattern misses entirely and which
+# is how half a site's own prose may refer to its product.
 # ⚠ The all-caps branch needs TWO capitals, so an ordinary sentence-initial word
 # ("There", "Organising") cannot satisfy it.
 _PROPER = re.compile(
     r"\b[A-Z][a-z]{2,}(?:[-\u2011][A-Z][a-z]+|\s+[A-Z][a-z]{2,})+"
     r"|\b[A-Z]{2,}(?:\s*\d+(?:\.\d+)*)?\b"
-    # Model names: M3, AK47, AWP, USP. One capital plus digits is a name, and
-    # `The M3 is a corner weapon` was flagged for lacking a subject because
+    # Model names: M3, X100, RTX, A7. One capital plus digits is a name, and
+    # `The M3 is a compact camera` was flagged for lacking a subject because
     # neither the 3-character word rule nor the two-capital rule reaches it.
     r"|\b[A-Z][0-9]+\b")
 
@@ -1148,9 +1148,9 @@ def _names_subject(h1: str, sentence: str, *, extra: tuple[str, ...] = ()) -> tu
     """Does the lead sentence stand on its own - does it name what it is about?
 
     ⚠ THE H1 IS EVIDENCE, NOT THE DEFINITION. A first version matched only
-    against h1 tokens and flagged `/landers/retro-shooter` - h1 "A Retro Shooter
-    That Never Needed Replacing", lead "Counter-Strike started life in 1999 as a
-    mod for Half-Life" - which names its subject about as clearly as a sentence
+    against h1 tokens and flagged `/landers/classic` - h1 "A Classic That
+    Never Needed Replacing", lead "Star-Runner started life in 1999 as a
+    mod for Moon-Base" - which names its subject about as clearly as a sentence
     can. The h1 was a stylish headline; the rule was measuring vocabulary
     agreement between two elements rather than whether the SENTENCE is
     self-contained, which is the thing an assistant cares about.
@@ -1168,7 +1168,7 @@ def _names_subject(h1: str, sentence: str, *, extra: tuple[str, ...] = ()) -> tu
     low_h, low_s = h1.lower(), sentence.lower()
     # ⚠ CJK IS CHECKED FIRST, and this ordering is the fix. `\w` with re.UNICODE
     # DOES match CJK - it tokenises a Chinese heading into whole runs between
-    # punctuation ("在线玩反恐精英"), which are far too long to appear verbatim in
+    # punctuation ("在线玩星际跑者"), which are far too long to appear verbatim in
     # a sentence. So the word branch does not fail to find tokens, it finds
     # useless ones, and a bigram fallback placed after it never runs.
     if _CJK.search(h1):
@@ -1229,7 +1229,7 @@ def extractable(root: str, limit: int = 400) -> dict:
         # ⚠ A PRONOUN AND AN EXISTENTIAL ARE NOT THE SAME FAULT.
         # "It does not mean a stripped-down clone" dangles: the quote carries
         # nothing to resolve `It` against. But "There are three ways to get
-        # Counter-Strike 1.6 running on a Chromebook" is a perfectly quotable
+        # Star-Runner 2.4 running on a Chromebook" is a perfectly quotable
         # sentence - the existential opener is a construction, not a defect,
         # and it fails only when the sentence ALSO names nothing. Treating the
         # two alike flagged a genuinely good lead on /guides/chromebook.
@@ -1281,14 +1281,14 @@ def run_control() -> dict:
     c.check("registrable_does_not_over_fold",
             _registrable("notexample.com") == "notexample.com")
 
-    text = ("Combatskirmish.net runs the game in a browser. Play-cs.com also does. "
+    text = ("Pixelharbor.example runs the game in a browser. Rival.example also does. "
             "Nothing here names anyone else.")
-    m = _mentions(text, "combatskirmish.net", None)
-    c.check("a_sentence_naming_us_is_surfaced", len(m) == 1 and "Combatskirmish" in m[0], str(m))
+    m = _mentions(text, "pixelharbor.example", None)
+    c.check("a_sentence_naming_us_is_surfaced", len(m) == 1 and "Pixelharbor" in m[0], str(m))
     c.check("a_sentence_naming_a_competitor_is_not_ours",
-            not any("Play-cs" in x for x in m))
+            not any("Rival" in x for x in m))
     c.check("mentions_are_case_insensitive",
-            len(_mentions("visit COMBATSKIRMISH.NET now.", "combatskirmish.net", None)) == 1)
+            len(_mentions("visit PIXELHARBOR.EXAMPLE now.", "pixelharbor.example", None)) == 1)
     c.check("no_mention_yields_nothing",
             _mentions("A sentence about nothing in particular.", "x.test", None) == [])
 
@@ -1315,18 +1315,18 @@ def run_control() -> dict:
         ENGINES.clear()
         ENGINES["fake"] = lambda q, **_: {
             "state": "answered", "has_answer": True,
-            "text": "Play-cs.com is the usual answer here.",
-            "references": [{"domain": "play-cs.com", "url": "https://play-cs.com"},
-                           {"domain": "dos.zone", "url": "https://dos.zone"}]}
+            "text": "Rival.example is the usual answer here.",
+            "references": [{"domain": "rival.example", "url": "https://rival.example"},
+                           {"domain": "other.example", "url": "https://other.example"}]}
         miss = ask("q", "example.com", use_cache=False)
         c.check("an_answer_without_us_is_not_cited",
                 miss["results"][0]["cited"] is False and miss["not_cited_by"] == ["fake"])
         c.check("competitors_are_named", miss["results"][0]["competitors_cited"] ==
-                ["play-cs.com", "dos.zone"])
+                ["rival.example", "other.example"])
 
         ENGINES["fake"] = lambda q, **_: {
             "state": "answered", "has_answer": True, "text": "Example.com does it.",
-            "references": [{"domain": "play-cs.com", "url": "https://play-cs.com"},
+            "references": [{"domain": "rival.example", "url": "https://rival.example"},
                            {"domain": "www.example.com", "url": "https://www.example.com/a"}]}
         hit = ask("q", "example.com", use_cache=False)
         c.check("an_answer_citing_us_is_cited", hit["results"][0]["cited"] is True)
@@ -1341,8 +1341,8 @@ def run_control() -> dict:
             "state": "answered", "has_answer": True, "text": "",
             "references": [{"domain": "google.com", "url": "https://google.com/a"},
                            {"domain": "google.com", "url": "https://google.com/b"},
-                           {"domain": "play-cs.com", "url": "https://play-cs.com"},
-                           {"domain": "play-cs.com", "url": "https://play-cs.com/x"}]}
+                           {"domain": "rival.example", "url": "https://rival.example"},
+                           {"domain": "rival.example", "url": "https://rival.example/x"}]}
         ENGINE_FURNITURE["fake"] = {"google.com"}
         f = ask("q", "example.com", use_cache=False)
         c.check("the_engines_own_domain_is_excluded",
@@ -1356,7 +1356,7 @@ def run_control() -> dict:
                 str(sv["share_of_voice"]))
         c.check("a_domain_cited_twice_in_one_answer_gets_one_vote",
                 next(r["answers_citing_it"] for r in sv["share_of_voice"]
-                     if r["domain"] == "play-cs.com") == 2,
+                     if r["domain"] == "rival.example") == 2,
                 "2 answers, not 4 citations")
         ENGINE_FURNITURE.pop("fake", None)
 
@@ -1381,7 +1381,7 @@ def run_control() -> dict:
 
         def flip(q, **_):
             calls["n"] += 1
-            refs = [{"domain": "play-cs.com", "url": "https://play-cs.com"}]
+            refs = [{"domain": "rival.example", "url": "https://rival.example"}]
             if calls["n"] % 2:
                 refs.append({"domain": "example.com", "url": "https://example.com/g"})
             return {"state": "answered", "has_answer": True,
@@ -1402,7 +1402,7 @@ def run_control() -> dict:
         c.check("cited_means_cited_in_at_least_one_run", four["results"][0]["cited"] is True)
         c.check("a_rate_is_not_a_single_observation", r0["single_observation"] is False)
         c.check("domain_run_counts_carry_the_per_domain_rate",
-                four["results"][0]["domain_run_counts"] == {"play-cs.com": 4, "example.com": 2},
+                four["results"][0]["domain_run_counts"] == {"rival.example": 4, "example.com": 2},
                 str(four["results"][0]["domain_run_counts"]))
         c.check("the_mentioned_rung_is_reported",
                 four["results"][0]["mentioned"] is True and four["mentioned_by"] == ["coin"])
@@ -1457,31 +1457,31 @@ def run_control() -> dict:
     # two shapes that must NOT read as an answer.
     aimode_fixture = {
         "text_blocks": [{"type": "paragraph", "snippet": "Playing in a browser is easy."},
-                        {"type": "list", "list": [{"snippet": "Open play-cs.com"}]}],
-        "references": [{"title": "t", "link": "https://play-cs.com/en/", "source": "Play-CS.com"},
-                       {"title": "u", "link": "https://dos.zone/cs/", "source": "DOS Zone"}],
+                        {"type": "list", "list": [{"snippet": "Open rival.example"}]}],
+        "references": [{"title": "t", "link": "https://rival.example/en/", "source": "Rival.example"},
+                       {"title": "u", "link": "https://other.example/x/", "source": "Other"}],
     }
     c.check("ai_mode_flattens_nested_list_blocks",
             _flatten_blocks(aimode_fixture["text_blocks"], []) ==
-            ["Playing in a browser is easy.", "Open play-cs.com"])
+            ["Playing in a browser is easy.", "Open rival.example"])
     c.check("ai_mode_furniture_excludes_google",
             "google.com" in ENGINE_FURNITURE["google_ai_mode"])
     ob = _observation({"text": "x", "references": [
         {"domain": _host(r["link"])} for r in aimode_fixture["references"]]},
         "google_ai_mode", "example.com", None)
     c.check("ai_mode_references_resolve_to_registrable_domains",
-            ob["cited_domains"] == ["play-cs.com", "dos.zone"], str(ob["cited_domains"]))
+            ob["cited_domains"] == ["rival.example", "other.example"], str(ob["cited_domains"]))
 
     # Extractability, both directions.
     import tempfile as _tf
     with _tf.TemporaryDirectory() as td:
         d = Path(td)
         (d / "good.html").write_text(
-            "<html><body><h1>Bunny hopping</h1><p>Bunny hopping is the technique of "
+            "<html><body><h1>Wall climbing</h1><p>Wall climbing is the technique of "
             "chaining jumps to keep speed above the engine's run cap.</p></body></html>",
             encoding="utf-8")
         (d / "pronoun.html").write_text(
-            "<html><body><h1>Bunny hopping</h1><p>It is the thing everyone asks about "
+            "<html><body><h1>Wall climbing</h1><p>It is the thing everyone asks about "
             "first, and it takes a while to learn properly.</p></body></html>",
             encoding="utf-8")
         e = extractable(str(d))
@@ -1497,7 +1497,7 @@ def run_control() -> dict:
                 f"{e['not_liftable']} not - a checker that passes or fails "
                 f"everything is measuring the template, not the prose")
         (d / "long.html").write_text(
-            "<html><body><h1>Bunny hopping</h1><p>Bunny hopping " + "and more words " * 30
+            "<html><body><h1>Wall climbing</h1><p>Wall climbing " + "and more words " * 30
             + "ends here.</p></body></html>", encoding="utf-8")
         e2 = extractable(str(d))
         c.check("an_over_long_lead_is_not_liftable",

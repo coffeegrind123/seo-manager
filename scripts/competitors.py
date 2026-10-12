@@ -49,7 +49,7 @@ cite a fact from one of these pages, open it yourself and verify it - that is th
 information-gain rule, and this tool deliberately cannot satisfy it for you.
 
 Usage:
-  competitors.py profile --query "how to bhop cs 1.6" --serp serp.json
+  competitors.py profile --query "how to wall climb" --serp serp.json
   competitors.py profile --query "..." --url https://a --url https://b
 """
 
@@ -77,7 +77,7 @@ CHROME = re.compile(r"<(nav|footer|header|aside|form)\b.*?</\1\s*>", re.S | re.I
 # Mirrors serp.py's WEAK_DOMAINS; kept local so this runs standalone.
 UGC = {
     "reddit.com", "quora.com", "youtube.com", "youtu.be", "facebook.com", "x.com",
-    "twitter.com", "tiktok.com", "steamcommunity.com", "gamebanana.com",
+    "twitter.com", "tiktok.com", "steamcommunity.com",
     "alliedmods.net", "stackoverflow.com", "stackexchange.com", "scribd.com",
     "medium.com", "pastebin.com", "gist.github.com", "github.com", "linkedin.com",
     "docs.google.com", "slideshare.net", "issuu.com",
@@ -203,7 +203,7 @@ def build_contract(profiles: list, query: str) -> dict:
     # "most of page 1 has a section about X" is measured, not guessed.
     stop = set("""a an the and or of for to in on with without your you how what why is are be
         can do does not it its this that then than from at as by best top guide tutorial vs
-        cs counter strike 1 6 16 2024 2025 2026 free online play
+        1 6 2024 2025 2026 free online play
         navigation nav menu footer header sidebar search subscribe newsletter comments
         comment related share cookies cookie privacy policy terms login signin signup
         account filter filters results projects categories category tags tag archive
@@ -235,7 +235,7 @@ def build_contract(profiles: list, query: str) -> dict:
     # A bot-challenge interstitial is a page you COULD NOT READ, and it looks
     # exactly like a thin one: a handful of words and a single heading. Reporting
     # it as weak inverts the finding - it tells you a competitor is beatable when
-    # all you learned is that they block you. Measured 2026-09-01: play-cs.com
+    # all you learned is that they block you. Measured 2026-09-01: a competitor
     # (DR 35, ranking ABOVE the site being audited) profiled as
     # "thin (5 words), no heading structure" from a page whose only heading was
     # the word "Verification".

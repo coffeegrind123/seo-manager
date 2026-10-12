@@ -4,7 +4,7 @@
 Every case below is a bug that existed during the build and was caught, or a
 distinction that silently produces a confident wrong answer. In order:
 
-  1. tag-only boilerplate detection missed a nav rendered as <p class="silonav">,
+  1. tag-only boilerplate detection missed a nav rendered as <p class="sectionnav">,
      so 3,900 furniture links counted as editorial and the broken silo looked fine
   2. self-referential hreflang counted as an inbound link, so every English-only
      silo looked reachable from elsewhere
@@ -63,8 +63,8 @@ check("norm handles query drop", sg.norm("/a?b=1") == "/a")
 check("norm keeps query when asked", sg.norm("/a?b=1", keep_query=True) == "/a?b=1")
 
 print("\n1. statistical boilerplate beats tag-only detection")
-# A nav rendered as a plain <p> - exactly combatskirmish.net's `silonav`.
-pages = {f"/p{i}": '<p class="silonav"><a href="/hub">Hub</a></p>' for i in range(80)}
+# A nav rendered as a plain <p> - exactly a real site's `sectionnav`.
+pages = {f"/p{i}": '<p class="sectionnav"><a href="/hub">Hub</a></p>' for i in range(80)}
 pages["/p0"] += '<a href="/only">the one editorial link</a>'   # linked from ONE page
 pages["/hub"] = "<a href='/p0'>x</a>"
 pages["/only"] = "<p>nothing</p>"
@@ -169,19 +169,19 @@ print("\n6. offline path mapping")
 with tempfile.TemporaryDirectory() as td:
     os.makedirs(os.path.join(td, "guides"))
     os.makedirs(os.path.join(td, "how-to-play"))
-    open(os.path.join(td, "guides", "bhop.html"), "w").write('<a href="/x">x</a>')
+    open(os.path.join(td, "guides", "walljump.html"), "w").write('<a href="/x">x</a>')
     open(os.path.join(td, "how-to-play", "index.html"), "w").write('<a href="/y">y</a>')
     g, info = sg.build_offline([(td, "/")], False, ["index.html"])
-    check("file -> /guides/bhop", "/guides/bhop" in g._uid)
+    check("file -> /guides/walljump", "/guides/walljump" in g._uid)
     check("index.html -> /how-to-play", "/how-to-play" in g._uid)
     g, _ = sg.build_offline([(td, "/")], False, ["index.html"], [(r"^/guides/", "/")])
-    check("--rewrite remaps the served path", "/bhop" in g._uid and "/guides/bhop" not in g._uid)
+    check("--rewrite remaps the served path", "/walljump" in g._uid and "/guides/walljump" not in g._uid)
 
 print("\n7. a global-nav hub is not a contextual orphan")
-# 80 leaf pages whose nav links the hub, exactly like combatskirmish.net's silonav.
+# 80 leaf pages whose nav links the hub, exactly like a real site's sectionnav.
 # The hub gets 80 inbound links and ZERO body links - the shape that made every
 # one of the site's 27 "contextual orphans" a false positive on 2026-09-01.
-pages = {f"/p{i}": '<p class="silonav"><a href="/hub">Hub</a></p>' for i in range(80)}
+pages = {f"/p{i}": '<p class="sectionnav"><a href="/hub">Hub</a></p>' for i in range(80)}
 # The hub body-links its leaves, so the leaves are properly reachable and the only
 # two interesting pages left are the hub itself and the genuinely unlinked one.
 pages["/hub"] = ("<p>the hub, linked from every nav and from no article body</p>"
@@ -215,14 +215,14 @@ check("the genuinely unlinked page IS still an orphan", "/lost" in out["orphan_u
 check("orphan count excludes the hub", out["orphans"] == 1)
 
 print("\n8. section-scoped furniture, without hiding the island")
-# A locale: 60 pages under /zh, every one linking to /zh by breadcrumb, and /zh
+# A locale: 60 pages under /ja, every one linking to /ja by breadcrumb, and /ja
 # linked editorially from nowhere. The real 2026-09-01 shape.
-pages = {f"/zh/p{i}": '<nav><a href="/zh">\u9996\u9875</a></nav><p>content</p>'
+pages = {f"/ja/p{i}": '<nav><a href="/ja">\u9996\u9875</a></nav><p>content</p>'
          for i in range(60)}
 # The locale home links its own silo, so the children are not orphans and the
-# only page under test is /zh itself.
-pages["/zh"] = ("<p>the locale home</p>"
-                + "".join(f'<p><a href="/zh/p{i}">page {i}</a></p>' for i in range(60)))
+# only page under test is /ja itself.
+pages["/ja"] = ("<p>the locale home</p>"
+                + "".join(f'<p><a href="/ja/p{i}">page {i}</a></p>' for i in range(60)))
 # ...and, in the SAME graph, the island: 17 guides that cross-link each other and
 # are reached from nowhere outside. 16/17 = 0.94 share, which is higher than the
 # locale nav's own threshold - so only the parent-path rule separates them.
@@ -232,7 +232,7 @@ for i in range(17):
     pages[f"/guides/g{i}"] = body
 # Filler, and it is load-bearing rather than padding: the whole bug is that a
 # locale nav is a LARGE share of its section and a TINY share of the site. With
-# only the pages above, /zh's 60 linkers are 77% of the corpus and site_wide
+# only the pages above, /ja's 60 linkers are 77% of the corpus and site_wide
 # sees it fine - the fixture has to be big enough for the blindness to exist.
 for i in range(250):
     # They carry their own nav, like any real page - a page with NO outbound link
@@ -242,11 +242,11 @@ for i in range(250):
 g = build(pages)
 
 roots = g.section_roots()
-check("the locale home is detected as section furniture", g._uid["/zh"] in roots)
+check("the locale home is detected as section furniture", g._uid["/ja"] in roots)
 check("a cross-linked guide is NOT - it is not its linkers' parent",
       g._uid["/guides/g0"] not in roots)
 check("site_wide alone could never have seen the locale nav",
-      g._uid["/zh"] not in g.site_wide(0.3))
+      g._uid["/ja"] not in g.site_wide(0.3))
 
 with tempfile.TemporaryDirectory() as td:
     f = os.path.join(td, "g.json")
@@ -255,15 +255,15 @@ with tempfile.TemporaryDirectory() as td:
     A.graph = f
     out = sg.cmd_orphans(A)
 check("the locale home is not reported as an orphan",
-      "/zh" not in out["orphan_urls"])
+      "/ja" not in out["orphan_urls"])
 check("it is listed for review with its real inbound count",
-      any(r["url"] == "/zh" and r["all_inlinks"] == 60 for r in out["nav_hub_urls"]))
+      any(r["url"] == "/ja" and r["all_inlinks"] == 60 for r in out["nav_hub_urls"]))
 check("and the island guides are STILL not swallowed as furniture",
       all(not r["url"].startswith("/guides/") for r in out["nav_hub_urls"]))
 
 print("\n9. canonicals: the one that makes a page unindexable")
-# The real 2026-07-17 shape: a case-collision left /maps/cs_assault carrying
-# /maps/cs_Assault's canonical, and that URL does not exist. Both halves look
+# The real 2026-07-17 shape: a case-collision left /maps/harbor_1 carrying
+# /maps/Harbor_1's canonical, and that URL does not exist. Both halves look
 # fine in isolation, which is why only a tree-wide check finds it.
 pages = {
     "/maps/a": '<link rel="canonical" href="/maps/a"><a href="/maps/b">b</a>',
@@ -311,26 +311,26 @@ check("an offline run says the URL set is complete",
 print()
 print("\nlink suggestions - which existing page should link to the weak one")
 pages = {
-    "/guides/bunny-hop": "<title>Bunny hop guide for CS 1.6</title><p>x</p>",
-    "/guides/strafe-jump": "<title>Strafe jump and bunny hop timing</title><p>Strafe and bunny hop "
+    "/guides/wall-climb": "<title>Wall climb guide for beginners</title><p>x</p>",
+    "/guides/strafe-jump": "<title>Strafe jump and wall climb timing</title><p>Strafe and wall climb "
                            "timing go together.</p>",
-    "/maps/dust2": "<title>Dust2 callouts</title><p>Map guide.</p>",
-    "/guides/already": "<title>Bunny hop already linking</title><a href='/guides/bunny-hop'>bh</a>",
+    "/maps/harbor": "<title>Harbor callouts</title><p>Map guide.</p>",
+    "/guides/already": "<title>Wall climb already linking</title><a href='/guides/wall-climb'>wc</a>",
     "/about": "<title>About us</title>",
 }
 g = build(pages)
-pq = {"/guides/bunny-hop": {"bunny hop": 400.0, "cs bhop": 50.0},
-      "/guides/strafe-jump": {"bunny hop": 30.0, "strafe jump": 900.0},
-      "/maps/dust2": {"dust2 callouts": 500.0}}
-sug = sg.suggest_links(g, [g.uid("/guides/bunny-hop")], pq, set(), per_target=5)
+pq = {"/guides/wall-climb": {"wall climb": 400.0, "wallclimb trick": 50.0},
+      "/guides/strafe-jump": {"wall climb": 30.0, "strafe jump": 900.0},
+      "/maps/harbor": {"harbor callouts": 500.0}}
+sug = sg.suggest_links(g, [g.uid("/guides/wall-climb")], pq, set(), per_target=5)
 rows = sug[0]["suggestions"]
 srcs = [r["source"] for r in rows]
 check("a page sharing a QUERY and title words is a high-confidence source",
       rows and rows[0]["source"] == "/guides/strafe-jump" and rows[0]["confidence"] == "high")
-check("the suggested anchor is the shared query", rows and rows[0]["anchor"] == "bunny hop")
+check("the suggested anchor is the shared query", rows and rows[0]["anchor"] == "wall climb")
 check("a page ALREADY linking to the target is never suggested", "/guides/already" not in srcs)
-check("an unrelated page is not suggested", "/about" not in srcs and "/maps/dust2" not in srcs)
-check("the target never suggests itself", "/guides/bunny-hop" not in srcs)
+check("an unrelated page is not suggested", "/about" not in srcs and "/maps/harbor" not in srcs)
+check("the target never suggests itself", "/guides/wall-climb" not in srcs)
 none = sg.suggest_links(g, [g.uid("/about")], pq, set(), per_target=5)
 check("CONTROL: a target nothing relates to gets no suggestions, not padding",
       none[0]["suggestions"] == [])

@@ -47,9 +47,9 @@ def main() -> int:
     check("the refusal names the way forward", bool(r.get("what_to_do")))
 
     print("\nsubtopics are withheld when the sample cannot support them:")
-    # Measured on "how to bunny hop in cs 1.6": 2 of 10 results readable, and the
-    # gaps came back as `ratings, submission, score, favorite` - GameBanana and
-    # mods.vg platform furniture read as subtopics. Printed as "differentiators"
+    # Measured on a game-technique query: 2 of 10 results readable, and the
+    # gaps came back as `ratings, submission, score, favorite` - two mod-hosting
+    # platforms' furniture read as subtopics. Printed as "differentiators"
     # that is an instruction to write a section about a ratings widget.
     with tempfile.TemporaryDirectory() as td:
         f = Path(td) / "c.json"
@@ -73,8 +73,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
         # Headings that deliberately avoid the query words. The real
-        # bunny-hop.html is written this way and scored 0.0 until the slug counted.
-        (d / "bunny-hop.html").write_text(
+        # wall-climb.html is written this way and scored 0.0 until the slug counted.
+        (d / "wall-climb.html").write_text(
             "<html><body><h2>What the engine is actually doing</h2>"
             "<p>Chaining jumps keeps speed above the run cap for a whole round.</p>"
             "</body></html>", encoding="utf-8")
@@ -82,11 +82,11 @@ def main() -> int:
             "<html><body><h2>Round economy and buy timing</h2>"
             "<p>The loss bonus decides whether a full buy is affordable next round.</p>"
             "</body></html>", encoding="utf-8")
-        hit = corpus_overlap("how to bunny hop", str(d))
+        hit = corpus_overlap("how to wall climb", str(d))
         miss = corpus_overlap("zzq nonexistent topic 9f2b", str(d))
     check("the existing page is found", hit["verdict"] == "existing-page-may-already-target-this")
     check("good editorial headings do not hide a page",
-          any("bunny-hop" in c["file"] for c in hit["candidates"]),
+          any("wall-climb" in c["file"] for c in hit["candidates"]),
           "found via the slug, which is how the page is actually addressed")
     check("an unrelated query is clear", miss["verdict"] == "clear")
     check("the metric discriminates",

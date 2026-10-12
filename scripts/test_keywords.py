@@ -9,7 +9,7 @@ where a confident wrong answer comes from:
      IMPRESSION-WEIGHTED or a 3-impression market moves the headline position as
      much as a 3,000-impression one.
   2. A single blended CTR hides a language segment earning most of the clicks.
-     On the site this was built against, Chinese queries were 15% of queries and
+     On the site this was built against, CJK-script queries were 15% of queries and
      73% of clicks at 30.3% CTR against 2.5% for everything else.
 """
 import io
@@ -43,18 +43,18 @@ def run_bing(rows, **flags):
 
 
 print("script detection")
-check("chinese -> cjk", kw.script_of("cs1.6网页版") == "cjk")
-check("japanese kana -> kana", kw.script_of("カウンターストライク") == "kana")
-check("korean -> hangul", kw.script_of("카운터스트라이크") == "hangul")
-check("russian -> cyrillic", kw.script_of("контр страйк") == "cyrillic")
-check("arabic -> arabic", kw.script_of("كاونتر سترايك") == "arabic")
-check("plain english -> latin", kw.script_of("cs 1.6 online") == "latin")
-check("mixed cjk+latin counts as cjk", kw.script_of("cs1.6 网页版") == "cjk")
+check("chinese -> cjk", kw.script_of("在线编辑器") == "cjk")
+check("japanese kana -> kana", kw.script_of("カメラアプリ") == "kana")
+check("korean -> hangul", kw.script_of("사진편집기") == "hangul")
+check("russian -> cyrillic", kw.script_of("фото редактор") == "cyrillic")
+check("arabic -> arabic", kw.script_of("محرر الصور") == "arabic")
+check("plain english -> latin", kw.script_of("photo editor online") == "latin")
+check("mixed cjk+latin counts as cjk", kw.script_of("photo 编辑器") == "cjk")
 
 print("\nper-market rows aggregate, position is impression-weighted")
 d = run_bing([
-    {"query": "cs 1.6", "impressions": 3000, "clicks": 60, "avg_position": 6.0},
-    {"query": "cs 1.6", "impressions": 3, "clicks": 0, "avg_position": 60.0},
+    {"query": "photo editor", "impressions": 3000, "clicks": 60, "avg_position": 6.0},
+    {"query": "photo editor", "impressions": 3, "clicks": 0, "avg_position": 60.0},
 ], min_impressions=1)
 r = d["results"][0]
 check("rows collapsed to one query", d["count"] == 1)
@@ -82,7 +82,7 @@ check("pos 80 -> deep", got["e"] == "deep")
 print("\nby_script segmentation surfaces a hidden earner")
 d = run_bing(
     [{"query": f"query {i}", "impressions": 1000, "clicks": 20, "avg_position": 6} for i in range(10)]
-    + [{"query": f"网页版{i}", "impressions": 200, "clicks": 60, "avg_position": 2} for i in range(5)],
+    + [{"query": f"编辑器{i}", "impressions": 200, "clicks": 60, "avg_position": 2} for i in range(5)],
     min_impressions=1)
 bs = d["by_script"]
 check("both scripts reported", set(bs) == {"latin", "cjk"})
@@ -93,7 +93,7 @@ check("yet a large share of clicks",
       bs["cjk"]["clicks"] / (bs["cjk"]["clicks"] + bs["latin"]["clicks"]) > 0.55)
 check("--script filters", len(run_bing(
     [{"query": "x", "impressions": 100, "clicks": 1, "avg_position": 3},
-     {"query": "网页版", "impressions": 100, "clicks": 1, "avg_position": 3}],
+     {"query": "编辑器", "impressions": 100, "clicks": 1, "avg_position": 3}],
     min_impressions=1, script=["cjk"])["results"]) == 1)
 
 print("\nctr_underperformer: a snippet problem, not a ranking problem")

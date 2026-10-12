@@ -143,7 +143,7 @@ ok("weak/ugc pages still reported as weak", len(r["weak_results"]) >= 2, str(r["
 # A bot-challenge interstitial looks exactly like a thin page - a few words, one
 # heading - and calling it weak INVERTS the finding: it says a competitor is
 # beatable when all you learned is that they block you. Measured 2026-09-01:
-# play-cs.com (DR 35, ranking ABOVE the audited site) profiled as "thin (5 words),
+# a competitor (DR 35, ranking ABOVE the audited site) profiled as "thin (5 words),
 # no heading structure" from a page whose only heading was the word "Verification".
 ch = lambda w, h, t="": C._is_challenge({"words": w, "headings": h, "title": t})
 ok("challenge/5-word 'Verification' page", ch(5, ["Verification"]), "not detected")

@@ -14,7 +14,7 @@ quietly invents "what page 1 covers" is worse than no brief, because the draft
 written from it will be confidently wrong about the competition and nobody will
 re-check.
 
-    brief.py build --query "how to bunny hop" --our-domain example.com
+    brief.py build --query "how to wall climb" --our-domain example.com
     brief.py build --query "..." --corpus ./content --provider ddg
     brief.py build --query "..." --contract-json out.json   # reuse a profile run
     brief.py control
@@ -169,8 +169,8 @@ def corpus_overlap(query: str, corpus: str, limit: int = 400) -> dict:
         except Exception:                                          # noqa: BLE001
             continue
         # ⚠ THE SLUG IS PART OF THE SIGNAL, and leaving it out misses the most
-        # obvious page. Measured 2026-09-01: `bunny-hop.html` scored 0.0 for
-        # "how to bunny hop" because its H2s are deliberately non-keyword -
+        # obvious page. Measured 2026-09-01: `wall-climb.html` scored 0.0 for
+        # "how to wall climb" because its H2s are deliberately non-keyword -
         # "what the engine is actually doing", "the timing" - which is GOOD
         # editorial writing. A cannibalisation check that only rewards
         # keyword-stuffed headings finds the wrong pages and clears the right
@@ -186,7 +186,7 @@ def corpus_overlap(query: str, corpus: str, limit: int = 400) -> dict:
         # scores 0.04 no matter how perfectly the query is covered - the
         # threshold can never fire and every query comes back "clear".
         # Measured 2026-09-01 against 17 real guides: `how to aim better in
-        # counter strike` and `zzq nonexistent topic 9f2b` BOTH scored 0, which
+        # a shooter` and `zzq nonexistent topic 9f2b` BOTH scored 0, which
         # is a metric that cannot discriminate rather than a corpus with no
         # overlap. The question here is "how much of MY QUERY does this page
         # already cover", and that is containment.
@@ -309,11 +309,11 @@ def build(query: str, *, provider: str = "ddg", count: int = 10,
     }
     # ⚠ A CONTRACT IS ONLY AS GOOD AS THE NUMBER OF PAGES BEHIND IT, and the
     # failure is not an empty list - it is a confident one. Measured 2026-09-01
-    # on "how to bunny hop in cs 1.6": only 2 of 10 results had readable article
+    # on a game-technique query: only 2 of 10 results had readable article
     # structure, and the `gaps` list came back as `ratings, submission, score,
-    # favorite, interactions` - GameBanana and mods.vg platform furniture, read
-    # as subtopics because the UGC registry is a fixed domain list and mods.vg
-    # is not on it. Printed as "differentiators" that is an instruction to write
+    # favorite, interactions` - two mod-hosting platforms' furniture, read
+    # as subtopics because the UGC registry is a fixed domain list and one of
+    # them was not on it. Printed as "differentiators" that is an instruction to write
     # a section about somebody's ratings widget.
     #
     # Widening the domain list forever is not the fix; refusing to draw
@@ -430,9 +430,9 @@ def run_control() -> dict:
     with _tf.TemporaryDirectory() as td:
         d = Path(td)
         # This page's headings deliberately AVOID the query words - the real
-        # `bunny-hop.html` is written exactly this way, and it scored 0.0 until
+        # `wall-climb.html` is written exactly this way, and it scored 0.0 until
         # the slug was counted.
-        (d / "bunny-hop.html").write_text(
+        (d / "wall-climb.html").write_text(
             "<html><body><h2>What the engine is actually doing</h2>"
             "<p>Chaining jumps keeps speed above the run cap, and it is the "
             "movement technique every scrim player learns first.</p>"
@@ -442,13 +442,13 @@ def run_control() -> dict:
             "<p>The loss bonus decides whether a full buy is affordable next "
             "round, so the economy is really a sequencing problem.</p>"
             "</body></html>", encoding="utf-8")
-        hit = corpus_overlap("how to bunny hop", str(d))
+        hit = corpus_overlap("how to wall climb", str(d))
         miss = corpus_overlap("zzq nonexistent topic 9f2b", str(d))
         c.check("an_existing_page_for_the_query_is_found",
                 hit.get("verdict") == "existing-page-may-already-target-this",
                 str(hit)[:200])
         c.check("a_page_whose_headings_avoid_the_keyword_is_still_found",
-                any("bunny-hop" in x["file"] for x in hit.get("candidates", [])),
+                any("wall-climb" in x["file"] for x in hit.get("candidates", [])),
                 "good editorial headings must not make a page invisible to this check")
         c.check("the_matching_signal_is_reported",
                 "slug" in (hit.get("candidates") or [{}])[0].get("matched_in", []),

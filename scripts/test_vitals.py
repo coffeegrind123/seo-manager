@@ -55,11 +55,11 @@ def main() -> int:
     check("two silos stay apart",
           template_of("https://x/maps/a") != template_of("https://x/guides/a"))
     check("a locale prefix is factored out",
-          template_of("https://x/zh/maps/a") == "/{locale}/maps/*")
+          template_of("https://x/ja/maps/a") == "/{locale}/maps/*")
     check("a locale silo is not the same as the root silo",
-          template_of("https://x/zh/maps/a") != template_of("https://x/maps/a"))
+          template_of("https://x/ja/maps/a") != template_of("https://x/maps/a"))
     check("the homepage is its own template", template_of("https://x/") == "/")
-    check("a bare locale root still groups", template_of("https://x/zh/") == "/{locale}/")
+    check("a bare locale root still groups", template_of("https://x/ja/") == "/{locale}/")
 
     print("\ntiming - the defect this file shipped, caught by its own control:")
     # Timing a plain urlopen reported 5,940ms for a server that answers in 119ms;

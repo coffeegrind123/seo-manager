@@ -159,9 +159,9 @@ print("HTML mode - a generated site has no draft, only built pages")
 
 HTML_PAGE = """<!doctype html>
 <html><head>
-  <title>AWP \u2014 CS 1.6 Weapon Guide</title>
-  <meta name="description" content="The AWP \u2014 price, damage and how to play it.">
-  <script type="application/ld+json">{"headline":"AWP \u2014 Counter-Strike 1.6"}</script>
+  <title>Longbow \u2014 SR 2.4 Item Guide</title>
+  <meta name="description" content="The longbow \u2014 price, damage and how to play it.">
+  <script type="application/ld+json">{"headline":"Longbow \u2014 Star-Runner 2.4"}</script>
   <style>.cta{color:red} /* the button \u2014 orange on hover */</style>
 </head><body>
   <!-- the did-you-mean redirect \u2014 only on variant pages -->
@@ -218,14 +218,14 @@ def _tmp_corpus(pages):
         paths.append(str(f))
     return paths
 
-FOOTER = "<footer><p>Combat Skirmish \u2014 play CS 1.6 free in your browser.</p></footer>"
+FOOTER = "<footer><p>Pixel Harbor \u2014 play SR 2.4 free in your browser.</p></footer>"
 # five pages sharing a footer; one of them ALSO has three em dashes of its own.
 shared_only = [f"<p>Page {i} says something ordinary about maps.</p>{FOOTER}" for i in range(4)]
 noisy = ("<p>It costs $4750 \u2014 most of a buy \u2014 and it is slow, "
          "so a miss \u2014 any miss \u2014 leaves you helpless.</p>" + FOOTER)
 res = slop.corpus(_tmp_corpus(shared_only + [noisy]))
 check("corpus runs over the tier", res["ok"] and res["files"] == 5)
-tmpl = [t for t in res["template"] if "Combat Skirmish" in t["match"]]
+tmpl = [t for t in res["template"] if "Pixel Harbor" in t["match"]]
 check("the shared footer is reported ONCE as template", len(tmpl) == 1, str(res["template"]))
 check("and is attributed to every file", tmpl and tmpl[0]["files"] == 5)
 check("pages carrying ONLY template chrome come back clean",
@@ -238,7 +238,7 @@ check("CONTROL the page with its own em dashes is still flagged",
 # identity on `match` collapsed the whole rule into one shared row and reported
 # every page clean - the mirror image of the bug this command exists to fix.
 check("template identity keys on context, not the bare match",
-      all(t["rule"] != "em_dash" or "Combat Skirmish" in t["match"]
+      all(t["rule"] != "em_dash" or "Pixel Harbor" in t["match"]
           for t in res["template"]),
       str(res["template"]))
 check("hits carry context so a '-' hit is readable at all",

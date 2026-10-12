@@ -140,7 +140,7 @@ def run_control() -> dict:
 
     # POSITIVE: an article with guaranteed traffic. If this is empty, the reader
     # is broken - not the topic.
-    pv = pageviews("Counter-Strike", days=14)
+    pv = pageviews("Photography", days=14)
     c.check("a_known_article_returns_pageviews",
             pv.get("ok") is True and (pv.get("total") or pv.get("days") or 0),
             str(pv)[:200])
@@ -151,7 +151,7 @@ def run_control() -> dict:
     c.check("the_two_are_distinguishable", pv.get("ok") != miss.get("ok"),
             "if a real article and an impossible one answer alike, every zero is noise")
 
-    ws = wiki_search("Counter-Strike", limit=3)
+    ws = wiki_search("Photography", limit=3)
     c.check("title_resolution_returns_candidates",
             bool(ws.get("results") or ws.get("titles") or ws.get("ok")), str(ws)[:200])
     refused = [x.get("status") for x in (pv, miss, ws)
