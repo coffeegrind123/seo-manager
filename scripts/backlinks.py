@@ -73,7 +73,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from providers import registrable as _shared_registrable  # noqa: E402
+from providers import registrable as _shared_registrable, site_list  # noqa: E402
 try:
     import crawllog
 except Exception as exc:                                    # pragma: no cover
@@ -117,7 +117,7 @@ AI_HOSTS = (
 
 # A referring domain is NOT automatically a backlink, and treating it as one is
 # how this report ends up dominated by things nobody linked. Measured on
-# combatskirmish.net 2026-09-01: of 40 referring domains, 34 survived the naive
+# a live site 2026-09-01: of 40 referring domains, 34 survived the naive
 # filter and only about 5 were real - the rest were the site's OWN second domain,
 # Cloudflare IPs on cPanel ports, throwaway *.workers.dev hosts, and attack probes
 # whose forged Referer header made `wordpress.org -> /wp-login.php` look like an
@@ -136,14 +136,15 @@ PROBE_PATHS = (
 )
 
 # Landing paths that are an embed or a hotlink rather than a page visit.
-# ⚠ These are SITE-TUNED. They say nothing about a hotlink that lands on a
-# generic root asset, and a referrer arriving on `/favicon.ico` was therefore
-# classified `genuine` and counted as a backlink - an overcount of the one
-# number this instrument exists to produce. Caught 2026-09-01 by the control.
-ASSET_PREFIXES = (
-    "/frontend/", "/api/", "/mi/", "/g/", "/gr/", "/e/", "/sounds/", "/dl/",
-    "/game/", "/map-images/", "/sm/", "/m/",
-)
+# Generic defaults only; a site adds its own asset directories as
+# `asset_prefixes` in `.seo/config.json` (site_list below). They once lived here
+# as one site's paths, which every other site then inherited as "assets".
+# ⚠ Prefixes say nothing about a hotlink that lands on a generic root asset, and
+# a referrer arriving on `/favicon.ico` was therefore classified `genuine` and
+# counted as a backlink - an overcount of the one number this instrument exists
+# to produce. Caught 2026-09-01 by the control; ASSET_EXACT/SUFFIXES cover it.
+ASSET_PREFIXES = ("/api/", "/static/", "/assets/", "/_next/static/",
+                  "/wp-content/", "/wp-includes/") + site_list("asset_prefixes")
 
 # Site-independent, and kept deliberately narrow: an extension list that grew to
 # include `.html` or `.php` would start discarding real pages, which is the
@@ -221,6 +222,16 @@ def run_control() -> dict:
     from controls import Controls          # noqa: PLC0415 - see the
     # note at the top: a module-level import breaks the --remote path.
     c = Controls("backlinks-control")
+    # site asset prefixes are read from .seo/config.json, walking up from cwd
+    import tempfile as _tf
+    from providers import site_list as _sl
+    with _tf.TemporaryDirectory() as _d:
+        (Path(_d) / ".seo").mkdir()
+        (Path(_d) / ".seo" / "config.json").write_text('{"asset_prefixes": ["/media/", 7, ""]}')
+        (Path(_d) / "sub").mkdir()
+        c.check("site_asset_prefixes_read_from_config_upwards",
+                _sl("asset_prefixes", Path(_d) / "sub") == ("/media/",))
+        c.check("no_config_means_no_extras", _sl("asset_prefixes", "/") == ())
     own = {"example.com", "example.net"}
 
     def cls(host, landing="/"):
@@ -242,7 +253,7 @@ def run_control() -> dict:
     c.check("a_bare_ip_is_spam", cls("203.0.113.9", "/") == "spam")
     c.check("a_cpanel_port_is_spam", cls("someshop.test:2083", "/") == "spam")
     c.check("a_site_tuned_asset_prefix_is_not_a_backlink",
-            cls("blog.test", "/mi/de_dust2.jpg") == "asset")
+            cls("blog.test", "/media/harbor_2.jpg") == "asset")
     c.check("a_hotlinked_root_asset_is_not_a_backlink",
             cls("blog.test", "/favicon.ico") == "asset")
     c.check("an_asset_by_extension_is_not_a_backlink",
@@ -253,7 +264,7 @@ def run_control() -> dict:
     c.check("a_real_page_is_never_mistaken_for_an_asset",
             cls("blog.test", "/guides/how-to-aim.html") == "genuine")
     c.check("a_directory_page_is_never_mistaken_for_an_asset",
-            cls("blog.test", "/maps/de_dust2") == "genuine")
+            cls("blog.test", "/maps/harbor_2") == "genuine")
 
     c.check("precedence_self_beats_probe",
             cls("example.com", "/wp-login.php") == "self",

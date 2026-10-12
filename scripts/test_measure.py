@@ -20,7 +20,7 @@ The three that matter most:
      that indistinguishable from a real finding.
 
   3. Decay vs demand drop. Impressions falling while POSITION HELD is not
-     decay, and rewriting for it is wasted work. Measured live: /play fell from
+     decay, and rewriting for it is wasted work. Measured live: /app fell from
      3 impressions to 1 while its position went 42 -> 1.
 
     python3 test_measure.py
@@ -115,7 +115,7 @@ CADDY_LINE = json.dumps({
     "ts": 1785576366.23,
     "request": {
         "remote_ip": "127.0.0.1", "client_ip": "127.0.0.1", "method": "GET",
-        "host": "example.com", "uri": "/maps/de_dust2",
+        "host": "example.com", "uri": "/maps/harbor_2",
         "headers": {
             "User-Agent": [UAS["googlebot"]],
             "Cf-Connecting-Ip": ["66.249.66.1"],
@@ -128,7 +128,7 @@ CADDY_LINE = json.dumps({
     "status": 200, "size": 5120, "duration": 0.01,
 })
 
-CLF_LINE = ('66.249.66.1 - - [01/Aug/2026:10:00:00 +0000] "GET /maps/de_dust2 HTTP/1.1" '
+CLF_LINE = ('66.249.66.1 - - [01/Aug/2026:10:00:00 +0000] "GET /maps/harbor_2 HTTP/1.1" '
             '200 5120 "https://news.ycombinator.com/" "%s"' % UAS["googlebot"])
 
 
@@ -144,7 +144,7 @@ def test_parsers():
     check("status/size read", (rec["status"], rec["size"]) == (200, 5120))
 
     auto = crawllog.make_parser("auto", None, None)
-    check("auto-detect handles the caddy line", auto(CADDY_LINE)["uri"] == "/maps/de_dust2")
+    check("auto-detect handles the caddy line", auto(CADDY_LINE)["uri"] == "/maps/harbor_2")
     clf = auto(CLF_LINE)
     check("auto-detect handles a combined line", clf is not None and clf["status"] == 200)
     check("combined referer extracted", clf and "ycombinator" in clf["referer"], clf and clf["referer"])
@@ -153,12 +153,12 @@ def test_parsers():
 
 def test_silo():
     print("\nsilo bucketing:")
-    check("depth 1 groups a deep path", crawllog.silo_of("/maps/de_dust2", 1) == "/maps/*")
+    check("depth 1 groups a deep path", crawllog.silo_of("/maps/harbor_2", 1) == "/maps/*")
     check("depth 2 keeps two segments",
-          crawllog.silo_of("/es/maps/de_dust2", 2) == "/es/maps/*")
+          crawllog.silo_of("/es/maps/harbor_2", 2) == "/es/maps/*")
     check("an asset is bucketed as an asset regardless of depth",
-          crawllog.silo_of("/mi/de_dust2.jpg", 1) == "/mi/ (assets)",
-          crawllog.silo_of("/mi/de_dust2.jpg", 1))
+          crawllog.silo_of("/media/harbor_2.jpg", 1) == "/media/ (assets)",
+          crawllog.silo_of("/media/harbor_2.jpg", 1))
     check("a query string does not create a new silo",
           crawllog.silo_of("/maps/x?t=abc", 1) == "/maps/*")
     check("root stays root", crawllog.silo_of("/", 1) == "/")
@@ -223,8 +223,8 @@ def test_referrer_classification():
     check("a private LAN address is dev traffic", backlinks.is_local("192.168.1.10"))
     # CONTROL: the filters must not eat real referrers.
     check("CONTROL - a real referrer survives both filters",
-          not backlinks.is_local("sbox.facepunch.com")
-          and not any(s in "sbox.facepunch.com" for s in backlinks.SEARCH_HOSTS))
+          not backlinks.is_local("api.toolhost.example")
+          and not any(s in "api.toolhost.example" for s in backlinks.SEARCH_HOSTS))
     check("CONTROL - reddit survives", not backlinks.is_local("reddit.com")
           and not any(s in "reddit.com" for s in backlinks.SEARCH_HOSTS))
     check("host_of strips www", backlinks.host_of("https://www.example.com/x") == "example.com")

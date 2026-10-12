@@ -185,7 +185,7 @@ BOTS = [
     # --- Added 2026-09-01, each MEASURED in this site's own access log ------
     # Found by classifying every distinct UA through classify_ua() and reading
     # what landed in `other-bot`, rather than by guessing which engines exist.
-    # Hit counts are from combatskirmish.net, 2026-08-31..09-01.
+    # Hit counts are from one live site, 2026-08-31..09-01.
     #
     # ⚠ Verification domains are LEFT EMPTY where the operator publishes no
     # documented rDNS suffix. A guessed suffix does not fail quietly - it makes
@@ -302,11 +302,44 @@ CATEGORY_ORDER = ["search", "ai_search", "ai_user", "ai_training", "social",
 # Paths that are never an indexable page. Crawl spent here is not necessarily
 # waste (an image crawl can be entirely legitimate) but it is not page-crawl
 # budget, and separating the two is the whole point of the report.
-ASSET_RE = re.compile(
-    r"\.(?:js|mjs|css|map|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|eot|mp4|webm|"
-    r"mp3|ogg|wav|wasm|zip|gz|br|bsp|wad|spr|mdl|pak|data|bin)(?:$|\?)",
-    re.I,
-)
+# Generic web/media formats only. A site's own binary formats (a game's level and
+# model files, a CAD viewer's meshes) go in `.seo/config.json` as
+# `asset_extensions`; they were once hardcoded here for one site.
+_ASSET_EXT = ["js", "mjs", "css", "map", "png", "jpe?g", "gif", "webp", "avif", "svg", "ico",
+              "woff2?", "ttf", "eot", "mp4", "webm", "mp3", "ogg", "wav", "wasm", "zip", "gz",
+              "br", "data", "bin"]
+
+
+def _asset_re(extra=()) -> "re.Pattern":
+    ext = _ASSET_EXT + [re.escape(e.lstrip(".")) for e in extra]
+    return re.compile(r"\.(?:" + "|".join(ext) + r")(?:$|\?)", re.I)
+
+
+def _site_list(key: str) -> list[str]:
+    """`.seo/config.json` -> key, walking up from the working directory; [] if absent.
+    Self-contained ON PURPOSE (no `providers` import): this file is shipped alone
+    to a remote host for `--remote`, where no sibling module exists - see the
+    lazy-import note below. The remote side gets the resolved list as
+    `--asset-ext` arguments instead (run_remote)."""
+    here = Path(".").resolve()
+    for d in (here, *here.parents):
+        f = d / ".seo" / "config.json"
+        if f.is_file():
+            try:
+                v = json.loads(f.read_text(encoding="utf-8")).get(key) or []
+            except Exception:
+                return []
+            return [str(x) for x in v if isinstance(x, str) and x.strip()]
+    return []
+
+
+ASSET_RE = _asset_re(_site_list("asset_extensions"))
+
+
+def set_asset_extensions(extra) -> None:
+    """Rebuild ASSET_RE with explicit extras (the --asset-ext flag)."""
+    global ASSET_RE
+    ASSET_RE = _asset_re(extra)
 
 
 # Which COMPANY operates each crawler. Used only by detect_ua_spoofing() below.
@@ -501,10 +534,16 @@ def run_control() -> dict:
     from controls import Controls          # noqa: PLC0415 - see the
     # note at the top: a module-level import breaks the --remote path.
     c = Controls("crawllog-control")
+    # site asset formats come from config/flags, not from this file
+    c.check("asset_ext_default_is_generic", not _asset_re([]).search("/x/level.lvl"))
+    c.check("asset_ext_extra_is_honoured",
+            bool(_asset_re(["lvl", ".mesh"]).search("/x/level.lvl"))
+            and bool(_asset_re(["lvl", ".mesh"]).search("/x/a.mesh?v=2")))
+    c.check("asset_ext_does_not_swallow_pages", not _asset_re(["lvl"]).search("/guides/levels"))
 
     line = json.dumps({
         "ts": 1756684800.0, "status": 200, "size": 5120, "duration": 0.03,
-        "request": {"method": "GET", "uri": "/maps/de_dust2", "host": "x.test",
+        "request": {"method": "GET", "uri": "/maps/harbor_2", "host": "x.test",
                     "client_ip": "127.0.0.1:44322", "remote_ip": "127.0.0.1",
                     "headers": {"User-Agent": ["Mozilla/5.0 (compatible; Googlebot/2.1)"],
                                 "Cf-Connecting-Ip": ["203.0.113.9"],
@@ -514,7 +553,7 @@ def run_control() -> dict:
     c.check("json_log_line_parses", r is not None,
             "a parser that returns None for every line reports zero crawl activity")
     if r:
-        c.check("uri_is_read", r["uri"] == "/maps/de_dust2", str(r.get("uri")))
+        c.check("uri_is_read", r["uri"] == "/maps/harbor_2", str(r.get("uri")))
         c.check("real_client_ip_beats_the_proxy_hop", r["ip"] == "203.0.113.9",
                 f"got {r['ip']} - 127.0.0.1 means every per-IP figure is one bucket")
         c.check("status_is_an_int", r["status"] == 200)
@@ -893,7 +932,7 @@ def silo_of(uri: str, depth: int) -> str:
         return "/"
     if ASSET_RE.search(path):
         # Bucket assets by their FIRST segment regardless of depth - the useful
-        # question is "how much went to /mi/", not which image.
+        # question is "how much went to /media/", not which image.
         return "/" + parts[0] + "/ (assets)"
     take = parts[:depth]
     out = "/" + "/".join(take)
@@ -964,6 +1003,8 @@ def no_input_error(a) -> dict:
 
 
 def cmd_scan(a):
+    if a.asset_ext is not None:
+        set_asset_extensions(a.asset_ext)
     if a.remote:
         return run_remote(a)
 
@@ -1264,6 +1305,9 @@ def run_remote(a):
              "--max-urls", str(a.max_urls), "--format", a.format]
     if a.regex:
         args += ["--regex", a.regex]
+    # the remote copy cannot see this site's .seo/config.json - send the list
+    for e in (a.asset_ext if a.asset_ext is not None else _site_list("asset_extensions")):
+        args += ["--asset-ext", e]
 
     cmd = ssh_cmd(a, args)
     try:
@@ -1823,8 +1867,8 @@ def cmd_gap2(a):
             "entries carry no query, so the comparison has to be path-to-path. A large "
             "count on one path may be one URL fetched often OR thousands of parameterised "
             "URLs, and those have opposite fixes. Re-run `urls --keep-query` before "
-            "reading it as a budget figure. Measured 2026-09-01: `/play 506` was 503 "
-            "`/play?connect=` variants and 3 bare fetches."),
+            "reading it as a budget figure. Measured 2026-09-01: `/app 506` was 503 "
+            "`/app?connect=` variants and 3 bare fetches."),
         "most_crawled_in_sitemap": [{"hits": n, "url": u} for n, u in hit[: a.top]],
         "reading": "never_crawled = the sitemap promises a page the bot has not fetched in this window; "
                    "at scale that is a crawl-budget problem, not an indexing one. "
@@ -1841,6 +1885,9 @@ def add_input_args(s):
     s.add_argument("--format", default="auto",
                    choices=["auto", "caddy", "json", "combined", "common", "regex"])
     s.add_argument("--regex", help="custom line regex with named groups (--format regex)")
+    s.add_argument("--asset-ext", action="append", default=None,
+                   help="a site-specific asset file extension (repeatable); default: "
+                        "`asset_extensions` in .seo/config.json")
     s.add_argument("--fields", nargs="*", help="field names for an unnamed --regex")
     s.add_argument("--days", type=int, help="only lines from the last N days")
     s.add_argument("--remote", help="user@host - ships this file over ssh and aggregates THERE")
@@ -1882,7 +1929,7 @@ def main():
     # OFF by default because `gap` compares against sitemap <loc> paths, which
     # carry no query - stripping is correct THERE. It is not correct when you
     # are reading the hit counts as a budget figure: measured 2026-09-01, `gap`
-    # reported `/play  506` for bingbot and 503 of those were `/play?connect=`
+    # reported `/app  506` for bingbot and 503 of those were `/app?connect=`
     # variants, blocked by a robots.txt rule that had shipped that same day. One
     # collapsed row supported two opposite conclusions and the output could not
     # tell them apart. Re-run with this flag before believing a single-path total.

@@ -27,7 +27,7 @@ def check(name, cond):
         FAILS.append(name)
 
 
-OWN = {"combatskirmish.net", "cs16.net"}
+OWN = {"oursite.example", "oursite-alt.net"}
 
 
 def c(host, landing):
@@ -41,10 +41,10 @@ check("-> /.env is a probe",                        c("example.com", "/.env") ==
 check("but wordpress.org -> / is GENUINE",          c("wordpress.org", "/") == "genuine")
 
 print("\n2. a second owned domain is self, at any subdomain or port")
-check("cs16.net",              c("cs16.net", "/") == "self")
-check("ms.cs16.net:27010",     c("ms.cs16.net:27010", "/ring") == "self")
-check("cs16.net:443",          c("cs16.net:443", "/") == "self")
-check("trailing-dot form",     c("cs16.net.", "/") == "self")
+check("oursite-alt.net",       c("oursite-alt.net", "/") == "self")
+check("ms.oursite-alt.net:9000", c("ms.oursite-alt.net:9000", "/ring") == "self")
+check("oursite-alt.net:443",   c("oursite-alt.net:443", "/") == "self")
+check("trailing-dot form",     c("oursite-alt.net.", "/") == "self")
 check("an unrelated .net is NOT self", c("someothersite.net", "/") == "genuine")
 
 print("\n3. referrer spam")
@@ -55,19 +55,19 @@ check("throwaway workers.dev", c("odd-block-9da6.e0yddn00.workers.dev", "/") == 
 check("a normal port is NOT spam", c("forum.example.com", "/") == "genuine")
 
 print("\n4. hotlinked assets are not page visits")
-check("apple-touch-icon",      c("1milliontaps.lol", "/frontend/assets/apple-touch-icon.png") == "asset")
-check("an API endpoint",       c("sbox.facepunch.com", "/api/random-name") == "asset")
-check("a map image",           c("someblog.com", "/mi/de_dust2.jpg") == "asset")
+check("apple-touch-icon",      c("clicker.example", "/frontend/assets/apple-touch-icon.png") == "asset")
+check("an API endpoint",       c("api.toolhost.example", "/api/random-name") == "asset")
+check("a map image",           c("someblog.com", "/media/harbor_2.jpg") == "asset")
 
 print("\n5. the real links survive - the whole point")
 check("reddit.com -> /",       c("reddit.com", "/") == "genuine")
-check("seedhub.cc -> /zh/",    c("seedhub.cc", "/zh/") == "genuine")
+check("linkhub.example -> /ja/", c("linkhub.example", "/ja/") == "genuine")
 check("steamcommunity.com",    c("steamcommunity.com", "/") == "genuine")
-check("a guide landing",       c("somegamingsite.com", "/guides/bunny-hop") == "genuine")
+check("a guide landing",       c("somegamingsite.com", "/guides/wall-climb") == "genuine")
 
 print("\n6. precedence: self beats probe, probe beats asset")
 check("own domain hitting a probe path is self, not probe",
-      c("cs16.net", "/wp-login.php") == "self")
+      c("oursite-alt.net", "/wp-login.php") == "self")
 check("a probe on an asset-looking path is still a probe",
       c("evil.example", "/vendor/phpunit") == "probe")
 
@@ -78,7 +78,7 @@ check("ya.ru is a search engine, not a link (the `yandex.` prefix misses it)", i
 check("kagi.com is a search engine", is_search("kagi.com"))
 check("yandex.ru still matches",     is_search("yandex.ru"))
 check("CONTROL: a real referrer is NOT matched as search", not is_search("reddit.com"))
-check("CONTROL: seedhub.cc is NOT matched as search",      not is_search("seedhub.cc"))
+check("CONTROL: linkhub.example is NOT matched as search", not is_search("linkhub.example"))
 
 print("\n7. every referrers flag survives the --remote round trip")
 # A --remote run reconstructs the argv by hand, so a flag added to the parser and
@@ -123,7 +123,7 @@ with _tf.TemporaryDirectory() as td:
     saved = Path(td) / "ref.json"
     saved.write_text(out.stdout)
     import backlinks as _bl
-    sm = ["https://oursite.test/guides/old-guide-2026", "https://oursite.test/maps/dust2"]
+    sm = ["https://oursite.test/guides/old-guide-2026", "https://oursite.test/maps/harbor"]
     def fake_chain(u):
         return [{"url": u, "status": 404, "location": None, "error": None}]
     rec = _bl.reclaim_rows(d["reclaim_candidates"], "https://oursite.test", sm, chain=fake_chain)

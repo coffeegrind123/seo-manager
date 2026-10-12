@@ -277,7 +277,7 @@ def _probe_tranco():
 
 
 def _probe_gdelt():
-    r = http("https://api.gdeltproject.org/api/v2/doc/doc?query=" + urllib.parse.quote('"counter strike"') +
+    r = http("https://api.gdeltproject.org/api/v2/doc/doc?query=" + urllib.parse.quote('"climate change"') +
              "&mode=timelinevol&format=json&timespan=3m", retries=2, backoff=5)
     tl = (r.json() or {}).get("timeline") or []
     n = len(tl[0].get("data", [])) if tl else 0
@@ -285,7 +285,7 @@ def _probe_gdelt():
 
 
 def _probe_google_news():
-    r = http("https://news.google.com/rss/search?q=" + urllib.parse.quote("counter strike") +
+    r = http("https://news.google.com/rss/search?q=" + urllib.parse.quote("climate change") +
              "&hl=en-US&gl=US&ceid=US:en", ua=BROWSER_UA)
     n = (r.get("body") or b"").count(b"<item>")
     return n > 0, f"{r.get('status')} items={n}", None
@@ -293,7 +293,7 @@ def _probe_google_news():
 
 def _probe_wikidata():
     r = http("https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&language=en&limit=5&search=" +
-             urllib.parse.quote("Counter-Strike"))
+             urllib.parse.quote("Photography"))
     n = len((r.json() or {}).get("search", []))
     c = http("https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&language=en&limit=5&search=zqxjkvwprtlnonsense")
     cn = len((c.json() or {}).get("search", []))
@@ -371,7 +371,7 @@ def _probe_marginalia():
     # None), not an HTTP code - a small independent index on modest hardware.
     # Measured: one probe failed outright, three curls seconds later all
     # answered 200. A single-shot probe reports it dead about 1 run in 10.
-    r = http("https://api.marginalia.nu/public/search/" + urllib.parse.quote("counter strike"),
+    r = http("https://api.marginalia.nu/public/search/" + urllib.parse.quote("photography"),
              retries=2, backoff=3, timeout=40)
     n = len((r.json() or {}).get("results", [])) if isinstance(r.json(), dict) else 0
     return n > 0, f"{r.get('status')} n={n}", None
@@ -667,3 +667,35 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ------------------------------------------------------------ site config
+def site_config(start=None) -> dict:
+    """The site's `.seo/config.json`, found by walking up from `start` (default:
+    the working directory), or {} when there is none.
+
+    SITE-SPECIFIC LISTS LIVE THERE, NEVER IN THIS SKILL. A site's own asset paths
+    (`/media/`, `/cdn/`) and its own file formats are facts about that site; once
+    they were hardcoded here, and every other site inherited one project's paths
+    as "assets". Keys read today: `asset_prefixes` (backlinks.py, crawllog.py
+    callers) and `asset_extensions` (crawllog.py), both lists of strings.
+    A malformed file is treated as absent rather than raised: these are additive
+    extras on top of generic defaults, never the only signal."""
+    from pathlib import Path as _P
+    import json as _json
+    here = _P(start or ".").resolve()
+    for d in (here, *here.parents):
+        f = d / ".seo" / "config.json"
+        if f.is_file():
+            try:
+                cfg = _json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+            return cfg if isinstance(cfg, dict) else {}
+    return {}
+
+
+def site_list(key: str, start=None) -> tuple[str, ...]:
+    v = site_config(start).get(key) or []
+    return tuple(str(x) for x in v if isinstance(x, str) and x.strip())
+
