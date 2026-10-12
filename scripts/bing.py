@@ -12,12 +12,20 @@ worrying about.
              demand verdict - see the coverage note below
   expand     related keywords WITH impressions - keyword research with numbers
   backlinks  inbound links, by count and by source URL
-  queries    the queries this site actually appears for on Bing
+  queries    the queries this site actually appears for on Bing - one row per
+             query per WEEK, dated, plus `by_query` (one row per query, totals
+             and impression-weighted position). `--q` / `--contains` return one
+             query's weekly series in date order: the only way to tell a trend
+             from the same query counted ten times
   pages      per-PAGE impressions, clicks and CTR - WHICH URL earns. `queries`
              cannot answer that, and the two have opposite fixes: a locale page
              ranking for its own language is a win to extend, the homepage
              ranking for that language is a targeting bug
   pagequeries  the queries ONE page appears for - attribution for the above
+  cannibal   for a set of pages, every query x URL pair: which URLs share a
+             query (`split`), which named owner page is missing from one
+             (`owner_absent`), and which queries sit at positions 7-11
+             (`edge_of_page`), where URL rotation drops a site off page 1
   urlinfo    Bing's own index record for ONE url - discovered, last crawled,
              size. The Bing counterpart to Google's URL Inspection, and the
              one that matters where Bing carries the traffic. ⚠ a URL that
@@ -70,9 +78,9 @@ genuinely valuable:
 
 ⚠ `known_to_bing: false` MEANS "Bing's keyword database has no row for this
 string" - it does NOT mean the query is small, and it must never be used as a
-demand gate. Measured 2026-09-01 on us/en-US over 90 days: `cs 1.6 non steam`
-returned exact = **2**, while `cs 1.6 config`, `cs 1.6 wallhack` and
-`cs 1.6 servers list` - all plainly larger - returned nothing at all. An endpoint
+demand gate. Measured 2026-09-01 on us/en-US over 90 days: one long-tail query
+returned exact = **2**, while three sibling queries on the same head term - all
+plainly larger - returned nothing at all. An endpoint
 that reports 2 for one query and nothing for bigger ones is not thresholding by
 volume; its coverage is patchy. So an unknown query is UNMEASURED, which is a
 different state from "no demand" and belongs on the "cannot ask" side of the
@@ -90,6 +98,7 @@ import json
 import re
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -315,6 +324,13 @@ def run_control() -> dict:
     ranking, and a `--days` that four endpoints silently ignore so 7d and 30d
     come back byte-identical - which reads as "positions did not move"."""
     c = Controls("bing-control")
+    # pages: weekly positions are impression-weighted. #2 at 3,000 impressions and
+    # #40 at 3 -> (2*3000 + 40*3) / 3003 = 2.04, not the plain mean 21.0.
+    c.check("pages_position_is_impression_weighted",
+            page_position([(2.0, 3000), (40.0, 3)]) == 2.0, page_position([(2.0, 3000), (40.0, 3)]))
+    c.check("pages_position_all_zero_impressions_falls_back_to_mean",
+            page_position([(4.0, 0), (6.0, 0)]) == 5.0)
+    c.check("pages_position_empty_is_none_not_zero", page_position([]) is None)
 
     c.check("site_url_is_normalised_with_a_scheme_and_slash",
             _norm_site("example.com") == "https://example.com/",
@@ -359,17 +375,17 @@ def run_control() -> dict:
     # of the clicks came SECOND by impressions. Sorting by the wrong column does
     # not error - it just answers a different question.
     rows = [{"url": "/", "impressions": 33403, "clicks": 716},
-            {"url": "/zh/", "impressions": 8522, "clicks": 2298}]
+            {"url": "/ja/", "impressions": 8522, "clicks": 2298}]
     by_clicks = sorted(rows, key=lambda x: x["clicks"], reverse=True)[0]["url"]
     by_imps = sorted(rows, key=lambda x: x["impressions"], reverse=True)[0]["url"]
     c.check("clicks_and_impressions_really_do_invert", by_clicks != by_imps)
-    c.check("the_reference_ranking_is_by_clicks", by_clicks == "/zh/",
+    c.check("the_reference_ranking_is_by_clicks", by_clicks == "/ja/",
             "if this ever changes, the fixture is wrong, not the tool")
 
     # --days must be REFUSED where the endpoint has no date range, not ignored.
     c.check("days_is_honoured_only_where_the_endpoint_has_a_window",
             set(WINDOWED) == {"keyword", "expand"}, f"got {sorted(WINDOWED)}")
-    for cmd in ("queries", "pages", "pagequeries", "traffic"):
+    for cmd in ("queries", "pages", "pagequeries", "traffic", "cannibal"):
         c.check(f"days_is_refused_on_{cmd}", cmd not in WINDOWED)
 
     # THE CRAWL-STATS COLUMN KINDS. Summing a running total is the arithmetic
@@ -417,6 +433,125 @@ def run_control() -> dict:
             == ["https://a/x", "https://a/y"])
     c.check("an_empty_list_stays_empty", _read_url_list([], None) == [])
 
+    # THE WEEKLY QUERY ROWS. One row per query per week; dropping the date made a
+    # flat ten-week ranking look like ten queries. Dates are derived, not copied:
+    # 2026-08-23T00:00Z is 1787443200 s (above), so 2026-08-07 is 16 days earlier,
+    # 1787443200 - 16*86400 = 1786060800, and each later week adds 604800.
+    W1, W2, W3 = "/Date(1786060800000)/", "/Date(1786665600000)/", "/Date(1787270400000)/"
+    raw = [  # deliberately NOT in date order
+        {"Query": "blue widget", "Date": W2, "Impressions": 300, "Clicks": 6,
+         "AvgImpressionPosition": 8, "AvgClickPosition": -1},
+        {"Query": "blue widget", "Date": W1, "Impressions": 100, "Clicks": 2,
+         "AvgImpressionPosition": 6, "AvgClickPosition": -1},
+        {"Query": "blue widget", "Date": W3, "Impressions": 100, "Clicks": 2,
+         "AvgImpressionPosition": 7, "AvgClickPosition": -1},
+        {"Query": "red widget", "Date": W3, "Impressions": 50, "Clicks": 5,
+         "AvgImpressionPosition": 3, "AvgClickPosition": 2},
+    ]
+    wk = _weekly(raw)
+    c.check("the_week_dates_decode_as_derived",
+            sorted({r["date"] for r in wk}) == ["2026-08-07", "2026-08-14", "2026-08-21"],
+            str(sorted({r["date"] for r in wk})))
+    c.check("every_weekly_row_keeps_its_date", all(r["date"] for r in wk))
+    c.check("click_position_minus_one_is_missing_even_with_clicks",
+            all(r["avg_click_position"] is None for r in wk if r["query"] == "blue widget"),
+            "measured: -1 on 951 of 951 rows, 786 of them with clicks > 0")
+    c.check("CONTROL_a_real_click_position_is_kept",
+            [r["avg_click_position"] for r in wk if r["query"] == "red widget"] == [2])
+    sm = _summarise(wk)
+    blue = sm["blue widget"]
+    c.check("weekly_rows_aggregate_to_one_row_per_query", len(sm) == 2, str(sorted(sm)))
+    c.check("impressions_and_clicks_are_summed_over_weeks",
+            (blue["impressions"], blue["clicks"]) == (500, 10), str(blue))
+    # (6*100 + 8*300 + 7*100) / 500 = 3700/500 = 7.4; the plain mean of 6, 8, 7 is 7.0.
+    c.check("position_is_impression_weighted_not_a_plain_mean",
+            blue["avg_position"] == 7.4, str(blue["avg_position"]))
+    c.check("weeks_and_span_are_reported",
+            (blue["weeks"], blue["first_date"], blue["last_date"])
+            == (3, "2026-08-07", "2026-08-21"), str(blue))
+    c.check("first_last_best_worst_week_positions",
+            (blue["position_first_week"], blue["position_last_week"],
+             blue["position_best"], blue["position_worst"]) == (6, 7, 6, 8), str(blue))
+    c.check("a_series_is_in_date_order_whatever_order_bing_sent",
+            [p["avg_position"] for p in _series([r for r in wk if r["query"] == "blue widget"])]
+            == [6, 8, 7])
+    dup = _summarise(_weekly(raw + [dict(raw[0], Impressions=100, AvgImpressionPosition=12)]))
+    # A second row for the 08-14 week: 300@8 + 100@12 -> 400 imps at 3600/400 = 9.0 that week.
+    c.check("a_split_week_is_summed_and_counted_not_shown_as_another_week",
+            dup["blue widget"]["weeks"] == 3 and dup["blue widget"]["same_week_rows"] == 2
+            and dup["blue widget"]["impressions"] == 600, str(dup["blue widget"]))
+    c.check("a_split_week_merges_its_position_impression_weighted",
+            [pt["avg_position"] for pt in _series(_weekly(raw + [dict(raw[0], Impressions=100,
+                                                   AvgImpressionPosition=12)]))
+             if pt["date"] == "2026-08-14"] == [9.0], "300@8 + 100@12 -> 9.0, a plain mean says 10")
+    c.check("exact_match_is_case_insensitive",
+            _match_queries(wk, exact="Blue Widget") == ["blue widget"])
+    c.check("exact_match_does_not_fall_back_to_substring",
+            _match_queries(wk, exact="widget") == [])
+    c.check("contains_matches_every_query_with_the_substring",
+            _match_queries(wk, contains="widget") == ["blue widget", "red widget"])
+    qs_ = _query_series("https://example.com/", wk, "widget", None, 10)
+    c.check("an_unmatched_query_says_unmeasured_not_zero",
+            qs_["matched"] == 0 and "NOT zero demand" in qs_.get("empty_means", ""))
+
+    # CANNIBALISATION. Expected values worked by hand:
+    #   "widget pricing": /a 400@8 (wk1) + 200@11 (wk2) = 600 at (3200+2200)/600 = 9.0
+    #                     /b 300@10 (wk2); /c 100@15 (wk1); total 1000
+    #                     shares .6/.3/.1 -> 3 URLs at >= .10 -> split
+    #                     best 9.0 in [7, 11] -> edge_of_page
+    #                     owner "pricing" -> /pricing measured with NO rows -> owner_absent
+    #                     wk1 leader /a (400 > 100), wk2 leader /b (300 > 200) -> 1 change
+    #   "widget guide":   /guide only, 500@3, owner present -> no flag
+    #   "widget":         /a 95@4, /b 5@12 -> /b share .05 -> no split; best 4 -> no flag
+    def pq(*rows):
+        return _weekly([{"Query": q, "Date": d, "Impressions": i, "Clicks": 0,
+                         "AvgImpressionPosition": p, "AvgClickPosition": -1} for q, d, i, p in rows])
+    A = {"https://example.com/a": pq(("widget pricing", W1, 400, 8), ("widget pricing", W2, 200, 11),
+                                     ("widget", W1, 95, 4)),
+         "https://example.com/b": pq(("widget pricing", W2, 300, 10), ("widget", W1, 5, 12)),
+         "https://example.com/c": pq(("widget pricing", W1, 100, 15)),
+         "https://example.com/guide": pq(("widget guide", W1, 500, 3)),
+         "https://example.com/pricing": []}
+    OWN = {"pricing": "https://example.com/pricing", "guide": "https://example.com/guide"}
+    ca = _cannibal_core(A, OWN)
+    fd = {f["query"]: f for f in ca["findings"]}
+    c.check("only_the_cannibalised_query_is_a_finding", sorted(fd) == ["widget pricing"], str(sorted(fd)))
+    wp = fd.get("widget pricing", {})
+    c.check("split_owner_absent_and_edge_all_fire",
+            set(wp.get("flags", [])) == {"split", "owner_absent", "edge_of_page"}, str(wp.get("flags")))
+    c.check("the_split_names_all_three_urls_at_the_boundary_share",
+            len(wp.get("split_urls", [])) == 3, "a share of exactly min_share counts")
+    c.check("per_url_position_is_impression_weighted",
+            [u["avg_position"] for u in wp.get("urls", [])][:1] == [9.0], str(wp.get("urls")))
+    c.check("the_query_total_spans_urls", wp.get("impressions") == 1000)
+    c.check("a_rotation_between_weeks_is_counted", wp.get("leader_changes") == 1,
+            str(wp.get("weekly_leaders")))
+    c.check("the_summary_counts_each_flag_once", ca["summary"] ==
+            {"split": 1, "owner_absent": 1, "edge_of_page": 1}, str(ca["summary"]))
+    tight = _cannibal_core(A, OWN, min_share=0.35)
+    c.check("min_share_is_tunable_and_a_lone_holder_is_not_a_split",
+            "split" not in tight["findings"][0]["flags"] and tight["summary"]["split"] == 0)
+    B = {"https://example.com/x": pq(("alpha tool", W1, 200, 2)),
+         "https://example.com/y": pq(("beta tool", W1, 300, 3))}
+    cb = _cannibal_core(B, {})
+    c.check("CONTROL_distinct_pages_for_distinct_queries_report_nothing",
+            cb["findings"] == [] and cb["queries_checked"] == 2, str(cb))
+    un = _cannibal_core({"https://example.com/a": A["https://example.com/a"],
+                         "https://example.com/pricing": None}, {"pricing": "https://example.com/pricing"})
+    c.check("an_owner_that_could_not_be_asked_is_unmeasured_never_absent",
+            un["summary"]["owner_absent"] == 0 and un["unmeasured_pages"] == ["https://example.com/pricing"])
+    c.check("an_owner_never_asked_is_not_absent",
+            _cannibal_core({"https://example.com/a": A["https://example.com/a"]},
+                           {"pricing": "https://example.com/pricing"})["summary"]["owner_absent"] == 0)
+    c.check("an_owner_phrase_matches_words_not_substrings",
+            _phrase_in("guide", "widget guide") and not _phrase_in("guide", "widget guidelines"))
+    edge = lambda p: _cannibal_core({"https://example.com/e": pq(("q", W1, 50, p))})["summary"]["edge_of_page"]
+    c.check("edge_of_page_is_7_to_11_inclusive",
+            (edge(6.99), edge(7), edge(11), edge(11.01)) == (0, 1, 1, 0))
+    c.check("a_query_below_min_impressions_is_not_judged",
+            _cannibal_core({"https://example.com/a": pq(("thin", W1, 5, 9)),
+                            "https://example.com/b": pq(("thin", W1, 4, 9))})["queries_checked"] == 0)
+
     # A key is not needed to run this control, and its ABSENCE must be reported
     # as "cannot ask", never folded into a data verdict.
     k = read_key()
@@ -434,9 +569,9 @@ def urlinfo(key, site, url):
 
     ⚠ THE TRAP THIS WRAPS. Bing answers ok:true for a URL THAT DOES NOT EXIST,
     with exactly the same all-sentinel payload it returns for a real page it has
-    never seen. Measured 2026-09-01 on combatskirmish.net: /guides/bunny-hop (a
-    live 200) and /does-not-exist-zzz were byte-identical - both DateTime.MinValue
-    on each date, DocumentSize 0 - while /maps/de_dust2 carried a real discovery
+    never seen. Measured 2026-09-01 on a live site: a guide page (a live 200) and
+    /does-not-exist-zzz were byte-identical - both DateTime.MinValue on each date,
+    DocumentSize 0 - while an older page on the same site carried a real discovery
     and crawl date. So `known_to_bing: false` says "Bing has no record of this
     string", never "this page exists and Bing declined it", and the two are
     different findings. Always carry a URL you KNOW is crawled as a control.
@@ -477,37 +612,233 @@ def urlinfo(key, site, url):
     }
 
 
-def queries(key, site, limit):
+# --------------------------------------------------------------------------
+# The WEEKLY shape of the query endpoints.
+#
+# Measured 2026-10-12 on a live account: GetQueryStats returned 951 rows for 358
+# distinct queries - ten rows for the busiest - and every (query, Date) pair was
+# unique. The rows are one per query per WEEK (ten Friday-dated weeks), not one per
+# market. GetPageQueryStats has the identical shape. Dropping `Date` and sorting by
+# impressions printed one query ten times with no way to tell a trend from a
+# duplicate: positions that sat flat at 6-8 for ten weeks were indistinguishable
+# from ten separate queries.
+#
+# ⚠ AvgClickPosition is NOT a position. It was -1 on all 951 rows - INCLUDING the
+# 786 rows with clicks > 0 - so "-1 means no click" does not even hold. It is
+# surfaced as None whenever it is not a positive number and must never be read as
+# a rank. The weekly rank is AvgImpressionPosition.
+# --------------------------------------------------------------------------
+
+def _pos(v):
+    """A Bing position field: a positive number, or None for any sentinel (-1, 0)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return v if v > 0 else None
+
+
+def _weekly(rows):
+    """Bing query rows -> dated rows in this script's shape. Rows without a query
+    are dropped; rows without a decodable date are KEPT with date None, because a
+    dropped row would silently understate a total."""
+    out = []
+    for x in rows or []:
+        q = x.get("Query")
+        if not q:
+            continue
+        out.append({
+            "query": q,
+            "date": _dotnet_date(x.get("Date")),
+            "impressions": x.get("Impressions") or 0,
+            "clicks": x.get("Clicks") or 0,
+            "avg_position": _pos(x.get("AvgImpressionPosition")),
+            "avg_click_position": _pos(x.get("AvgClickPosition")),
+        })
+    return out
+
+
+def _by_date(rows):
+    """Collapse rows to one point per date, position impression-weighted.
+
+    One row per (query, date) is what was measured, so this is normally the
+    identity. It exists so that the day Bing starts splitting a week (by market,
+    device, anything) the total stays right and the split is COUNTED - see
+    `same_week_rows` - rather than appearing as a second week."""
+    pts = {}
+    for r in rows:
+        d = pts.setdefault(r["date"], {"date": r["date"], "impressions": 0, "clicks": 0,
+                                       "_w": 0.0, "_wi": 0, "_n": 0})
+        d["impressions"] += r["impressions"]
+        d["clicks"] += r["clicks"]
+        d["_n"] += 1
+        if r["avg_position"] is not None and r["impressions"] > 0:
+            d["_w"] += r["avg_position"] * r["impressions"]
+            d["_wi"] += r["impressions"]
+    out = []
+    for d in pts.values():
+        w, wi, n = d.pop("_w"), d.pop("_wi"), d.pop("_n")
+        d["avg_position"] = round(w / wi, 2) if wi else None
+        d["_rows"] = n
+        out.append(d)
+    # Undated rows sort last rather than vanishing.
+    out.sort(key=lambda d: (d["date"] is None, d["date"] or ""))
+    return out
+
+
+def _summarise(rows):
+    """query -> one aggregate row: totals, IMPRESSION-WEIGHTED position, weeks.
+
+    Weighted, never a plain mean of weekly positions: a 5-impression week at
+    position 40 must not move the headline as much as a 5,000-impression week at
+    position 6. `position_first_week` / `position_last_week` and `position_best` /
+    `position_worst` are there so a trend is visible without opening the series."""
+    groups = {}
+    for r in rows:
+        groups.setdefault(r["query"], []).append(r)
+    out = {}
+    for q, rs in groups.items():
+        pts = _by_date(rs)
+        imps = sum(p["impressions"] for p in pts)
+        clicks = sum(p["clicks"] for p in pts)
+        w = sum(p["avg_position"] * p["impressions"] for p in pts if p["avg_position"] is not None)
+        wi = sum(p["impressions"] for p in pts if p["avg_position"] is not None)
+        dated = [p for p in pts if p["date"]]
+        ranked = [p for p in dated if p["avg_position"] is not None]
+        a = {
+            "query": q,
+            "impressions": imps,
+            "clicks": clicks,
+            "ctr": round(clicks / imps, 4) if imps else None,
+            "avg_position": round(w / wi, 2) if wi else None,
+            "weeks": len(dated),
+            "first_date": dated[0]["date"] if dated else None,
+            "last_date": dated[-1]["date"] if dated else None,
+            "position_first_week": ranked[0]["avg_position"] if ranked else None,
+            "position_last_week": ranked[-1]["avg_position"] if ranked else None,
+            "position_best": min((p["avg_position"] for p in ranked), default=None),
+            "position_worst": max((p["avg_position"] for p in ranked), default=None),
+        }
+        undated = sum(p["_rows"] for p in pts if not p["date"])
+        if undated:
+            a["undated_rows"] = undated
+        multi = max((p["_rows"] for p in dated), default=1)
+        if multi > 1:
+            a["same_week_rows"] = multi
+            a["same_week_means"] = ("Bing returned more than one row for a single week of this "
+                                    "query. Measured on 2026-10-12 it never did. The rows are SUMMED "
+                                    "here, so the total is right, but find out what splits them "
+                                    "before reading a per-row number.")
+        out[q] = a
+    return out
+
+
+def _series(rows):
+    """Public per-week points, date order, no internal fields."""
+    return [{k: v for k, v in p.items() if not k.startswith("_")} for p in _by_date(rows)]
+
+
+def _span(weekly):
+    ds = sorted({r["date"] for r in weekly if r["date"]})
+    return {"count": len(ds), "first": ds[0] if ds else None, "last": ds[-1] if ds else None}
+
+
+def _match_queries(weekly, exact=None, contains=None):
+    """Exact = case-insensitive whole-string match; contains = case-insensitive
+    substring. Case-folded because Bing lower-cases most rows and a caller copying
+    a query from a SERP will not."""
+    names = {r["query"] for r in weekly}
+    if exact is not None:
+        want = exact.strip().casefold()
+        return sorted(n for n in names if n.strip().casefold() == want)
+    want = (contains or "").strip().casefold()
+    return sorted(n for n in names if want and want in n.casefold())
+
+
+def _query_series(site, weekly, exact, contains, limit):
+    matched = _match_queries(weekly, exact, contains)
+    summ = _summarise([r for r in weekly if r["query"] in set(matched)])
+    results = []
+    for q in matched:
+        a = dict(summ[q])
+        a["series"] = _series([r for r in weekly if r["query"] == q])
+        results.append(a)
+    results.sort(key=lambda a: -a["impressions"])
+    span = _span(weekly)
+    res = {"ok": True, "site": site,
+           "match": {"mode": "exact" if exact is not None else "contains",
+                     "value": exact if exact is not None else contains},
+           "matched": len(results), "window_weeks": span, "results": results[:limit],
+           "reading": ("`series` is one point per week in date order; `avg_position` is "
+                       "Bing's AvgImpressionPosition. A flat series is a STABLE ranking, not "
+                       "a duplicate. avg_click_position is None when Bing sends a sentinel - "
+                       "it is not a rank.")}
+    if not results:
+        res["empty_means"] = (
+            f"no row for this string in Bing's window for this site ({span['count']} weeks, "
+            f"{span['first']}..{span['last']}). That is NOT zero demand and NOT 'we stopped "
+            "ranking' - Bing omits low-volume queries, and an exact match needs Bing's exact "
+            "wording. Try --contains with one distinctive word.")
+    return res
+
+
+def queries(key, site, limit, exact=None, contains=None):
+    """The queries this site appears for - dated, and aggregated per query.
+
+    Output, both keys always present:
+      queries   one row per query per WEEK, with `date` - the original key and row
+                shape (plus `date` and `avg_click_position`), so `keywords.py bing`
+                still reads it. Sorted by impressions, cut at --limit ROWS.
+      by_query  one row per query: total impressions/clicks, ctr, impression-
+                weighted avg_position, weeks, first/last date, first/last/best/worst
+                weekly position. Built from ALL rows, then cut at --limit QUERIES.
+    """
     r = call("GetQueryStats", key, siteUrl=site)
     if not r["ok"]:
         return r
-    rows = r["d"] or []
-    out = [
-        {
-            "query": x.get("Query"),
-            "impressions": x.get("Impressions"),
-            "clicks": x.get("Clicks"),
-            "avg_position": x.get("AvgImpressionPosition"),
-        }
-        for x in rows
-    ]
-    out.sort(key=lambda x: x["impressions"] or 0, reverse=True)
-    res = {"ok": True, "site": site, "count": len(out), "queries": out[:limit]}
-    if not out:
+    weekly = _weekly(r["d"] or [])
+    if exact is not None or contains is not None:
+        return _query_series(site, weekly, exact, contains, limit)
+
+    by_query = sorted(_summarise(weekly).values(), key=lambda a: (-a["impressions"], a["query"]))
+    rows = sorted(weekly, key=lambda x: (-x["impressions"], x["query"], x["date"] or ""))
+    res = {"ok": True, "site": site, "count": len(rows), "query_count": len(by_query),
+           "window_weeks": _span(weekly),
+           "queries": rows[:limit],
+           "by_query": by_query[:limit],
+           "reading": ("`queries` holds one row PER WEEK: the same query appears once for each "
+                       "week it had impressions. Read `by_query` for per-query totals and an "
+                       "impression-weighted position, and `queries --q \"<query>\"` for one "
+                       "query's weekly series in date order. `--limit` cuts `queries` by ROWS "
+                       "and `by_query` by QUERIES; `by_query` is aggregated before the cut.")}
+    if not rows:
         res["empty_means"] = "authorised and genuinely empty - no Bing query data for this site yet."
     return res
+
+
+def page_position(pos: list[tuple[float, int]]) -> float | None:
+    """Impression-weighted mean of weekly positions, rounded to 0.1.
+
+    Rows are one per page per WEEK. A plain mean gives a 3-impression week the
+    same vote as a 3,000-impression one, so a page that ranked #2 all quarter and
+    #40 for one near-empty week reads as #21. Weeks with no impressions fall back
+    to equal weight only when NO week has impressions (a position still exists)."""
+    if not pos:
+        return None
+    w = sum(i for _, i in pos)
+    if w <= 0:
+        return round(sum(p for p, _ in pos) / len(pos), 1)
+    return round(sum(p * i for p, i in pos) / w, 1)
 
 
 def pages(key, site, limit):
     """Per-PAGE impressions and clicks - the dimension `queries` cannot give you.
 
-    WHY THIS EXISTS (2026-09-01, combatskirmish.net). `queries` said the
-    best-converting terms on the site were Chinese - 488 clicks on 1,462
-    impressions at position 2 - and there was no way to find out WHICH PAGE
-    earned them. Query-level data alone cannot answer "is our Chinese locale
-    working, or is the English homepage ranking for Chinese queries?", and those
-    two have opposite fixes. `pages` answered it in one call: /zh/ carried 8,522
-    impressions and 2,298 clicks at position 4 - a 27% CTR, and more than three
+    WHY THIS EXISTS (2026-09-01, a live site). `queries` said the
+    best-converting terms on the site were in one non-English language - 488
+    clicks on 1,462 impressions at position 2 - and there was no way to find out
+    WHICH PAGE earned them. Query-level data alone cannot answer "is our locale
+    page working, or is the English homepage ranking for those queries?", and
+    those two have opposite fixes. `pages` answered it in one call: the locale
+    homepage carried 8,522 impressions and 2,298 clicks at position 4 - a 27% CTR, and more than three
     times the clicks the homepage got from four times the impressions. 70% of the
     site's clicks came from one locale page that every internal-linking audit had
     flagged as having no editorial inbound links at all.
@@ -529,12 +860,11 @@ def pages(key, site, limit):
         a = agg.setdefault(u, {"url": u, "impressions": 0, "clicks": 0, "_pos": []})
         a["impressions"] += x.get("Impressions") or 0
         a["clicks"] += x.get("Clicks") or 0
-        if x.get("AvgImpressionPosition"):
-            a["_pos"].append(x["AvgImpressionPosition"])
+        if (x.get("AvgImpressionPosition") or 0) > 0:
+            a["_pos"].append((x["AvgImpressionPosition"], x.get("Impressions") or 0))
     out = []
     for a in agg.values():
-        pos = a.pop("_pos")
-        a["avg_position"] = round(sum(pos) / len(pos), 1) if pos else None
+        a["avg_position"] = page_position(a.pop("_pos"))
         # CTR is the reason to read this report rather than the impression column:
         # a page can carry a fraction of the impressions and most of the clicks.
         a["ctr"] = round(a["clicks"] / a["impressions"], 4) if a["impressions"] else None
@@ -557,18 +887,20 @@ def pages(key, site, limit):
 def pagequeries(key, site, page, limit):
     """The queries ONE page appears for - attribution, the other half of `pages`.
 
-    `pages` says /zh/ earns 70% of the clicks; this says which searches sent
+    `pages` says one locale page earns 70% of the clicks; this says which searches sent
     them, which is what tells you whether the win is repeatable or a single term.
     """
     r = call("GetPageQueryStats", key, siteUrl=site, page=page)
     if not r["ok"]:
         return r
-    rows = r["d"] or []
-    out = [{"query": x.get("Query"), "impressions": x.get("Impressions"),
-            "clicks": x.get("Clicks"), "avg_position": x.get("AvgImpressionPosition")}
-           for x in rows]
-    out.sort(key=lambda x: x["impressions"] or 0, reverse=True)
-    res = {"ok": True, "site": site, "page": page, "count": len(out), "queries": out[:limit]}
+    # Same weekly shape as GetQueryStats (measured 2026-10-12: up to ten dated rows
+    # per query for one page), so the same two views: dated rows for compatibility,
+    # `by_query` for the per-query answer.
+    out = sorted(_weekly(r["d"] or []), key=lambda x: (-x["impressions"], x["query"], x["date"] or ""))
+    by_query = sorted(_summarise(out).values(), key=lambda a: (-a["impressions"], a["query"]))
+    res = {"ok": True, "site": site, "page": page, "count": len(out),
+           "query_count": len(by_query), "window_weeks": _span(out),
+           "queries": out[:limit], "by_query": by_query[:limit]}
     if not out:
         # ⛔ A URL Bing has never ranked and a MISTYPED URL both return an empty
         # list, and they are completely different findings. Say so rather than
@@ -579,6 +911,279 @@ def pagequeries(key, site, page, limit):
                               "the exact URL with `bing.py pages` before reading this as a "
                               "finding about the page.")
     return res
+
+
+# --------------------------------------------------------------------------
+# CANNIBALISATION, from Bing's own per-page attribution.
+#
+# Why (measured on a live site): four URLs of one site rotated through positions
+# 8-10 for its head queries, week to week, and the homepage - the page meant to
+# own two of those queries - drew no impressions for them at all. Read from SERPs
+# alone that looked like "we fell off page 1". It was the site competing with
+# itself, and only per-page query data shows it.
+#
+# The flags:
+#   split          >= 2 URLs each holding >= min_share of the query's impressions
+#   owner_absent   the URL the caller says should own a phrase has NO impressions
+#                  for a query containing that phrase, while another URL does
+#   edge_of_page   the best URL's impression-weighted position is 7-11 inclusive -
+#                  the band where a rotation between URLs pushes the site off page 1
+#
+# ⚠ Only the MEASURED pages are visible. A URL outside the set cannot appear in a
+# split, so a clean result covers those pages and nothing else. Owner URLs are
+# always added to the set: an owner that was never asked would read as absent.
+#
+# ⚠ Page-level and site-level impressions are different quantities. Measured
+# 2026-10-12: the site's GetPageStats rows summed to 519,667 impressions against
+# 366,823 for GetQueryStats over the same window (1.42x) - a SERP showing two URLs
+# of the site counts twice per page and once per query. So `site_impressions` is
+# reported beside `measured_page_impressions` and NOT turned into a coverage ratio:
+# a ratio above 1 and a ratio below 1 can both happen for reasons this cannot tell
+# apart.
+# --------------------------------------------------------------------------
+
+CANNIBAL_MIN_SHARE = 0.10
+CANNIBAL_MIN_IMPRESSIONS = 10
+# Positions 7-11: the bottom of page 1 and the top of page 2 on a 10-result SERP.
+EDGE_OF_PAGE = (7, 11)
+# Pause between per-page calls. urlinfo lost 35 of 46 calls to throttling in a
+# tight loop (2026-09-01); a throttle must not be read as "this page has no queries".
+PAGE_CALL_PACE_S = 1.0
+
+
+def _phrase_in(phrase, query):
+    """Case-insensitive WORD match: "guide" is in "setup guide", not in "guidelines".
+    A substring match would assign an owner to queries it was never meant for."""
+    p = re.escape(phrase.strip().casefold())
+    return bool(p) and re.search(rf"(?<!\w){p}(?!\w)", query.casefold()) is not None
+
+
+def _slash_variant(url):
+    return url[:-1] if url.endswith("/") else url + "/"
+
+
+def _leaders(by_url_rows):
+    """Week -> the URL with most impressions that week. A rotation shows up as the
+    leader changing; ties go to the alphabetically-first URL so the answer is
+    deterministic."""
+    weeks = {}
+    for url, rows in by_url_rows.items():
+        for p in _by_date(rows):
+            if p["date"] and p["impressions"] > 0:
+                weeks.setdefault(p["date"], []).append((-p["impressions"], url))
+    seq = [{"date": d, "url": sorted(v)[0][1]} for d, v in sorted(weeks.items())]
+    changes = sum(1 for i in range(1, len(seq)) if seq[i]["url"] != seq[i - 1]["url"])
+    return seq, changes
+
+
+def _cannibal_core(per_page, owners=None, min_share=CANNIBAL_MIN_SHARE,
+                   min_impressions=CANNIBAL_MIN_IMPRESSIONS, site_totals=None):
+    """Pure: {url: weekly rows, or None when the call FAILED} -> findings.
+
+    None and [] are different inputs on purpose: [] is a page Bing answered for
+    with nothing, None is a page that could not be asked. An owner whose call
+    failed is `owner_unmeasured`, never `owner_absent`."""
+    owners = owners or {}
+    unmeasured = {u for u, v in per_page.items() if v is None}
+    by_q = {}
+    for url, rows in per_page.items():
+        for r in rows or []:
+            by_q.setdefault(r["query"], {}).setdefault(url, []).append(r)
+
+    findings, checked = [], 0
+    for q, urls in by_q.items():
+        entries = []
+        for url, rows in urls.items():
+            a = _summarise(rows)[q]
+            entries.append({"url": url, "impressions": a["impressions"], "clicks": a["clicks"],
+                            "avg_position": a["avg_position"], "weeks": a["weeks"]})
+        total = sum(e["impressions"] for e in entries)
+        if total < min_impressions:
+            continue
+        checked += 1
+        for e in entries:
+            e["share"] = round(e["impressions"] / total, 4)
+        entries.sort(key=lambda e: (-e["impressions"], e["url"]))
+
+        flags = []
+        holders = [e["url"] for e in entries if e["impressions"] / total >= min_share]
+        if len(holders) >= 2:
+            flags.append("split")
+        ranked = [e["avg_position"] for e in entries
+                  if e["avg_position"] is not None and e["impressions"] > 0]
+        best = min(ranked) if ranked else None
+        if best is not None and EDGE_OF_PAGE[0] <= best <= EDGE_OF_PAGE[1]:
+            flags.append("edge_of_page")
+
+        owner_rows = []
+        for phrase, ourl in owners.items():
+            if not _phrase_in(phrase, q):
+                continue
+            mine = next((e for e in entries if e["url"] == ourl), None)
+            if ourl not in per_page:
+                owner_rows.append({"phrase": phrase, "url": ourl, "state": "not_asked"})
+            elif ourl in unmeasured:
+                owner_rows.append({"phrase": phrase, "url": ourl, "state": "unmeasured"})
+            elif mine and mine["impressions"] > 0:
+                owner_rows.append({"phrase": phrase, "url": ourl, "state": "present",
+                                   "share": mine["share"]})
+            elif any(e["impressions"] > 0 for e in entries if e["url"] != ourl):
+                owner_rows.append({"phrase": phrase, "url": ourl, "state": "absent"})
+        if any(o["state"] == "absent" for o in owner_rows):
+            flags.append("owner_absent")
+        if not flags:
+            continue
+
+        leaders, changes = _leaders(urls)
+        f = {"query": q, "flags": flags, "impressions": total,
+             "clicks": sum(e["clicks"] for e in entries),
+             "best_position": best, "urls": entries,
+             "split_urls": holders if "split" in flags else [],
+             "leader_changes": changes, "weekly_leaders": leaders}
+        if owner_rows:
+            f["owners"] = owner_rows
+        if site_totals is not None:
+            f["site_impressions"] = site_totals.get(q)
+            f["measured_page_impressions"] = total
+        findings.append(f)
+
+    findings.sort(key=lambda f: (-f["impressions"], f["query"]))
+    summary = {k: sum(1 for f in findings if k in f["flags"])
+               for k in ("split", "owner_absent", "edge_of_page")}
+    return {"queries_checked": checked, "summary": summary, "findings": findings,
+            "unmeasured_pages": sorted(unmeasured)}
+
+
+def _read_owners(pairs, owners_file):
+    """--owner "phrase=url" (repeatable) and --owners-file, which takes EITHER
+    {phrase: url} OR the head-term map's own shape, {"terms": [{"phrase", "owner"}]}
+    (headterms.py's .seo/headterms.json) - so the ownership the build gate enforces
+    is the ownership measured here, with no hand-copied second list to drift.
+    A url may be site-relative ("/guides/x"); `cannibal` resolves it against the site.
+    Split --owner on the FIRST '=' so a URL with a query string survives."""
+    owners = {}
+    if owners_file:
+        with open(owners_file) as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("terms"), list):
+            for t in data["terms"]:
+                if isinstance(t, dict) and t.get("phrase") and t.get("owner"):
+                    owners[str(t["phrase"])] = str(t["owner"])
+        elif isinstance(data, dict):
+            owners.update({str(k): str(v) for k, v in data.items()})
+        else:
+            raise ValueError('--owners-file must be {"phrase": "url"} or {"terms": [{"phrase", "owner"}]}')
+        if not owners:
+            # An owners file that yields nothing would run as if no owner were named,
+            # and `owner_absent` could then never fire - an empty answer from the input.
+            raise ValueError(f"--owners-file {owners_file} named no phrase/owner pairs")
+    for p in pairs or []:
+        if "=" not in p:
+            raise ValueError(f"--owner needs phrase=url, got {p!r}")
+        k, v = p.split("=", 1)
+        owners[k.strip()] = v.strip()
+    bad = {k: v for k, v in owners.items()
+           if not k or not v.startswith(("http://", "https://", "/"))}
+    if bad:
+        raise ValueError(f"owner urls must be absolute or start with '/', phrases non-empty: {bad}")
+    return owners
+
+
+def _page_rows(key, site, page, pace):
+    """One page's weekly rows, retried once. None = could not ask (NOT zero)."""
+    for attempt in range(2):
+        r = call("GetPageQueryStats", key, siteUrl=site, page=page)
+        if r.get("ok"):
+            return _weekly(r["d"] or []), None
+        if attempt == 0 and pace:
+            time.sleep(pace * 3)
+    return None, r.get("error")
+
+
+def cannibal(key, site, explicit_pages, top, owners, min_share=CANNIBAL_MIN_SHARE,
+             min_impressions=CANNIBAL_MIN_IMPRESSIONS, max_findings=50, pace=PAGE_CALL_PACE_S):
+    ps = pages(key, site, 10 ** 9)
+    if not ps.get("ok"):
+        return ps
+    known = {p["url"]: p["impressions"] for p in ps["pages"]}
+    owners = {k: urllib.parse.urljoin(site, v) for k, v in (owners or {}).items()}
+
+    # An owner URL spelled differently from Bing's record would be asked, come back
+    # empty, and be reported ABSENT from every query - a finding made from a typo.
+    # A slash variant that Bing does know is refused rather than silently rewritten.
+    owner_unknown = []
+    for phrase, u in owners.items():
+        if u in known:
+            continue
+        if _slash_variant(u) in known:
+            return {"ok": False, "error": "owner_url_not_as_bing_reports",
+                    "detail": (f"owner for {phrase!r} is {u!r}; Bing records "
+                               f"{_slash_variant(u)!r}. Pass Bing's exact string."),
+                    "what_to_do": "copy the URL from `bing.py pages`"}
+        owner_unknown.append(u)
+
+    by_imps = sorted(known, key=lambda u: (-known[u], u))
+    wanted = list(explicit_pages) + (by_imps[:top] if top else [])
+    wanted += [u for u in owners.values()]
+    page_set = list(dict.fromkeys(wanted))
+    if not page_set:
+        return {"ok": False, "error": "no pages",
+                "detail": "pass --pages / --from-file, or a --limit > 0 for the top pages"}
+
+    per_page, errors = {}, {}
+    for i, u in enumerate(page_set):
+        if i and pace:
+            time.sleep(pace)
+        rows, err = _page_rows(key, site, u, pace)
+        per_page[u] = rows
+        if rows is None:
+            errors[u] = err
+
+    if all(v is None for v in per_page.values()):
+        return {"ok": False, "error": "every per-page call failed",
+                "detail": errors, "why_not_none": ("no page could be asked, so 'no "
+                                                    "cannibalisation' cannot be concluded")}
+
+    sq = call("GetQueryStats", key, siteUrl=site)
+    site_totals = ({q: a["impressions"] for q, a in _summarise(_weekly(sq["d"] or [])).items()}
+                   if sq.get("ok") else None)
+
+    core = _cannibal_core(per_page, owners, min_share, min_impressions, site_totals)
+    out = {"ok": True, "site": site,
+           "params": {"min_share": min_share, "min_impressions": min_impressions,
+                      "edge_of_page": list(EDGE_OF_PAGE), "owners": owners},
+           "pages_measured": [u for u in page_set if per_page[u] is not None],
+           "unmeasured_pages": core["unmeasured_pages"],
+           "queries_checked": core["queries_checked"],
+           "summary": core["summary"],
+           "finding_count": len(core["findings"]),
+           "findings": core["findings"][:max_findings],
+           "reading": (
+               "Sorted by impressions. `urls` lists every MEASURED page that drew "
+               "impressions for the query, with its share and impression-weighted "
+               "position; `weekly_leaders` / `leader_changes` show a rotation directly. "
+               "Only the pages in `pages_measured` are visible: a URL outside the set "
+               "cannot appear in a split. `site_impressions` (per query) and "
+               "`measured_page_impressions` (per URL appearance) are different counts "
+               "and are not a coverage ratio.")}
+    if errors:
+        out["errors"] = errors
+        out["unmeasured_means"] = ("these pages could not be asked (throttle or API error). "
+                                   "Their queries are missing from every finding, and an owner "
+                                   "among them is `unmeasured`, never `absent`. Re-run.")
+    if owner_unknown:
+        out["owner_urls_unknown_to_bing"] = owner_unknown
+        out["owner_unknown_means"] = ("Bing's page report has no row for these URLs at all: "
+                                      "either they draw no impressions anywhere (then "
+                                      "`owner_absent` is real) or the string is not the URL "
+                                      "Bing indexed. Check with `bing.py urlinfo` and a control.")
+    if not core["findings"]:
+        out["empty_means"] = (f"no flag fired across {core['queries_checked']} queries with "
+                              f">= {min_impressions} impressions on the measured pages. That "
+                              "covers those pages only" +
+                              ("; some pages were NOT measured, see unmeasured_pages." if errors
+                               else "."))
+    return out
 
 
 def traffic(key, site):
@@ -1133,7 +1738,6 @@ def main():
     for name, helptext in [
         ("sites", "verified sites (and the auth control)"),
         ("backlinks", "inbound links"),
-        ("queries", "queries this site appears for"),
         ("traffic", "clicks/impressions over time"),
         ("pages", "per-PAGE impressions/clicks/CTR - which URL actually earns"),
         ("crawlstats", "what BINGBOT fetched, day by day, and what is in the index"),
@@ -1156,6 +1760,28 @@ def main():
     sb.add_argument("--from-file", help="file of URLs, one per line, # comments allowed")
     sb.add_argument("--yes", action="store_true",
                     help="actually submit. Without it this prints the batch and spends nothing")
+
+    qy = sub.add_parser("queries", help="queries this site appears for - dated weekly rows + by_query",
+                        parents=[common])
+    qy.add_argument("--q", dest="exact", help="one query's weekly series, date order (case-insensitive exact)")
+    qy.add_argument("--contains", help="weekly series for every query containing this substring")
+    cn = sub.add_parser("cannibal", help="queries split across several URLs of the site, owner pages "
+                        "missing, best position at 7-11", parents=[common])
+    cn.add_argument("--pages", help="comma-separated page URLs, exactly as `bing.py pages` reports them")
+    cn.add_argument("--from-file", help="file of page URLs, one per line, # comments allowed")
+    cn.add_argument("--top", type=int, default=None,
+                    help="also add the top N pages by impressions (default: --limit when no "
+                         "pages are given, else 0)")
+    cn.add_argument("--owner", action="append", default=[],
+                    help='"phrase=url": the URL meant to own queries containing the phrase (repeatable)')
+    cn.add_argument("--owners-file", help='JSON object {"phrase": "url", ...}')
+    cn.add_argument("--min-share", type=float, default=CANNIBAL_MIN_SHARE,
+                    help="share of a query's impressions a URL needs to count toward a split")
+    cn.add_argument("--min-impressions", type=int, default=CANNIBAL_MIN_IMPRESSIONS,
+                    help="ignore queries with fewer impressions across the measured pages")
+    cn.add_argument("--max-findings", type=int, default=50)
+    cn.add_argument("--pace", type=float, default=PAGE_CALL_PACE_S,
+                    help="seconds between per-page calls (Bing throttles tight loops)")
 
     ui = sub.add_parser("urlinfo", help="Bing's own record of ONE url: discovered, last crawled, size",
                         parents=[common])
@@ -1200,6 +1826,27 @@ def main():
         }, indent=2))
         sys.exit(2)
 
+    # Argument contradictions are refused before the network, like --days above.
+    if a.cmd == "queries" and a.exact is not None and a.contains is not None:
+        print(json.dumps({"ok": False, "error": "conflicting_match",
+                          "detail": "--q is an exact match and --contains a substring match; pass one"}))
+        sys.exit(2)
+    if a.cmd == "cannibal":
+        try:
+            owners = _read_owners(a.owner, a.owners_file)
+            explicit = _read_url_list([u.strip() for u in (a.pages or "").split(",") if u.strip()],
+                                      a.from_file)
+        except (ValueError, OSError, json.JSONDecodeError) as ex:
+            print(json.dumps({"ok": False, "error": "bad_cannibal_input", "detail": str(ex)}))
+            sys.exit(2)
+        if not (0 < a.min_share <= 0.5):
+            # Above 0.5 two URLs can never both qualify, so `split` could not fire and
+            # an empty result would be the parameter, not the site.
+            print(json.dumps({"ok": False, "error": "min_share_out_of_range",
+                              "detail": "--min-share must be in (0, 0.5]; above 0.5 a split is impossible"}))
+            sys.exit(2)
+        top = a.top if a.top is not None else (0 if explicit else a.limit)
+
     end = date.today()
     start = end - timedelta(days=a.days if a.days is not None else 90)
     s, e_ = start.strftime(DATE_FMT), end.strftime(DATE_FMT)
@@ -1233,16 +1880,21 @@ def main():
             out = crawlsettings(key, site)
         elif a.cmd == "pagequeries":
             out = pagequeries(key, site, a.page, a.limit)
+        elif a.cmd == "queries":
+            out = queries(key, site, a.limit, a.exact, a.contains)
+        elif a.cmd == "cannibal":
+            out = cannibal(key, site, explicit, top, owners, a.min_share, a.min_impressions,
+                           a.max_findings, a.pace)
         else:
-            out = {"backlinks": backlinks, "queries": queries,
+            out = {"backlinks": backlinks,
                    "traffic": traffic, "pages": pages}[a.cmd](
                 *( (key, site, a.limit)
-                   if a.cmd in ("backlinks", "queries", "pages") else (key, site) )
+                   if a.cmd in ("backlinks", "pages") else (key, site) )
             )
 
     # State the window on every report that has one it did not choose, so a
     # reader who never passed --days still knows the span is Bing's, not theirs.
-    if a.cmd in ("queries", "pages", "pagequeries", "traffic") and out.get("ok"):
+    if a.cmd in ("queries", "pages", "pagequeries", "traffic", "cannibal") and out.get("ok"):
         out.setdefault(
             "window",
             "Bing's own fixed reporting window - not selectable here; --days is refused "

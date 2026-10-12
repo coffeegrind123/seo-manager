@@ -7,13 +7,17 @@ Every case is a way this returns a confident wrong answer instead of an error:
      search term turns a page report into nonsense that still looks like data.
   2. Rows arrive one per date, so a page's real total only exists after
      aggregation - reading the first row understates every page differently.
-  3. Sorting by impressions inverts the actual answer. Measured on
-     combatskirmish.net 2026-09-01: /zh/ had a QUARTER of the homepage's
+  3. Sorting by impressions inverts the actual answer. Measured on a live
+     site 2026-09-01: a locale homepage had a QUARTER of the homepage's
      impressions and THREE TIMES its clicks. Impressions-first ranking puts the
      page earning 68% of all clicks in second place.
   4. A page with impressions but no clicks must not raise on the CTR division.
   5. An empty result is EITHER "no data yet" or "you typed the URL wrong", and
      those are opposite findings - it must say so, not imply the page is dead.
+  12. GetQueryStats / GetPageQueryStats return one row per query per WEEK.
+      Without the date a flat ten-week ranking reads as ten queries.
+  13. `cannibal`: a split, a missing owner page and a page-1 edge position, each
+      with a control that must NOT fire.
   7. --days is accepted by the parser for every subcommand, but only `keyword`
      and `expand` reach an endpoint that takes a date range. Silently ignoring it
      elsewhere makes `--days 7` and `--days 30` return identical rows - measured
@@ -48,8 +52,8 @@ print("1-3. GetPageStats: URL in a field called `Query`, aggregated, click-sorte
 stub([
     {"Query": "https://x.net/",    "Impressions": 20000, "Clicks": 400, "AvgImpressionPosition": 7},
     {"Query": "https://x.net/",    "Impressions": 13403, "Clicks": 316, "AvgImpressionPosition": 7},
-    {"Query": "https://x.net/zh/", "Impressions": 4000,  "Clicks": 1100, "AvgImpressionPosition": 4},
-    {"Query": "https://x.net/zh/", "Impressions": 4522,  "Clicks": 1198, "AvgImpressionPosition": 4},
+    {"Query": "https://x.net/ja/", "Impressions": 4000,  "Clicks": 1100, "AvgImpressionPosition": 4},
+    {"Query": "https://x.net/ja/", "Impressions": 4522,  "Clicks": 1198, "AvgImpressionPosition": 4},
 ])
 r = bing.pages("k", "https://x.net/", 10)
 top = r["pages"][0]
@@ -57,8 +61,8 @@ check("the URL is read out of the `Query` field", top["url"].startswith("https:/
 check("rows for one page are aggregated, not truncated to the first",
       any(p["url"] == "https://x.net/" and p["impressions"] == 33403 for p in r["pages"]))
 check("clicks aggregate too", top["clicks"] == 2298)
-check("sorted by CLICKS, so /zh/ leads despite a quarter the impressions",
-      top["url"] == "https://x.net/zh/")
+check("sorted by CLICKS, so /ja/ leads despite a quarter the impressions",
+      top["url"] == "https://x.net/ja/")
 check("the impressions-first order would have been wrong",
       max(r["pages"], key=lambda p: p["impressions"])["url"] == "https://x.net/")
 check("ctr exposes the inversion", top["ctr"] > 0.25 and r["pages"][1]["ctr"] < 0.03)
@@ -253,6 +257,179 @@ r = bing.submit("k", "https://x.net/", ["https://x.net/a", "https://x.net/a"], N
 check("CONTROL a within-quota batch DOES send", r["submitted"] is True)
 check("deduplicated on the way", sent["urlList"] == ["https://x.net/a"])
 check("and the receipt does not claim a crawl happened", "not a crawl confirmation" in r["note"])
+
+print("\n12. weekly query rows keep their date, and aggregate per query")
+# 2026-08-07 = 1786060800 s (1787443200, i.e. 2026-08-23, minus 16 days); +604800 per week.
+W1, W2, W3 = "/Date(1786060800000)/", "/Date(1786665600000)/", "/Date(1787270400000)/"
+weekly_payload = [
+    {"Query": "blue widget", "Date": W3, "Impressions": 100, "Clicks": 1, "AvgImpressionPosition": 7, "AvgClickPosition": -1},
+    {"Query": "blue widget", "Date": W1, "Impressions": 100, "Clicks": 1, "AvgImpressionPosition": 6, "AvgClickPosition": -1},
+    {"Query": "blue widget", "Date": W2, "Impressions": 300, "Clicks": 3, "AvgImpressionPosition": 8, "AvgClickPosition": -1},
+    {"Query": "green widget", "Date": W2, "Impressions": 40, "Clicks": 0, "AvgImpressionPosition": 15, "AvgClickPosition": -1},
+]
+stub(weekly_payload)
+r = bing.queries("k", "https://example.com/", 50)
+check("every dated row carries `date`", all(x.get("date") for x in r["queries"]))
+check("`queries` stays one row per week (backward-compatible key and length)",
+      r["count"] == 4 and len(r["queries"]) == 4)
+check("the old row keys survive for keywords.py bing",
+      all({"query", "impressions", "clicks", "avg_position"} <= set(x) for x in r["queries"]))
+bq = {x["query"]: x for x in r["by_query"]}
+check("by_query has one row per query", r["query_count"] == 2 and len(bq) == 2)
+# (100*7 + 100*6 + 300*8) / 500 = 3700/500 = 7.4
+check("by_query position is impression-weighted (7.4, not the plain mean 7.0)",
+      bq["blue widget"]["avg_position"] == 7.4)
+check("by_query carries weeks and the date span",
+      (bq["blue widget"]["weeks"], bq["blue widget"]["first_date"], bq["blue widget"]["last_date"])
+      == (3, "2026-08-07", "2026-08-21"))
+check("by_query is sorted by total impressions", r["by_query"][0]["query"] == "blue widget")
+check("the window is reported in weeks", r["window_weeks"] == {"count": 3, "first": "2026-08-07", "last": "2026-08-21"})
+r1 = bing.queries("k", "https://example.com/", 1)
+check("--limit cuts by_query AFTER aggregation, not the rows it is built from",
+      len(r1["by_query"]) == 1 and r1["by_query"][0]["impressions"] == 500)
+
+r = bing.queries("k", "https://example.com/", 50, exact="BLUE widget")
+check("--q returns one query's series", r["matched"] == 1)
+check("--q series is in DATE order regardless of payload order",
+      [p["date"] for p in r["results"][0]["series"]] == ["2026-08-07", "2026-08-14", "2026-08-21"])
+check("and its weekly positions are Bing's impression positions",
+      [p["avg_position"] for p in r["results"][0]["series"]] == [6, 8, 7])
+check("AvgClickPosition -1 never reaches a row as a rank",
+      all(x["avg_click_position"] is None for x in bing._weekly(weekly_payload)))
+r = bing.queries("k", "https://example.com/", 50, contains="widget")
+check("--contains matches every query holding the substring", r["matched"] == 2)
+r = bing.queries("k", "https://example.com/", 50, exact="widget")
+check("CONTROL --q is exact: a substring does not match", r["matched"] == 0)
+check("and an empty match is not reported as zero demand", "NOT zero demand" in r["empty_means"])
+
+rc, out = cli("queries", "--q", "a", "--contains", "b")
+check("--q with --contains is refused before the network", out.get("error") == "conflicting_match" and rc != 0)
+
+stub(weekly_payload)
+r = bing.pagequeries("k", "https://example.com/", "https://example.com/p", 50)
+check("pagequeries rows are dated too", all(x.get("date") for x in r["queries"]))
+check("and pagequeries aggregates per query", len(r["by_query"]) == 2)
+
+print("\n13. cannibal: split / owner_absent / edge_of_page, each with a control")
+SITE = "https://example.com/"
+A, B, C, G, P = (SITE + "a", SITE + "b", SITE + "c", SITE + "guide", SITE + "pricing")
+
+
+def row(q, d, imp, pos):
+    return {"Query": q, "Date": d, "Impressions": imp, "Clicks": 0,
+            "AvgImpressionPosition": pos, "AvgClickPosition": -1}
+
+
+PAGE_STATS = [{"Query": u, "Impressions": n, "Clicks": 0, "AvgImpressionPosition": 5}
+              for u, n in ((A, 695), (B, 305), (C, 100), (G, 500), (P, 20))]
+PER_PAGE = {
+    A: [row("widget pricing", W1, 400, 8), row("widget pricing", W2, 200, 11), row("widget", W1, 95, 4)],
+    B: [row("widget pricing", W2, 300, 10), row("widget", W1, 5, 12)],
+    C: [row("widget pricing", W1, 100, 15)],
+    G: [row("widget guide", W1, 500, 3)],
+    P: [],
+}
+SITE_Q = [row("widget pricing", W1, 700, 9), row("widget", W1, 100, 4), row("widget guide", W1, 500, 3)]
+calls = []
+
+
+def cannibal_stub(fail=()):
+    def _call(method, key, **kw):
+        calls.append((method, kw.get("page")))
+        if method == "GetPageStats":
+            return {"ok": True, "d": PAGE_STATS}
+        if method == "GetQueryStats":
+            return {"ok": True, "d": SITE_Q}
+        if method == "GetPageQueryStats":
+            if kw["page"] in fail:
+                return {"ok": False, "error": "HTTP 429"}
+            return {"ok": True, "d": PER_PAGE.get(kw["page"], [])}
+        return {"ok": True, "d": []}
+    bing.call = _call
+
+
+cannibal_stub()
+calls.clear()
+r = bing.cannibal("k", SITE, [A, B, C], 0, {"pricing": P, "guide": G}, pace=0)
+fd = {f["query"]: f for f in r["findings"]}
+check("an owner URL is measured even when not passed as a page",
+      ("GetPageQueryStats", P) in calls and P in r["pages_measured"])
+check("exactly one cannibalised query", sorted(fd) == ["widget pricing"])
+wp = fd["widget pricing"]
+check("split + owner_absent + edge_of_page on it",
+      set(wp["flags"]) == {"split", "owner_absent", "edge_of_page"})
+# /a: (400*8 + 200*11)/600 = 9.0; shares 600/1000, 300/1000, 100/1000
+check("per-URL impressions, shares and weighted position",
+      [(u["url"], u["impressions"], u["share"], u["avg_position"]) for u in wp["urls"]]
+      == [(A, 600, 0.6, 9.0), (B, 300, 0.3, 10.0), (C, 100, 0.1, 15.0)])
+check("the owner row says absent", wp["owners"] == [{"phrase": "pricing", "url": P, "state": "absent"}])
+check("the rotation is visible week by week",
+      [x["url"] for x in wp["weekly_leaders"]] == [A, B] and wp["leader_changes"] == 1)
+check("site-level and page-level impressions are both reported, not divided",
+      wp["site_impressions"] == 700 and wp["measured_page_impressions"] == 1000
+      and "coverage" not in json.dumps(wp))
+check("CONTROL the owned query (owner present, one URL) is not a finding", "widget guide" not in fd)
+check("CONTROL a 95/5 split under min_share is not a finding", "widget" not in fd)
+
+r = bing.cannibal("k", SITE, [A, B, C], 0, {"pricing": P}, min_share=0.35, pace=0)
+check("--min-share is honoured", r["summary"]["split"] == 0 and r["summary"]["owner_absent"] == 1)
+
+cannibal_stub(fail=(P,))
+r = bing.cannibal("k", SITE, [A, B, C], 0, {"pricing": P}, pace=0)
+check("a FAILED owner call is unmeasured, never absent",
+      r["summary"]["owner_absent"] == 0 and r["unmeasured_pages"] == [P] and "unmeasured_means" in r)
+check("and the owner row says so",
+      r["findings"][0]["owners"] == [{"phrase": "pricing", "url": P, "state": "unmeasured"}])
+
+cannibal_stub()
+r = bing.cannibal("k", SITE, [], 2, {}, pace=0)
+check("auto mode measures the top N pages BY IMPRESSIONS", r["pages_measured"] == [A, G])
+
+r = bing.cannibal("k", SITE, [A], 0, {"pricing": SITE + "pricing/"}, pace=0)
+check("an owner URL differing from Bing's by a slash is refused, not reported absent",
+      r["ok"] is False and r["error"] == "owner_url_not_as_bing_reports")
+
+cannibal_stub(fail=(A, B))
+r = bing.cannibal("k", SITE, [A, B], 0, {}, pace=0)
+check("every page failing is a refusal, not 'no cannibalisation'",
+      r["ok"] is False and "findings" not in r)
+
+PER_PAGE_CLEAN = {A: [row("alpha tool", W1, 200, 2)], B: [row("beta tool", W1, 300, 3)]}
+_saved = dict(PER_PAGE)
+PER_PAGE.clear(); PER_PAGE.update(PER_PAGE_CLEAN)
+cannibal_stub()
+r = bing.cannibal("k", SITE, [A, B], 0, {}, pace=0)
+check("CONTROL a site with no shared queries reports NO finding",
+      r["ok"] is True and r["findings"] == [] and r["queries_checked"] == 2)
+check("and the empty result says it covers the measured pages only", "measured pages" in r["empty_means"])
+PER_PAGE.clear(); PER_PAGE.update(_saved)
+
+import tempfile
+with tempfile.TemporaryDirectory() as td:
+    hp = os.path.join(td, "headterms.json")
+    with open(hp, "w") as fh:
+        json.dump({"terms": [{"phrase": "pricing", "owner": "/pricing", "allow": []},
+                             {"phrase": "guide", "owner": G}]}, fh)
+    check("the head-term map's own shape is read as owners",
+          bing._read_owners([], hp) == {"pricing": "/pricing", "guide": G})
+    with open(hp, "w") as fh:
+        json.dump({"terms": []}, fh)
+    try:
+        bing._read_owners([], hp)
+        check("an owners file naming nobody is refused", False)
+    except ValueError:
+        check("an owners file naming nobody is refused", True)
+cannibal_stub()
+r = bing.cannibal("k", SITE, [A, B, C], 0, {"pricing": "/pricing"}, pace=0)
+check("a site-relative owner resolves against the site and is measured",
+      P in r["pages_measured"] and r["summary"]["owner_absent"] == 1)
+
+rc, out = cli("cannibal", "--min-share", "0.6")
+check("a --min-share at which a split is impossible is refused", out.get("error") == "min_share_out_of_range")
+rc, out = cli("cannibal", "--owner", "pricing")
+check("a malformed --owner is refused", out.get("error") == "bad_cannibal_input")
+rc, out = cli("cannibal", "--days", "7")
+check("cannibal --days refuses like the other fixed-window commands", out.get("error") == "window_not_selectable")
 
 print()
 if FAILS:
