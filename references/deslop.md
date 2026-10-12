@@ -128,16 +128,16 @@ it needs saying that `scan`, run page by page, cannot substitute for it.
 ### On a generated site, use `corpus`, per tier
 
 ```
-slop.py corpus public/seo/weapons/*.html      # one TIER at a time
+slop.py corpus public/seo/products/*.html      # one TIER at a time
 ```
 
-Measured on combatskirmish.net, 2026-09-01, and each step changed the answer:
+Measured on a generated site, 2026-09-01, and each step changed the answer:
 
 | how it was run | result |
 |---|---|
 | `scan` per page, raw HTML | **44 of 44 `warn`** |
 | `scan` per page, markup masked | 12 pass / 32 warn |
-| `corpus`, per tier | weapons 15/2, guides 12/5 — and a ranked work list |
+| `corpus`, per tier | products 15/2, guides 12/5 — and a ranked work list |
 
 A verdict identical on every page is not a corpus-wide defect, it is the
 instrument reading the wrong text. Three separate causes, all of them the same
@@ -145,22 +145,22 @@ mistake — counting something the writer did once:
 
 1. **Raw HTML is not prose.** `<title>`, the meta description, JSON-LD
    `headline`, `<style>`, and HTML/CSS comments all carry prose-shaped text.
-   `awp.html` measured **861 "words" raw against 252** of real copy. `scan` now
+   `widget.html` measured **861 "words" raw against 252** of real copy. `scan` now
    detects HTML and masks it; `--no-html` restores the old behaviour, and exists
    mainly as the control that proves the masking is what changed the answer.
 2. **Visible chrome is not prose either.** The h1, the CTA label, the nav links
-   and the footer are prose-shaped, and they repeat on every page. On `awp.html`
+   and the footer are prose-shaped, and they repeat on every page. On `widget.html`
    only **3 of 9** body-text hits were body copy; every `unicode_arrow` on the
-   entire site was a navigation label (`All weapons →`). `corpus` groups hits by
+   entire site was a navigation label (`All products →`). `corpus` groups hits by
    their enclosing sentence and reports anything shared across the tier once, as
    `template` — fix it in the generator, not on 2,599 pages.
 3. **Per tier, not per site.** The share threshold is a fraction of the files you
-   pass, so folding 17 weapon pages into a 44-file run pushes their shared nav
+   pass, so folding 17 product pages into a 44-file run pushes their shared nav
    below it and hands the arrows back as if they were per-page prose.
 
 **The limit, which is invisible unless stated:** template grouping is by
 identical text, so a templated line carrying an interpolated value
-(`AWP — Counter-Strike 1.6`) is not recognised as shared even though its shape
+(`Widget Pro — Acme`) is not recognised as shared even though its shape
 is. That is why `per_rule` reports `files_hit` and `every_file` — a rule firing
 on 17 of 17 files is templated whether or not the strings match. Read
 `every_file: true` as layout, not writing.

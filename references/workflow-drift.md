@@ -23,6 +23,13 @@ python3 $SEO/drift.py snapshot \
 Dated file, committed with the rest of `.seo/`. The whole workflow is a diff
 between two of these, so the first run produces no findings and that is correct.
 
+**The owned head terms ride along.** If `.seo/headterms.json` sits beside the
+keyword file, every owned phrase is snapshotted too (`headterms_included` in the
+output; `--headterms-from` to point elsewhere, `--no-headterms` to skip). Those
+are the queries the site exists to rank for, and the research queue rarely holds
+them: measured 2026-10-12, a site's head phrase slipped to the edge of page 1 with
+no earlier snapshot of its page 1 to diff against.
+
 **`unread` keywords are excluded from the snapshot, never stored empty.** A
 refused read is a failed read, not an empty page 1 — storing it as one makes the
 next diff report a total page-1 wipeout followed by a full recovery. Re-run the
@@ -123,6 +130,13 @@ possible, never as present. Run `algoupdates.py status` first: a calendar that
 was not synced in 30 days says nothing about the last month.
 
 ## 7. Act
+
+**Before treating a lost page-1 slot as competitive**, run `bing.py cannibal --owners-file
+.seo/headterms.json` (or `decay.py cannibal` on Search Console data): `split` +
+`edge_of_page` on the same query with `leader_changes` > 0 is the site rotating its own
+URLs, not being displaced — fix the heads (decay §6), not the content. Measured
+2026-10-12: a "we fell off page 1" that was four of the site's own URLs taking turns at
+positions 8-10.
 
 | Signal | Response |
 |---|---|

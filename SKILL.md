@@ -174,7 +174,7 @@ Supporting references:
 
 ## The scripts
 
-36 scripts, all stdlib Python 3, no installs. Every one prints JSON; `--help`
+38 scripts, all stdlib Python 3, no installs. Every one prints JSON; `--help`
 lists the subcommands.
 
 ```bash
@@ -192,9 +192,11 @@ The six you touch in almost every run:
 | `seodoctor.py` | self-healing preflight — run it first, every run |
 | `controls.py` | the control primitive, and `controls.py audit` — which instruments can currently prove they discriminate. Run it before trusting any zero |
 | `seostate.py` | all state: queue, keywords, ranks, pages, trends, profile, pacing, overview, next-actions, run log |
-| `serp.py` | live SERPs through the provider ladder, plus the weakness/authority scoring the gate needs |
+| `serp.py` | live SERPs through the provider ladder, plus the weakness/authority scoring the gate needs; `--provider bing` (opt-in) reads Bing's own page 1 behind named refusals |
 | `keywords.py` | expansion across six independent suggestion corpora, with a cross-engine agreement signal |
 | `sameness.py` | the corpus sameness gate + a pairwise drift audit |
+| `headterms.py` | which URL OWNS each head phrase (`.seo/headterms.json`), and every page whose title or H1 took one anyway — the cannibalisation sameness cannot see, because the bodies differ |
+| `claims.py` | the published copy against the product's verified-facts ledger (`.seo/claims.json`): known-false claims as findings, competitor-plus-preference sentences for review |
 | `geo.py` | do answer engines cite us? Google's AI Overview and AI Mode work today on the SerpApi key; `no_key` engines report cannot-ask, never not-cited. **`--runs 3`** — answers are non-deterministic, and one run is a coin toss labelled as one |
 | `remeasure.py` | did the change work? Hypotheses with pre-registered directions, re-checked by re-running the same command |
 | `brief.py` | a build brief assembled from measurements — and a hard refusal when page 1 could not be read |
@@ -277,9 +279,9 @@ well as in the quality bar:
 
   **This is now structural rather than a habit.** `controls.py` provides the
   primitive (`Controls`, `refuse()`, `guard_zero()`, `uniform_verdict()`) and
-  **every one of the 35 instruments carries a control you can run** — `control`
+  **every one of the 37 instruments carries a control you can run** — `control`
   as a subcommand, or `--control` on the five flag-style ones. `controls.py
-  audit` runs the lot (697 checks; a live source that refuses is `unreachable`,
+  audit` runs the lot (828 checks; a live source that refuses is `unreachable`,
   never `broken`) and reports `ok: false` naming
   any instrument that cannot currently prove itself. It was built after seven
   instruments failed their controls in a single run on 2026-09-01; each would
@@ -382,6 +384,11 @@ exact command live where the pointer says:
   11.7×. (`workflow-build-guide.md` §5)
 - **One guide per UTC day**, site-wide, counting the owner's own merges.
   (`workflow-build-guide.md` §0)
+- **One owner per head phrase; product claims from the ledger; comparisons state
+  competitors' facts and never recommend them.** `headterms.py` and `claims.py` run
+  on every build and every deploy. (`quality-bar.md` §9, `workflow-build-guide.md` §3/§9)
+- **"We fell off page 1" is checked against our OWN URLs first** — `bing.py cannibal` /
+  `decay.py cannibal` before any competitive or content diagnosis. (`workflow-drift.md` §7)
 - **The sameness gate is not advisory** — never argued with, never shipped past,
   never loosened; three rewrites, then the topic is the problem.
   (`workflow-build-guide.md` §9)

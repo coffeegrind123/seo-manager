@@ -109,7 +109,7 @@ reported as `none`.
 
 `feeds` reports `url_count_per_bing` from Bing's last crawl **of the feed**, so a
 sitemap you changed yesterday still reads with the old total. `--verify` counts
-the live file and prints the delta. Measured on combatskirmish.net 2026-09-01:
+the live file and prints the delta. Measured on a generated site 2026-09-01:
 live 5,388, Bing 6,127, `last_crawled` 2026-08-31 — a 739-URL gap that is
 either a change bingbot has not re-read or a change that never deployed.
 `last_crawled` against your deploy date is what separates the two. Neither is a
@@ -166,7 +166,7 @@ collides, say so and let the owner choose.
 
 The `unknown` bucket is routinely one of the largest rows in the report, and it
 is a mixture of three different things: real crawlers not yet in the table,
-network scanners, and outright attack probes. On combatskirmish.net it held
+network scanners, and outright attack probes. On one measured site it held
 vulnerability scanning (`l9scan`/leakix), a UA field containing
 `http://<site>/wp-admin/install.php`, and an academic scanner — alongside
 genuine crawlers. A high `error_rate` on the bucket points at the scanners.
@@ -289,7 +289,7 @@ contaminated whole is not a share. Rows sort by `hits_net`, so a scanner cannot
 outrank real crawl demand. The top level adds `bot_hits_net` and
 `bots_entirely_forged`.
 
-Measured on combatskirmish.net over 7 days / 1,485,860 lines, 2026-09-01:
+Measured on one site over 7 days / 1,485,860 lines, 2026-09-01:
 
 | category | claimed | real | forged |
 |---|---|---|---|
@@ -315,8 +315,8 @@ reason. Same rule as `no_key` never meaning `not_cited`: cannot-ask is not no.
 ⚠ **`urls` strips the query string, and `gap` therefore aggregates every
 parameterised variant onto one path.** That is correct for the comparison —
 sitemap `<loc>` entries carry no query — and wrong the moment you read a hit
-count as a budget figure. Measured 2026-09-01: `gap` reported `/play 506` for
-bingbot, and `urls --keep-query` showed **503 of them were `/play?connect=`
+count as a budget figure. Measured 2026-09-01: `gap` reported `/app 506` for
+bingbot, and `urls --keep-query` showed **503 of them were `/app?session=`
 across 408 distinct URLs against a single bare row**. "One page fetched 506
 times" and "408 junk URLs" have opposite fixes. Re-run with `--keep-query`
 before believing any single-path total; `gap` now says so in its own output.

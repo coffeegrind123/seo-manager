@@ -413,13 +413,18 @@ python3 $SEO/seostate.py propose \
 python3 $SEO/seostate.py update <id> --status approved
 
 # and EVERY survivor the gate withheld - one row each, with its class:
-python3 $SEO/seostate.py defer --keyword "browser vr games" --class catalogue \
-  --authority-count 5 --page1 heyvr.io,vrwebgames.com,viverse.com,itch.io \
+python3 $SEO/seostate.py defer --keyword "best free browser games" --class catalogue \
+  --authority-count 5 --page1 rival-a.example,rival-b.example,rival-c.example \
   --engine "Google via serper, US exit" --note "a 'games' query; we are one game"
-python3 $SEO/seostate.py defer --keyword "counter strike vr team beef" --class brand_navigational \
+python3 $SEO/seostate.py defer --keyword "<partner brand> integration" --class brand_navigational \
   --fold-into <id of the page that credits them> --authority-count 3
 python3 $SEO/seostate.py defer --keyword "<kw>" --class authority --authority-count 5 --page1 ...
 ```
+
+**A candidate that IS an owned head phrase is not a new page.** Check it against
+`.seo/headterms.json` (`headterms.py check --url <proposed path> --title "<kw>"`):
+if it collides, the work belongs to the owner — propose `--type update` on the
+owner URL, never a second page competing for the same query.
 
 Follow the queue policies (guides build-first, tools approve-first behind the
 project's tool gate). **Every rationale opens with its remit verdict in one
@@ -521,7 +526,7 @@ authority gate because nobody bothered to target them:
    ⚠ **Mine the engine that actually sends the traffic, and CHECK which one that
    is rather than assuming Google.** On a site with a verified Bing property,
    `bing.py traffic` answers it in one call, and the answer is not always the
-   obvious one: measured on combatskirmish.net 2026-09-01, Bing delivered
+   obvious one: measured on one site 2026-09-01, Bing delivered
    **57,596 impressions / 4,300 clicks** in 29 days against Search Console's
    **545 / 43** for the same window — about 100x — after this program had spent
    its entire history reading GSC. Every outcome steer it had derived described

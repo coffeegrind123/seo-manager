@@ -99,6 +99,23 @@ around.
 
 **Success criteria**: `check` returned a verdict other than `site_wide_failure`. If it refused, the deploy had not settled — wait and re-run; never widen `--max-fail-share` to force a verdict.
 
+### 2b. Then the two copy guards, on the same URL set
+
+```bash
+python3 $SEO/headterms.py scan --urls .seo/contract/<name>-urls.txt   # a page took an owned phrase?
+python3 $SEO/claims.py scan --urls .seo/contract/<name>-urls.txt      # copy the ledger says is false?
+# a static build on disk is cheaper and covers EVERY page, not one per template:
+python3 $SEO/headterms.py scan --root <build output>
+python3 $SEO/claims.py scan --root <build output>
+```
+
+`contract.py` compares markup to its own baseline, so it is blind to a head or a
+sentence that was wrong when the baseline was taken. These compare against the
+site's recorded INTENT instead — `.seo/headterms.json` and `.seo/claims.json`.
+Both refuse without their file; that refusal is "not set up", never a pass.
+
+**Success criteria**: both scans ran (or refused with "no map/ledger", which is reported as not set up); every collision and every `never` finding is resolved or explained; every competitor `review` sentence was read.
+
 ---
 
 ## 3. Read the lifecycle, not the diff

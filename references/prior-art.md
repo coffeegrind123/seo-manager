@@ -228,7 +228,7 @@ the warning sat one screen above them.
 the proof: §9 above recorded GrokBot as an answer engine newly discovered on the
 site, from a row that was 45/45 forged.
 
-Measured over 7 days on combatskirmish.net, 1,485,860 log lines:
+Measured over 7 days on one site, 1,485,860 log lines:
 
 | category | claimed | real | forged |
 |---|---|---|---|
@@ -405,10 +405,10 @@ Bing is last by coverage and first by traffic. The reason was one row of `gap`'s
 output — and reading it correctly took three attempts, each of which would have
 shipped a different wrong fix:
 
-1. **`/play 506` on bingbot, not in the sitemap** → "a bare 302 is eating 25% of
+1. **`/app 506` on bingbot, not in the sitemap** → "a bare 302 is eating 25% of
    Bing's budget; block it." Wrong.
-2. `urls --keep-query`: **503 of the 506 are `/play?connect=` across 408 distinct
-   URLs**, and `/play?connect=` is *already* `Disallow`ed → "the rule is being
+2. `urls --keep-query`: **503 of the 506 are `/app?session=` across 408 distinct
+   URLs**, and `/app?session=` is *already* `Disallow`ed → "the rule is being
    ignored; go serve-side." Also wrong.
 3. `grep -c` over every release directory on the box: **the rule reached
    production on 2026-09-01, the same day**. Every earlier release has zero
@@ -417,7 +417,7 @@ shipped a different wrong fix:
    against it.
 
 Nothing is concluded from that yet. It is registered instead:
-`remeasure.py record --id bing-play-connect-block`, baseline **502** `/play`-silo
+`remeasure.py record --id bing-app-session-block`, baseline **502** `/app`-silo
 hits in the 14 days to 2026-09-01, expect `decrease` by ≥400, `not_before
 2026-09-22` — with the falsification written down in advance ("if it does not
 drop, the rule is not being honoured and the next step is a serve-side block,
@@ -439,7 +439,7 @@ an output that cannot distinguish two states with opposite fixes.
   `no_key` rule, applied to an instrument instead of a credential.
 
 **And one in `remeasure.py`, found by trying to use it**: `--metric` refused
-`bots.bingbot.top_silos./play` with "no index 'bingbot'", because `bots` is a
+`bots.bingbot.top_silos./app` with "no index 'bingbot'", because `bots` is a
 list and only positional indices were implemented — while the script's own
 `--help` had documented the identity form since it was written. Worse than a
 missing feature: the workaround, `bots.0`, is a positional index into a list
@@ -584,9 +584,9 @@ stands; a 50k-star repo repeating the myth does not change the log study.
 **SerpApi `engine=google_ai_mode` — PROBED LIVE 2026-09-20, with `~/.serpapi_key`.**
 HTTP 200, `search_metadata.status: Success`, and unlike the AI Overview it is
 **single-stage**: `text_blocks` (6), `references` (5) and a
-`reconstructed_markdown` all arrive on the first response. For "how to play
-counter strike 1.6 in browser": Instagram, **play-cs.com ×2**, VPN4Games, DOS
-Zone — combatskirmish.net absent, the same finding as the AI Overview on
+`reconstructed_markdown` all arrive on the first response. For the site's
+core "how to play <game> in browser" query: Instagram, **rival.example ×2**,
+two other portals — the site absent, the same finding as the AI Overview on
 2026-09-01. Google AI Mode is a second answer surface, on the same key, and
 `geo.py` could not ask it. That is the #2 lesson repeated verbatim: "we lack the
 credential" was a remembered constraint that nobody re-checked against the
@@ -668,8 +668,8 @@ instruments, 623 checks, and `run_tests.py` 19 of 19 suites. What each one
 found on contact with live data is under its entry.
 
 - **✅ #14 — `geo.py`: the surfaces it could already reach.** Live: AI Mode
-  answered the site's core query with play-cs.com ×2, dos.zone, Instagram,
-  VPN4Games — combatskirmish.net absent, the AI Overview finding repeated on a
+  answered the site's core query with rival.example ×2, two portals, Instagram
+  — the site absent, the AI Overview finding repeated on a
   second surface. `--runs` forced a rewrite of the sweep arithmetic (a run is
   an answer, so share-of-voice stays ≤ 1.0 by construction), and `seostate.py
   record-ai` / `ai-visibility` now store `runs`/`cited_runs`/`mentioned` and
@@ -948,7 +948,7 @@ AI Overview is reachable today through the SerpApi key this skill already
 uses.** The reasoning stopped at "answer engine = LLM API" and never checked.
 
 Measured within minutes of the tool existing, on six of the site's core queries:
-5 produced an AI Overview, **zero cite combatskirmish.net, and play-cs.com is
+5 produced an AI Overview, **zero cite the site, and rival.example is
 cited in 4 of 5** - an 80% share of voice on our own queries, held by the DR 35
 competitor. Nothing in the program was asking this.
 
@@ -982,8 +982,8 @@ halves, and neither survived contact:
   geolook thesis says the unit is an extractable fact block, so the audit is
   whether a page states its answer in one self-contained, liftable sentence.
   Across 2,694 pages: **zero** with no lead, and the apparent failures were a
-  probe artefact — the weapons pages open with a deliberate one-line tagline
-  ("The T-side rifle. One-shot headshot, brutal recoil.") and the very next
+  probe artefact — the product pages open with a deliberate one-line tagline
+  ("The lightest pack we sell. Fits under a seat.") and the very next
   paragraph is a proper definition naming the entity.
 
 ⚠ **A negative result on the way there, worth keeping.** The first probe was a
@@ -1017,15 +1017,15 @@ and a cache.
 ### ✅ #2c — Bing's PAGE dimension — **BUILT 2026-09-01 (`bing.py pages`)**
 
 Not on the original list, and it turned out to be the item that actually mattered.
-`queries` could say the best-converting terms on combatskirmish.net were Chinese
-and could not say WHICH PAGE earned them — and "our Chinese locale is working" and
-"the English homepage is ranking for Chinese queries" have opposite fixes. Bing
+`queries` could say the best-converting terms on the site were in one
+non-English language and could not say WHICH PAGE earned them — and "our locale is
+working" and "the English homepage is ranking for that language's queries" have opposite fixes. Bing
 exposes `GetPageStats`/`GetPageQueryStats`; nothing here called them.
 
-One call settled it and reframed the whole account: **`/zh/` takes 8,522
-impressions and 2,298 clicks at position 4 — a 27% CTR, three times the
+One call settled it and reframed the whole account: **one locale homepage ranks
+at position 4 for a 27% CTR — three times the
 homepage's clicks from a quarter of its impressions, and 68% of every click the
-site gets.** The homepage carries 33,403 impressions at 2.1%.
+site gets.** The homepage converts its impressions at 2.1%.
 
 Two traps, both controlled, because each returns confident nonsense rather than an
 error: `GetPageStats` puts the page URL in a field named **`Query`**, and sorting
@@ -1043,13 +1043,13 @@ The additive tier turned out to be worth building, and each one found a real
 defect the moment it ran against live data:
 
 - **`vitals.py`** (was #5, whole-site CWV). Per TEMPLATE, not per URL, because
-  on a generated site 2,234 map pages share one layout and a fix is applied per
+  on a generated site 2,234 listing pages share one layout and a fix is applied per
   template. Keyless. Its first version reported **5,940ms TTFB** for a server
   that answers in 119ms - the rest was this container's DNS - and flagged it
   "server/CDN work", pointing at the wrong system entirely. Connect is now timed
   separately and every sweep measures a known-fast third-party host first. It
-  also samples TTFB twice: `/leaderboard` measured 12,065ms once and 70-94ms on
-  repeat (a 5-minute cache the sweep missed), while `/servers/*` measured
+  also samples TTFB twice: `/rankings` measured 12,065ms once and 70-94ms on
+  repeat (a 5-minute cache the sweep missed), while `/listings/*` measured
   4,188 / 4,186 / 4,307 - reproducible, bimodal `[65, 66, 4071, 4157]` across
   1,404 indexed URLs on the tier Bing crawls most.
 - **`brief.py`** (was #6, content briefs). Assembled from measurements, and a
@@ -1080,7 +1080,7 @@ question without a guess and without a build.
 ### #3b — the ORIGINAL framing
 
 `pagecheck.py schema` reads Google's extractor. `claude-seo/seo-schema`
-generates. On combatskirmish.net the `/ring` and `/leaderboard` JSON-LD was
+generates. On the measured site the hub and rankings JSON-LD was
 written by hand.
 
 ⚠ Pairs with `references/schema-gates.md`: a retired rich-result type is a reason
@@ -1112,7 +1112,7 @@ Two process notes, because both cost a step:
 ### #5–#7 — the ORIGINAL framing, superseded above
 
 - **Whole-site CWV** (`unlighthouse`) — "not the bottleneck on any site measured
-  so far". It was: `/servers/*` runs 4.2s on 1,404 indexed URLs. The claim was
+  so far". It was: `/listings/*` runs 4.2s on 1,404 indexed URLs. The claim was
   made without ever measuring the site's server response per template.
 - **Content briefs / competitor pages** (open-seo, claude-seo) — sits on top of
   `competitors.py`, which deliberately returns structure only. Still true, and

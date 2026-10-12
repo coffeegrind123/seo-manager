@@ -23,7 +23,7 @@ verdict before you act.**
 This is where the thin-content literature will lead you wrong. Template share is
 a property of the *writing*. Whether Google keeps, ranks and re-crawls a page is
 a property of what Google *decided*. They come apart constantly, because a
-generated page's unique value is often not prose at all — a map overview image,
+generated page's unique value is often not prose at all — an overview image,
 a spec table, a live server list, a dataset. Shingles cannot see any of it.
 
 > **Measured, and the reason this warning is here.** On a real 2,637-page
@@ -42,7 +42,7 @@ So the sequence is always: **measure → get index evidence → only then act.**
 ## 1. Measure the corpus
 
 ```bash
-python3 $SEO/sameness.py tiers --corpus public/seo/maps --top 15
+python3 $SEO/sameness.py tiers --corpus public/seo/listings --top 15
 ```
 
 O(n) — it builds a document-frequency map of every 5-word shingle across the
@@ -158,7 +158,7 @@ Fold case-duplicate identities at generation time and log every drop.
   **One date with the full URL count beside it is the failure**, and it is silent:
   Google uses `lastmod` only while it is consistently accurate, so a tree that
   stamps every URL with the build date has no freshness signal at all rather than
-  a slightly stale one. Measured on combatskirmish.net 2026-09-01: all **5,388**
+  a slightly stale one. Measured on a ~5,400-URL generated site 2026-09-01: all **5,388**
   URLs carried the same date, defended in the generator by a comment reasoning
   that "the whole tree genuinely is regenerated in a single pass — every page's
   content is as new as this run". Regenerated is not modified, and at that site's

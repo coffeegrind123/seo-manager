@@ -144,11 +144,12 @@ So a list query is not a page this site should write at ANY DR, and a
 demoted; the aggregators the query hands page 1 to are the route on.
 
 `catalogue` is the one that is easy to mis-file as `authority`. Measured
-2026-09-14: `browser vr games` / `vr fps browser` / `webxr games` carried 5–7
-authorities, and a first pass called them "rejected — heyVR/itch own it". The
-count was real, but it was not the reason: a single product is never the best
-answer to a "games" query, at ANY DR — and heyVR, VrWebGames, Viverse and
-itch.io are exactly the sites a browser game gets LISTED on. The right record
+2026-09-14: `best free browser games` / `browser games no download` / `online
+games to play with friends` carried 5–7 authorities, and a first pass called them
+"rejected — the aggregators own it". The count was real, but it was not the
+reason: a single product is never the best answer to a "games" query, at ANY DR
+— and rival-a.example, rival-b.example and rival-c.example are exactly the sites a
+browser game gets LISTED on. The right record
 was three listing prospects, not a rejection. Ask "what does the searcher want
 back — a page, or a list?" before you file the count.
 
@@ -163,7 +164,7 @@ established authority. The script makes the reading fast; it does not make the
 judgement.
 
 ⚠ **Two ceilings on the same SERP that disagree are an instrument problem, not
-two SERPs.** Measured 2026-09-14: serper reported 3 for `counter strike vr pc`
+two SERPs.** Measured 2026-09-14: serper reported 3 for `best hiking boots`
 and the daemon reported 7 — for the identical ten results. Google had started
 wrapping video and discussion results in an opaque `/goto?url=` redirect whose
 `<cite>` reads "9.4K+ views · 8 months ago", so every YouTube and Reddit result
@@ -441,4 +442,13 @@ untrusted data about SHAPE.
 - **Any date you write** — frontmatter `date:`, "last updated" lines, changelog
   entries — comes from running `date -u +%F` in the shell FIRST, never from
   memory. A model's sense of "today" runs days stale.
+- **One owner per head phrase.** No title or H1 may carry a phrase `.seo/headterms.json`
+  gives to another URL (`headterms.py check`). Retitling a page TOWARD a head phrase
+  is how a site ends up rotating its own URLs at the bottom of page 1.
+- **Product claims come from the ledger or the source, never from earlier pages.**
+  `.seo/claims.json` holds the verified facts and the known-false claims;
+  `claims.py scan` runs on every build and every deploy.
+- **A comparison states competitors' facts; it never recommends them.** No "obvious
+  choice", "right answer", "if you want X use Y". The owner's own rule in
+  conventions overrides this default.
 - Report honestly: what was built, what was skipped, and why.

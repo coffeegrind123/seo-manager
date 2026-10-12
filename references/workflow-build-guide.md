@@ -159,6 +159,19 @@ build one per fan-out query — that is the scaled-content pattern the shift was
 aimed at. The pages only this site can publish — the data-study, the product's
 own reference, the measured finding — are the rising citable class.
 
+⚠ **A comparison states facts about competitors; it never routes the reader to
+one.** Prices, platforms, requirements, limits, what each one's own docs say — yes,
+with sources. "X is the obvious choice", "if you want Y, use X", "the right answer
+is X", "a good product in its own right", "the largest" — no. Those are verdicts,
+and a verdict on someone else's product on the owner's site is the owner's call,
+not the writer's: measured 2026-10-12, comparison pages written by an earlier run
+of this skill told readers named competitors were "the obvious choice" and "the
+right answer", and the owner had them removed as false. Where this site has a real
+limitation, state the limitation (that is honest and stays); do not pair it with a
+recommendation to leave. Read the owner's competitor rule in `.seo/conventions.md`
+§6 if it has one — it overrides this default. `claims.py scan` (step 9) puts
+competitor-plus-preference sentences in front of you for review.
+
 **Success criteria**: Two recent exemplars have been read for conventions and voice — not as skeletons — and an archetype is chosen that does NOT repeat the last 2-3 published guides, with the reason (recent mix + SERP) stated for the report and PR body.
 
 ---
@@ -191,7 +204,19 @@ So before drafting, for any idea whose angle asserts the product *does* somethin
 This costs one grep and it is the cheapest gate in the workflow. It runs BEFORE the
 SERP re-pull because a false premise cannot be rescued by a weak page 1.
 
-**Success criteria**: Every capability the angle asserts is confirmed in the CODE, API or current official docs — never the landing page or the queue rationale. A claim that fails sends the row back to `pending` with evidence; it is never softened into a vaguer version of itself.
+**Then read `.seo/claims.json`** — the site's ledger of verified product facts
+(each with the source file it came from) and its `never` list of claims known to be
+false. It is the same lesson made durable: the claims that go wrong are rarely
+invented in the draft, they are COPIED from earlier pages, and an earlier page is
+positioning copy. Measured 2026-10-12 on a real site: one aspirational sentence
+about the product's technology had spread to ~15 English passages, a FAQ, its
+JSON-LD and ~400 translated strings, while the repo's README said otherwise in its
+first line; three more had gone stale as features shipped, so the site undersold
+itself in ~20 places. If the draft needs a product fact the ledger does not carry,
+verify it in the source and ADD it (with its source) — the next run inherits it.
+If there is no ledger yet, create one from what this step just verified.
+
+**Success criteria**: Every capability the angle asserts is confirmed in the CODE, API or current official docs — never the landing page or the queue rationale. A claim that fails sends the row back to `pending` with evidence; it is never softened into a vaguer version of itself. `.seo/claims.json` was read, and any product fact this draft relies on is in it with a source.
 
 ---
 
@@ -644,6 +669,38 @@ the run report. That is the honest shape, not a gap.
 
 **Success criteria**: `factcheck.py claims --fetch` ran on the final draft; every `uncited` claim is either sourced or explicitly marked as this run's own measurement; no `not_in_source` claim ships; `unverified` sources were replaced where a checkable one exists.
 
+### Then the HEAD-TERM GATE — the title and H1 may not take another page's phrase
+
+```bash
+python3 $SEO/headterms.py check --url <this page's path> \
+  --title "<final title>" --h1 "<final H1>"
+```
+
+`.seo/headterms.json` records which URL OWNS each head phrase. A new page whose
+title or H1 carries an owned phrase becomes a second candidate for that query, and
+the engine rotates between the two — both rank worse than either would alone. The
+sameness gate cannot see it (different bodies, same head). Measured 2026-10-12: an
+earlier run of this skill retitled a lander toward the homepage's head phrase with
+every body-level gate green; six weeks later four of the site's URLs were rotating
+at average position 8-10 for that phrase and the homepage was shown for none of it.
+
+`collides` → choose a head that answers THIS page's own question and link to the
+owner with the phrase as the anchor instead. Moving ownership is a decision for
+the map, made from `bing.py cannibal` / `decay.py cannibal` measurements and
+recorded there with a reason — never a way to pass this check. A missing map is a
+refusal, not a pass: create it (setup Part 3) before shipping a head.
+
+### Then the PRODUCT-CLAIMS SCAN — against the ledger, on the BUILT page
+
+```bash
+python3 $SEO/claims.py scan --root <build output dir> --glob '<this page's built file>'
+```
+
+Deterministic `findings` are sentences matching a `never` rule: fix every one
+before the PR. `review` items are sentences that name a listed competitor next to
+a preference cue: read each verbatim and apply the comparison rule in §3. It reads
+JSON-LD prose too, because a FAQ answer in structured data IS published copy.
+
 ### Then the SAMENESS GATE — mandatory
 
 ```bash
@@ -676,7 +733,7 @@ flagged, and exit cleanly without a PR. **Never loop past three.**
 
 If it passes open with a note (corpus unreadable), say so in the report.
 
-**Success criteria**: The site's build command passes, internal links resolve to real slugs, the slop scan ran BEFORE the sameness gate and its `flagged` rules were acted on, and the sameness gate PASSED. A sameness fail is never argued with, shipped past, or reworded away; after three honest rewrites the row goes back to `pending` and the run exits without a PR.
+**Success criteria**: The site's build command passes, internal links resolve to real slugs, the slop scan ran BEFORE the sameness gate and its `flagged` rules were acted on, `headterms.py check` returned `clear`, `claims.py scan` has no findings and every review item was read, and the sameness gate PASSED. A sameness fail is never argued with, shipped past, or reworded away; after three honest rewrites the row goes back to `pending` and the run exits without a PR.
 
 ---
 

@@ -160,9 +160,9 @@ named `User-agent: GPTBot` group whose whole body is `Allow: /` grants that agen
 every path the `*` group closes. Nothing in the file looks wrong: the exclusions
 are right there, a few lines above, in a group that does not apply to it.
 
-**Measured on combatskirmish.net, 2026-09-01.** The file allowed AI crawlers
+**Measured on a browser-game site, 2026-09-01.** The file allowed AI crawlers
 deliberately and correctly — and 18 named agent groups reached up to 11 disallowed
-paths each, including `/g/` (tokenised game binaries), `/api/` and `/dl/`. Over
+paths each, including `/assets/` (tokenised binaries), `/api/` and `/download/`. Over
 the six days 2026-08-26..09-01 Amazonbot made 5,035 requests (839/day), the
 largest crawler on the site by a factor of two. The file's own header stated the
 intent — *"keep them out of the API and

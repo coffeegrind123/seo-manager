@@ -119,8 +119,8 @@ python3 $SEO/sitegraph.py canonicals --graph .seo/graph/site.json  # then this
 ⚠ **Run `canonicals` on the built tree, before the deploy.** A canonical naming a
 URL that 404s makes the page **unindexable**, and nothing about either half looks
 wrong on its own — which is why it shipped here once already: the repo generates on
-a case-INSENSITIVE mount and production is case-SENSITIVE, so `cs_Assault` and
-`cs_assault` wrote to one file, the survivor carried the other name's canonical, and
+a case-INSENSITIVE mount and production is case-SENSITIVE, so `Item-One` and
+`item-one` wrote to one file, the survivor carried the other name's canonical, and
 both halves of 19 pairs pointed at a dead URL from inside the sitemap. Offline is the
 whole point — a live crawl cannot tell a dangling canonical from a page it simply did
 not reach, and the tool says so in its own output rather than letting you assume.
@@ -128,7 +128,7 @@ not reach, and the tool says so in its own output rather than letting you assume
 ⚠ **Read `external_silo_median` and `islands`, not `inlinks_median`.** A silo whose
 pages cross-link each other has healthy-looking inbound counts on every page and is
 reachable from nowhere a crawler already goes. That is not a hypothetical: on
-combatskirmish.net every page in `/guides` had **16 inbound links, all 16 from other
+a browser-game site every page in `/guides` had **16 inbound links, all 16 from other
 guides**, and Google's URL Inspection API reported all twelve as *"URL is unknown to
 Google, never crawled"* nine days after they shipped — while the indexed control page
 sat in the same sitemap. `orphans` alone reports zero in that situation, because the
@@ -142,9 +142,9 @@ page, and the fix is contextual links INTO it from the silos that already get cr
 counts body links only, so every page that lives in the global nav scores zero — and
 those are the most reachable pages you have. They are reported separately as
 `nav_hub_urls` with their true inbound count; read that field before treating one as a
-finding. Measured on combatskirmish.net 2026-09-01: of 27 zero-contextual pages, 6 were
+finding. Measured on a ~4,000-page site 2026-09-01: of 27 zero-contextual pages, 6 were
 nav hubs carrying 3,978-12,070 inbound links each. The remaining 21 were locale home
-pages (`/es`, `/tr`, …), and they turned out to be the SAME artefact one scope down: `/zh`
+pages (`/es`, `/tr`, …), and they turned out to be the SAME artefact one scope down: `/fr`
 is linked from **60 of the 60 pages in its own locale** by breadcrumb and logo, but a
 locale nav covers 1.5% of a 3,977-page site, so a site-wide frequency rule cannot see it.
 `Graph.section_roots()` catches furniture at section scale too, and the site's real orphan
@@ -152,7 +152,7 @@ count is **zero**.
 
 ⚠ That fix is deliberately narrow — it requires the target to be the PARENT PATH of the
 pages linking to it — because a share-based section rule would have hidden the island silo
-this tool exists to find: `/guides/bunny-hop` is linked from 16 of 17 guides, a 0.94 share,
+this tool exists to find: `/guides/getting-started` is linked from 16 of 17 guides, a 0.94 share,
 which is indistinguishable from a nav by frequency alone. Only the parent-path test
 separates them, and `test_sitegraph.py` case 8 holds both in one graph to prove it.
 

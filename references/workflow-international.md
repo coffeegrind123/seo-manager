@@ -135,27 +135,27 @@ python3 $SEO/bing.py expand --seed '<the locale's own head term>' \
 Then diff the demand against what the page already ranks for. That is the gap,
 and it is stated in impressions rather than intuition.
 
-**Measured on combatskirmish.net, 2026-09-01, and every step of it was a
+**Measured on a browser-game site, 2026-09-01, and every step of it was a
 surprise to the people who built the site:**
 
-- `/zh/` earned **2,298 of the site's 3,357 Bing clicks — 68%** — at a 27% CTR
+- One locale homepage earned **68% of the site's Bing clicks** — at a 27% CTR
   from position 4, against the English homepage's 2.1% from four times the
-  impressions. The site's own access log agreed independently: `cn.bing.com`
-  sent 1,988 referrals against google.com's 495.
-- The phrase driving it, **网页版** ("web version", 20,770 impressions), appeared
-  **nowhere on the page**. It ranked #2 on relevance alone.
-- The gap came to ~14,000 impressions of Chinese demand with no presence at all.
+  impressions. The site's own access log agreed independently: that market's
+  Bing host sent four times the referrals google.com did.
+- The phrase driving it, the locale's own word for **"web version"** (20,770
+  impressions), appeared **nowhere on the page**. It ranked #2 on relevance alone.
+- The gap came to ~14,000 impressions of that locale's demand with no presence at all.
 
 ⚠ **Two disciplines this needs, both of which changed the answer here.**
 
 **Strip brand and competitor terms before summing a gap.** A competitor's own
-brand (`webcs.xyz`, 21,178 impressions) is demand you cannot serve, and leaving
+brand (`rival.example`, 21,178 impressions) is demand you cannot serve, and leaving
 it in inflates the opportunity by more than the opportunity.
 
-**Check that the phrase is TRUE before targeting it.** 中文版 ("Chinese version")
-was worth another ~4,700 impressions and was rejected: the page is in Chinese but
-the game is not localised — no `game_langs`, no `zh_CN` strings in the client — so
-the phrase would promise a build that does not exist. A keyword gap is a reason to
+**Check that the phrase is TRUE before targeting it.** The locale's word for
+"<language> version" was worth another ~4,700 impressions and was rejected: the
+page is translated but the product is not localised — no translated strings in the
+app itself — so the phrase would promise a build that does not exist. A keyword gap is a reason to
 check a claim, never a reason to make one.
 
 And when the winning page is that large a share of the site's traffic, changes to

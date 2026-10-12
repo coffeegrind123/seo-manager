@@ -256,6 +256,29 @@ read like the owner wrote it.
 
 The tracking helper and event-naming convention, if any.
 
+### 8. Head-term ownership and the claims ledger — two JSON files beside this one
+
+Both are site facts, so both live in the site's repo, never in the skill.
+
+**`.seo/headterms.json`** — which URL owns each head phrase (format in
+`headterms.py --help`). Seed it from measurements, not intuition: `bing.py
+cannibal` (Bing-led sites) or `decay.py cannibal` (Search Console) shows which URL
+the engine already prefers for each head query. One owner per phrase; usually the
+homepage owns the product's main phrase and each hub owns its own. Then run
+`headterms.py scan --root <build output>` once and resolve what it reports BEFORE
+the first content run — every later build is gated on it, and `drift.py snapshot`
+starts tracking page 1 for every owned phrase.
+
+**`.seo/claims.json`** — the product facts a writer may state, each with the
+source file that proves it, and a `never` list of claims known to be false (format
+in `claims.py --help`). Build it from the SOURCE (README, docs, code), not from the
+homepage: positioning copy is where an aspirational claim hides. Add the main
+competitors' names under `competitors`, then run `claims.py scan --root <build
+output>` once. The first scan of an existing site usually finds something.
+
+If the owner has a rule about how competitors may be framed (§6 voice rules), write
+it down here in conventions — `claims.py` only surfaces the sentences to read.
+
 ---
 
 ## Part 4 — personalize the site profile

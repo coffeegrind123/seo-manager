@@ -27,9 +27,46 @@ so this is the ladder that matters most.
 | **`marginalia`** | free | no | ✅ **verified keyless** | `api.marginalia.nu/public/search/<q>` answers 200 JSON with no key at all. A genuinely independent index that deliberately favours non-commercial pages — **useless for the authority gate** (it down-ranks exactly the commercial results the gate counts) but a real seam for information-gain research. |
 | **`dataforseo`** | paid | yes | untested here | Real Google, live, per-request billing. |
 | **`searxng`** | free (self-host) | no | ⚠️ **public instances blocked** | A *self-hosted* SearXNG with `format: json` is an excellent free aggregator. Public ones are not: `searx.be` answered with an antibot challenge, `priv.au` with 429. |
-| ~~Bing~~ | — | — | ❌ **actively hostile — never add it** | See the wrong-query warning below. |
+| **`bing`** (HTML, opt-in) | free | no | ⚠️ **works behind guards, never in the failover** | `--provider bing`. Needs the residential proxy and a pinned exit, which is confirmed rather than assumed. Two wrong-answer modes are refused by name (`wrong_query`, `query_collapse`), and a challenge page is refused as `challenge`. One page only. See "Bing, opt-in" below. |
 
-### ❌ Bing returns clean results for a DIFFERENT query
+### Bing, opt-in (2026-10-12)
+
+Re-measured on a site whose traffic is Bing-led, where "what does Bing rank" is the
+question that matters. Bing is now `--provider bing`, opt-in and outside the failover,
+because each failure below is either refused or reported:
+
+| Route | Result | Guard |
+|---|---|---|
+| plain request, no proxy | ten well-formed rows for an UNRELATED query (speed tests, prediction markets); search box still showed the right query | topical overlap → `wrong_query` |
+| headed Chrome (serpd) | "One last step" challenge page | `challenge` (cannot ask) |
+| residential proxy, fixed exit | correct page 1 for some queries | exit pinned to the market, confirmed via ip-api on the same sticky session; a different country → `exit_mismatch` |
+| verb-led query ("play ...") | the bare verb's results (app stores, game portals), 15/15 from US/CA/AU exits | `detect_collapse` → `query_collapse` |
+| `first=11`, `count=30` | ignored: page 1 again, ten rows | one page read; `depth.read` is the ceiling |
+
+**Collapse is not wrong-query, and the 2026-07-30 fixtures below were collapses.**
+Re-read, both `bing-fr` and `bing-de` collapsed onto "self", the query's first word
+(first-word share 0.86 / 1.0, rest 0.0). The collapse rule: the first word is in ≥60%
+of results AND ≤20% carry a MAJORITY of the remaining words. "Any remaining word" is too
+weak, because a collapsed verb page of game portals still says "games". Only the first
+word is tested: every measured collapse was onto it, and testing any word would flag a
+brand SERP whose titles carry the brand but not the qualifier after it. A collapse also
+gets past the relevance check on short queries: "best boots" leaves one relevance token,
+so a page of dictionary entries for "best" would pass the `qualifier_ignored` exemption.
+
+**Same query, different session, different answer.** "best hiking boots" from US exits
+collapsed onto "best" on one session and was a clean ten-result page on two others the
+same day. One refused read is a refused read, not a property of the query.
+
+**Parsing:** organic links are `bing.com/ck/a?…&u=a1<base64url>` with the `=` padding
+stripped, and some destinations carry a per-session `msockid` that is removed. Ads
+(`b_ad*` classes) and modules (`b_msg` etc.) are detected by class attribute, never by
+substring: the inline JS of an ad-free page says `adc:"b_ad"` and "Challenge".
+
+**Exit reporting (every proxied provider, DuckDuckGo included):** `exit_country` is what
+the session OBSERVED, `exit_requested` what was asked for. A probe that cannot confirm the
+exit is reported as `exit_country: null, exit_unconfirmed: true`, never silently dropped.
+
+### ❌ Bing returns clean results for a DIFFERENT query (the 2026-07-30 record)
 
 **The most dangerous thing measured in this whole exercise, and the reason the
 relevance guard exists.**
@@ -244,6 +281,7 @@ first looks. Measured against one commercial provider; the shapes generalise:
 | **Geo-pinned SERPs** — how does this page rank *from Germany* | ✅ real feature |
 | Getting around **DuckDuckGo's 202** | ❌ measured not to work |
 | Making **Google HTML** scrapeable | ❌ it is JS-only, not IP-gated |
+| **Bing HTML** with a pinned, confirmed exit | ✅ works for some queries; the direct route answers the wrong query |
 
 **Google rate-limits the headed browser too, after enough queries.** Around 45
 checks into a testing session, consecutive queries started returning `/sorry`
@@ -385,10 +423,11 @@ p = serp.Proxy(serp._read_proxy_file()["SEO_PROXY_URL"], country="de")
 **Country pool** (`--proxy-country`): whatever your provider actually serves —
 verify it rather than trusting the marketing list. On the provider this was
 measured against, `gr se nl it de es pl ro pt be at cz dk ie ch` all resolved and
-**`us` did not**: asking for it silently returned a random non-US exit, so a
-US-pinned request would have quietly lied about its geo. `serp.py` refuses `us`
-for that reason. Re-check this for your own provider before trusting a geo-pinned
-result.
+**`us` did not** at the time: asking for it silently returned a random non-US exit, so a
+US-pinned request would have quietly lied about its geo. ⚠ That was 2026-07; `us` has been
+on `serp.py`'s verified list since 2026-08-02 and a confirmed US exit was read on
+2026-10-12. The lesson stands: a country list is a measurement with a date on it -
+re-check it (`serp.py --verify-countries`) before trusting a geo-pinned result.
 
 **Credentials never appear in output.** Payloads log
 `proxy: "proxy.example-provider.com (session ab12cd, de)"` and nothing more; curl's stderr
@@ -1030,7 +1069,7 @@ request; it is a missing `GOOGLE_API_KEY`, and the script says so.
 **Live with a key, 2026-09-20.** Enabling the API alone changes nothing — the
 console's "doesn't require that you create credentials" banner means no OAuth
 consent, not no key; the bearer still 400s after enabling. With the key:
-`web.dev` PHONE answers (control), `combatskirmish.net` has a **DESKTOP record
+`web.dev` PHONE answers (control), `example.com` has a **DESKTOP record
 only** (PHONE is `no_record` — too little mobile traffic, a fact about sample
 size), and its LCP p75 of 2,335 ms decomposes into TTFB 642 / load delay 545 /
 load duration 778 / render delay 303 — the image fetch, not the server, is the
@@ -1176,7 +1215,7 @@ Engine tenant can obtain, so rDNS is not a witness for them — CIDR is.
 (CLS values are STRINGS; a missing week is null/`NaN`) and
 `record.collectionPeriods[].lastDate`. Measured with the install's
 `GOOGLE_API_KEY`: www.wikipedia.org returned 25 periods for LCP/INP/CLS;
-combatskirmish.net PHONE is `no_record`. Each point is a 28-day rolling window, so
+a low-mobile-traffic site's PHONE is `no_record`. Each point is a 28-day rolling window, so
 consecutive points overlap. `vitals.py history`.
 
 ### Agentic Resource Discovery and UCP — the specs, not a port of them

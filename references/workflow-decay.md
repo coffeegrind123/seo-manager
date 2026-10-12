@@ -175,7 +175,22 @@ both.
 If the weaker URL is generated/programmatic and the stronger is curated, the
 generated one canonicalises to the curated one, never the reverse.
 
-**Success criteria**: Each cannibalised query has one page named as the winner and a consolidation action for the other. Generated pages canonicalise to curated ones, never the reverse.
+**On a Bing-led site, read Bing's version too** — Search Console may see a few
+hundred impressions where Bing sees tens of thousands:
+
+```bash
+python3 $SEO/bing.py cannibal --limit 20                       # the top pages, per query
+python3 $SEO/bing.py cannibal --owners-file .seo/headterms.json # + owner_absent per owned phrase
+```
+
+`split` is two or more URLs sharing a query's impressions; `owner_absent` is the
+owner of a phrase getting none while another URL does; `edge_of_page` is a best
+average position between 7 and 11. Together they are the signature of "we keep
+falling off page 1" when nothing was penalised: the engine is rotating your own
+URLs at the bottom of page 1. Fix the HEADS (titles/H1s), record the winner in
+`.seo/headterms.json`, and let `headterms.py` stop it recurring.
+
+**Success criteria**: Each cannibalised query has one page named as the winner and a consolidation action for the other, and the winner is recorded in `.seo/headterms.json`. Generated pages canonicalise to curated ones, never the reverse.
 
 ---
 
