@@ -100,8 +100,215 @@ def parse_after(s: str) -> int | None:
     return n * {"d": 1, "w": 7, "m": 30}[unit]
 
 
+# ---------------------------------------------------------------- metric paths
+# A metric path is dotted segments; a segment is a NAME, one or more row
+# SELECTORS, or a name followed by selectors:
+#
+#     queries[query=best hiking boots].avg_position
+#     \_____/\_______________________/ \__________/
+#      name    selector: field=value      name
+#
+#     segment   := name? selector*          (at least one of the two)
+#     name      := dict key | list index (0, -1) | legacy row identity (bingbot)
+#     selector  := '[' field '=' value ']'  exact, case-sensitive string match
+#     value     := "quoted"  -> \" and \\ are the only escapes
+#                | unquoted  -> everything up to the closing ], with \] \\ \" escapes
+#
+# Dots and spaces inside [...] are literal, so `[query=a.b c]` needs no quotes;
+# quoting is for a value containing ] or ", or to make leading/trailing spaces
+# and the empty string visible (`[query=""]`). Outside brackets \. \[ \\ escape a
+# key that contains those characters. Several selectors on ONE segment must all
+# hold on the same row (`rows[query=x][page=/a]`) - the way to disambiguate a
+# selector that matches two rows. A number or bool field is compared by its JSON
+# text: `[rank=3]` matches 3, never 3.0 or "03"; `[code=007]` matches the string
+# "007" and not the number 7.
+
+_ESC_NAME = ".[\\"
+_ESC_FIELD = "=]\\"
+_ESC_VALUE = '"]\\'
+
+
+def _read_until(path: str, i: int, stops: str, escapable: str, what: str) -> tuple[str, int]:
+    out = []
+    while i < len(path) and path[i] not in stops:
+        ch = path[i]
+        if ch == "\\":
+            if i + 1 >= len(path) or path[i + 1] not in escapable:
+                raise ValueError(f"bad escape at position {i} in {what} "
+                                 f"(only {' '.join(escapable)} may follow a backslash)")
+            out.append(path[i + 1])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out), i
+
+
+def _read_selector(path: str, i: int) -> tuple[tuple[str, str], int]:
+    """`path[i]` is '['. Returns ((field, value), index after ']')."""
+    open_at = i
+    field, i = _read_until(path, i + 1, "=]", _ESC_FIELD, "a selector field")
+    if i >= len(path) or path[i] != "=":
+        raise ValueError(f"selector at position {open_at} has no '=' - write [field=value]")
+    if not field:
+        raise ValueError(f"selector at position {open_at} has an empty field name")
+    i += 1
+    if i < len(path) and path[i] == '"':
+        buf, i = [], i + 1
+        while True:
+            if i >= len(path):
+                raise ValueError(f"unterminated quote in the selector at position {open_at}")
+            ch = path[i]
+            if ch == "\\":
+                if i + 1 >= len(path) or path[i + 1] not in '"\\':
+                    raise ValueError(f"bad escape at position {i} in a quoted value "
+                                     '(only \\" and \\\\ are escapes)')
+                buf.append(path[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                i += 1
+                break
+            buf.append(ch)
+            i += 1
+        value = "".join(buf)
+        if i >= len(path) or path[i] != "]":
+            raise ValueError(f"expected ']' after the quoted value at position {i}")
+    else:
+        value, i = _read_until(path, i, "]", _ESC_VALUE, "a selector value")
+        if i >= len(path):
+            raise ValueError(f"selector at position {open_at} is not closed with ']'")
+    return (field, value), i + 1
+
+
+def parse_path(path: str) -> list[tuple[str | None, tuple[tuple[str, str], ...]]]:
+    """Parse a metric path into [(name or None, ((field, value), ...)), ...].
+    Raises ValueError naming the position - a malformed path must be refused
+    when it is RECORDED, not discovered as `unmeasured` three weeks later."""
+    if not isinstance(path, str) or not path:
+        raise ValueError("empty metric path")
+    segs, i = [], 0
+    while True:
+        seg_at = i
+        name, i = _read_until(path, i, ".[", _ESC_NAME, "a key")
+        had_name = i > seg_at
+        sels = []
+        while i < len(path) and path[i] == "[":
+            sel, i = _read_selector(path, i)
+            sels.append(sel)
+        if not had_name and not sels:
+            raise ValueError(f"empty segment at position {seg_at}")
+        segs.append((name if had_name else None, tuple(sels)))
+        if i == len(path):
+            return segs
+        if path[i] != ".":
+            raise ValueError(f"unexpected {path[i]!r} at position {i} - a selector "
+                             "must be followed by '.', '[' or the end of the path")
+        i += 1
+        if i == len(path):
+            raise ValueError("the path ends with '.'")
+
+
+def _quote_value(v: str) -> str:
+    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _fmt_sels(sels) -> str:
+    """Canonical text of a segment's selectors: every value quoted, so the
+    same row written `[q=a b]` or `[q="a b"]` prints - and compares - alike."""
+    def field(f: str) -> str:
+        return "".join("\\" + ch if ch in _ESC_FIELD else ch for ch in f)
+    return "".join(f"[{field(f)}={_quote_value(v)}]" for f, v in sels)
+
+
+def _sel_text(v) -> str | None:
+    """The string a selector compares against. JSON text for numbers and bools,
+    so a numeric-looking field is selectable at all; None/dict/list never match -
+    a row with no identity value cannot be the row a hypothesis named."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return json.dumps(v)
+    return None
+
+
+def resolve(obj, path: str, missing_is_zero: bool = False):
+    """`dig` with the error's KIND: (value, error, kind), kind one of None,
+    'syntax', 'missing', 'no_match', 'ambiguous', 'type'. `check` needs the kind:
+    an ambiguous selector is a refusal (the path no longer names one row), a
+    miss is `unmeasured`, and the two must not read the same."""
+    try:
+        segs = parse_path(path)
+    except ValueError as e:
+        return None, f"malformed metric path {path!r}: {e}", "syntax"
+    # missing_is_zero answers for the SPARSE MAP AT THE LEAF, never for a row a
+    # selector names. A selector picks a row out of a list, and a missing row is
+    # not a zero: the list is usually a top-N, so absence means "below the cut",
+    # a renamed or re-cased field, a typo in the selector, or a truncated
+    # response - and for a position metric a zero would read as better than #1.
+    # So the flag only covers dict keys AFTER the last selector.
+    last_sel = max((k for k, (_, sels) in enumerate(segs) if sels), default=-1)
+    cur = obj
+    for k, (part, sels) in enumerate(segs):
+        if part is not None:
+            if isinstance(cur, dict):
+                if part not in cur:
+                    if missing_is_zero and k > last_sel:
+                        return 0, None, None
+                    return None, f"no key {part!r} at {path!r}", "missing"
+                cur = cur[part]
+            elif isinstance(cur, list):
+                # A positional index into a list that is SORTED BY VALUE is a
+                # measurement that silently re-points itself: `bots.0` was bingbot
+                # today and is whatever ranks first at re-check time, so the verdict
+                # compares two different bots and calls it a change. So a non-numeric
+                # segment addresses the element whose own identity field matches it -
+                # which is also what this script's own --help has always documented
+                # (`bots.bingbot.hits`) and what it did not implement until
+                # 2026-09-01, refusing the documented example as "no index".
+                if part.isdigit() or (part[:1] == "-" and part[1:].isdigit()):
+                    try:
+                        cur = cur[int(part)]
+                    except IndexError:
+                        return None, f"no index {part!r} at {path!r}", "missing"
+                else:
+                    match = [el for el in cur if isinstance(el, dict) and any(
+                        str(el.get(f, "")).lower() == part.lower()
+                        for f in ("key", "id", "name", "bot", "slug"))]
+                    if len(match) != 1:
+                        return None, (f"{part!r} matches {len(match)} elements at {path!r} - "
+                                      "a metric must name exactly one"), (
+                                          "ambiguous" if match else "no_match")
+                    cur = match[0]
+            else:
+                return None, f"cannot descend into {type(cur).__name__} at {part!r}", "type"
+        if not sels:
+            continue
+        where = f"{part or ''}{_fmt_sels(sels)}"
+        if not isinstance(cur, list):
+            return None, (f"selector {where} needs a list of rows, found "
+                          f"{type(cur).__name__}"), "type"
+        hits = [j for j, el in enumerate(cur) if isinstance(el, dict)
+                and all(f in el and _sel_text(el[f]) == v for f, v in sels)]
+        if not hits:
+            return None, (f"no row matches {where} among {len(cur)} rows at {path!r} - "
+                          "a row that is not there is UNMEASURED, never a zero"), "no_match"
+        if len(hits) > 1:
+            shown = ", ".join(map(str, hits[:8])) + (", ..." if len(hits) > 8 else "")
+            return None, (f"{where} matches {len(hits)} rows (indices {shown}) at {path!r} - "
+                          "refusing to pick one; add another [field=value] to the same "
+                          "segment to name exactly one row"), "ambiguous"
+        cur = cur[hits[0]]
+    if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+        return None, f"{path!r} is {type(cur).__name__}, not a number", "type"
+    return cur, None, None
+
+
 def dig(obj, path: str, missing_is_zero: bool = False):
-    """`a.b.0.c` out of nested JSON. Returns (value, error).
+    """The metric at `path` out of nested JSON (grammar above). Returns
+    (value, error).
 
     A missing key is an ERROR, never a zero. "the metric is not in the output"
     and "the metric is zero" are different states, and collapsing them is how a
@@ -112,49 +319,17 @@ def dig(obj, path: str, missing_is_zero: bool = False):
     `top_silos` omits a silo the bot never touched, and `/guides` being absent
     is precisely the finding. It must be a decision recorded WITH the hypothesis
     rather than a default, because as a default it silently converts every
-    renamed key and every failed read into a zero."""
-    cur = obj
-    for part in path.split("."):
-        if isinstance(cur, dict):
-            if part not in cur:
-                if missing_is_zero:
-                    return 0, None
-                return None, f"no key {part!r} at {path!r}"
-            cur = cur[part]
-        elif isinstance(cur, list):
-            # A positional index into a list that is SORTED BY VALUE is a
-            # measurement that silently re-points itself: `bots.0` was bingbot
-            # today and is whatever ranks first at re-check time, so the verdict
-            # compares two different bots and calls it a change. So a non-numeric
-            # segment addresses the element whose own identity field matches it -
-            # which is also what this script's own --help has always documented
-            # (`bots.bingbot.hits`) and what it did not implement until
-            # 2026-09-01, refusing the documented example as "no index".
-            if part.isdigit() or (part[:1] == "-" and part[1:].isdigit()):
-                try:
-                    cur = cur[int(part)]
-                except IndexError:
-                    return None, f"no index {part!r} at {path!r}"
-            else:
-                match = [el for el in cur if isinstance(el, dict) and any(
-                    str(el.get(f, "")).lower() == part.lower()
-                    for f in ("key", "id", "name", "bot", "slug"))]
-                if len(match) != 1:
-                    return None, (f"{part!r} matches {len(match)} elements at {path!r} - "
-                                  "a metric must name exactly one")
-                cur = match[0]
-        else:
-            return None, f"cannot descend into {type(cur).__name__} at {part!r}"
-    if isinstance(cur, bool) or not isinstance(cur, (int, float)):
-        return None, f"{path!r} is {type(cur).__name__}, not a number"
-    return cur, None
+    renamed key and every failed read into a zero. It never zeroes a row a
+    selector failed to find (see `resolve`)."""
+    value, err, _ = resolve(obj, path, missing_is_zero)
+    return value, err
 
 
 def run_measurement(cmd: str, timeout: int = 900) -> dict:
     """Run a skill command and return its JSON. The argv is the identity of the
     measurement, so it is echoed back for the caller to compare."""
     # ⚠ shlex, not .split(). A stored command is round-tripped through a string,
-    # and a whitespace split turns `serp.py 'cs 1.6 online'` into three
+    # and a whitespace split turns `serp.py 'red running shoes'` into three
     # arguments - the measurement then fails with an argparse usage message,
     # which `record` correctly refuses on but which reads as a broken tool
     # rather than a quoting bug.
@@ -196,7 +371,25 @@ def same_experiment(cmd: str, metric: str) -> tuple:
     except ValueError:
         parts = cmd.split()
     norm = [os.path.expanduser(t) for t in parts]
-    return (tuple(norm), metric.split(".")[-1])
+    return (tuple(norm), *_metric_identity(metric))
+
+
+def _metric_identity(metric: str) -> tuple:
+    """What a metric path READS, for duplicate detection: the leaf name plus
+    every row selector, canonically quoted.
+
+    The leaf alone was the identity, so that `bots.0.hits` and `bots.bingbot.hits`
+    - one number addressed two ways - collide. A selector cannot be dropped the
+    same way: `queries[query=a].avg_position` and `queries[query=b].avg_position`
+    share a leaf and are two different experiments, and splitting on '.' also
+    cut a selector value like `a.b c` in half. A positional index carries no
+    identity, so it stays out."""
+    try:
+        segs = parse_path(metric)
+    except ValueError:
+        return (metric, ())
+    leaf = segs[-1][0] if segs[-1][0] is not None else ""
+    return (leaf, tuple(_fmt_sels(sels) for _, sels in segs if sels))
 
 
 def record(a) -> dict:
@@ -206,6 +399,15 @@ def record(a) -> dict:
                       f"--after {a.after!r} is not a duration (use 14d / 3w / 2m)")
     if a.expect not in DIRECTIONS:
         return refuse("remeasure-record", f"--expect must be one of {DIRECTIONS}")
+    for flag, pth in (("--metric", a.metric), ("--denominator", getattr(a, "denominator", None))):
+        if pth is None:
+            continue
+        try:
+            parse_path(pth)
+        except ValueError as e:
+            return refuse("remeasure-record", f"{flag} {pth!r} is not a valid path: {e}",
+                          hint=("dotted keys, numeric indices, and [field=value] row "
+                                'selectors; quote a value holding ] or " as [field="..."]'))
 
     # Checked BEFORE the baseline is measured: taking a measurement to register
     # a duplicate wastes the call and, worse, produces a SECOND baseline for one
@@ -375,13 +577,23 @@ def check(a) -> dict:
                 "note": ("UNMEASURED is not NO CHANGE. The hypothesis stays open and "
                          "nothing about it has been learned.")}
 
-    value, err = dig(got["data"], row["metric"], row.get("missing_is_zero", False))
+    value, err, kind = resolve(got["data"], row["metric"], row.get("missing_is_zero", False))
+    if kind == "ambiguous":
+        # REFUSED, not compared and not zeroed: the path that named one row at
+        # baseline now names several, so any value picked would be a guess about
+        # which row the hypothesis meant. Still logged, still open.
+        row["checks"].append({"at": now(), "state": "unmeasured", "kind": kind, "reason": err})
+        save(a.root, d)
+        return refuse("remeasure-check", err, id=a.id, state="unmeasured", kind=kind,
+                      question=row["question"], metric=row["metric"],
+                      hint=("the hypothesis stays open; close it and record one whose "
+                            "selector names exactly one row"))
     if err:
-        entry = {"at": now(), "state": "unmeasured", "reason": err}
+        entry = {"at": now(), "state": "unmeasured", "kind": kind, "reason": err}
         row["checks"].append(entry)
         save(a.root, d)
         return {"ok": False, "check": "remeasure-check", "id": a.id, "state": "unmeasured",
-                "question": row["question"], "reason": err,
+                "kind": kind, "question": row["question"], "reason": err,
                 "note": ("the metric path is missing from the output - that is a changed "
                          "tool or a failed read, NEVER a value of zero")}
 
@@ -496,12 +708,14 @@ def run_control() -> dict:
     c.check("but_it_is_off_by_default", v8 is None and bool(err8),
             "as a default it converts every renamed key into a zero")
 
+    _selector_controls(c)
+
     q = run_measurement("controls.py control")
     c.check("a_simple_command_runs", q.get("ok") is True, str(q.get("error"))[:120])
     # The quoting round-trip. Without shlex this reports 3 tokens, not 2.
     import shlex as _sh
     c.check("a_quoted_argument_survives_the_round_trip",
-            _sh.split("serp.py 'cs 1.6 online' --count 20")[1] == "cs 1.6 online",
+            _sh.split("serp.py 'red running shoes' --count 20")[1] == "red running shoes",
             "a whitespace split makes this three arguments and the measurement fails")
     c.check("an_unbalanced_quote_is_an_error_not_a_crash",
             run_measurement("serp.py 'unclosed").get("ok") is False)
@@ -597,6 +811,158 @@ def run_control() -> dict:
     return c.verdict()
 
 
+def _selector_controls(c: Controls) -> None:
+    """Row selectors. Every expected value below is a literal written from the
+    fixture by hand, never read back through `dig` - a control that derives its
+    expectation from the code under test passes whatever the code does."""
+    rows = {"queries": [
+        {"query": "best hiking boots", "avg_position": 8.0, "clicks": 12},
+        {"query": "trail map.v2 guide", "avg_position": 3.5, "clicks": 40},
+        {"query": "tent", "page": "/a", "avg_position": 6.0, "rank": 3, "code": "007"},
+        {"query": "tent", "page": "/b", "avg_position": 9.0, "rank": 7, "code": 7},
+    ]}
+    c.check("a_selector_names_a_row_by_content",
+            dig(rows, "queries[query=best hiking boots].avg_position") == (8.0, None))
+    c.check("dots_and_spaces_in_an_unquoted_value_are_literal",
+            dig(rows, "queries[query=trail map.v2 guide].clicks") == (40, None))
+    c.check("a_quoted_value_reads_the_same_row",
+            dig(rows, 'queries[query="trail map.v2 guide"].clicks') == (40, None))
+    c.check("a_numeric_field_is_selectable_as_a_string",
+            dig(rows, "queries[rank=3].avg_position") == (6.0, None))
+    c.check("a_numeric_looking_string_matches_only_the_string",
+            dig(rows, "queries[code=007].avg_position") == (6.0, None)
+            and dig(rows, "queries[code=7].avg_position") == (9.0, None))
+    c.check("a_selector_is_exact_not_case_folded",
+            dig(rows, "queries[query=Best Hiking Boots].avg_position")[0] is None)
+
+    _, err, kind = resolve(rows, "queries[query=no such query].avg_position")
+    c.check("a_zero_match_selector_is_unmeasured_not_zero",
+            kind == "no_match" and bool(err), f"{kind}: {err}")
+    v, _, kind = resolve(rows, "queries[query=no such query].avg_position",
+                         missing_is_zero=True)
+    c.check("missing_is_zero_never_invents_a_selected_row",
+            v is None and kind == "no_match",
+            "a top-N list omits a row below the cut; zero would read as 'better than #1'")
+    v, _, _ = resolve({"queries": [{"query": "x", "by_silo": {}}]},
+                      "queries[query=x].by_silo./guides", missing_is_zero=True)
+    c.check("CONTROL_missing_is_zero_still_covers_the_leaf_map_after_a_selector", v == 0)
+
+    _, err, kind = resolve(rows, "queries[query=tent].avg_position")
+    c.check("a_two_match_selector_is_refused_as_ambiguous",
+            kind == "ambiguous" and "2 rows" in str(err), str(err))
+    c.check("a_second_selector_on_the_segment_disambiguates",
+            dig(rows, "queries[query=tent][page=/b].avg_position") == (9.0, None))
+    c.check("CONTROL_the_old_index_syntax_still_resolves",
+            dig(rows, "queries.1.clicks") == (40, None)
+            and dig(rows, "queries.-1.avg_position") == (9.0, None))
+
+    for bad in ("queries[query=x", "queries[query].a", "queries[=x].a",
+                'queries[query="x].a', 'queries[query="x"y].a', "a..b", "a.",
+                "queries[query=x]y.a", "queries[query=a\qb].a"):
+        _, _, kind = resolve(rows, bad)
+        c.check(f"malformed_path_is_a_syntax_error:{bad}", kind == "syntax", str(kind))
+
+    a_ = "bing.py pagequeries --url https://example.com/"
+    c.check("experiments_differ_by_selector_not_just_leaf",
+            same_experiment(a_, "queries[query=a].avg_position")
+            != same_experiment(a_, "queries[query=b].avg_position"))
+    c.check("the_same_selector_quoted_two_ways_is_one_experiment",
+            same_experiment(a_, "queries[query=a.b c].avg_position")
+            == same_experiment(a_, 'queries[query="a.b c"].avg_position'))
+
+    # END TO END. The target row is at index 0 at baseline and index 3 at
+    # re-check, with a different row moved into index 0. The command string is
+    # byte-identical across both runs; only the file it prints changes.
+    import tempfile as _tf
+    base = {"queries": [
+        {"query": "best hiking boots", "avg_position": 8.0},
+        {"query": "rain jacket", "avg_position": 11.0},
+        {"query": "camp stove", "avg_position": 20.0},
+        {"query": "trail map.v2 guide", "avg_position": 30.0}]}
+    later = {"queries": [
+        {"query": "rain jacket", "avg_position": 15.0},
+        {"query": "camp stove", "avg_position": 18.0},
+        {"query": "trail map.v2 guide", "avg_position": 25.0},
+        {"query": "best hiking boots", "avg_position": 4.0}]}
+    with _tf.TemporaryDirectory() as td:
+        (Path(td) / ".seo").mkdir()
+        payload = Path(td) / "payload.json"
+        payload.write_text(json.dumps(base), encoding="utf-8")
+        # A script path, because run_measurement runs `<script> args` under this
+        # interpreter - the same way every skill instrument is run.
+        emitter = Path(td) / "emit.py"
+        emitter.write_text("import sys\nprint(open(sys.argv[1]).read())\n", encoding="utf-8")
+        emit = f"{shlex.quote(str(emitter))} {shlex.quote(str(payload))}"
+
+        class S:
+            root = td
+            question = "did the homepage move up for the query?"
+            cmd = emit
+            baseline = None
+            expect = "decrease"
+            min_change = 2.0
+            after = "7d"
+            note = None
+            force = False
+            missing_is_zero = False
+            timeout = 60
+
+        class Sel(S):
+            id = "sel"
+            metric = "queries[query=best hiking boots].avg_position"
+
+        class Idx(S):
+            id = "idx"
+            metric = "queries.0.avg_position"
+
+        rs, ri = record(Sel()), record(Idx())
+        c.check("selector_baseline_reads_the_target_row",
+                rs.get("ok") and rs["recorded"]["baseline"] == 8.0, str(rs)[:160])
+        c.check("index_baseline_reads_the_same_row_today",
+                ri.get("ok") and ri["recorded"]["baseline"] == 8.0, str(ri)[:160])
+        payload.write_text(json.dumps(later), encoding="utf-8")
+
+        class SelF(Sel):
+            force = True
+            cmd = None
+
+        class IdxF(Idx):
+            force = True
+            cmd = None
+
+        cs, ci = check(SelF()), check(IdxF())
+        c.check("a_moved_row_is_still_the_row_compared",
+                cs.get("value") == 4.0 and cs.get("delta") == -4.0
+                and cs.get("state") == "confirmed", str(cs)[:200])
+        c.check("CONTROL_the_index_path_silently_compares_a_different_row",
+                ci.get("value") == 15.0 and ci.get("state") == "refuted",
+                "if this fails the fixture no longer exercises the re-sort trap")
+
+        dup = dict(later)
+        dup["queries"] = later["queries"] + [{"query": "best hiking boots", "avg_position": 5.0}]
+        payload.write_text(json.dumps(dup), encoding="utf-8")
+
+        class Amb(Sel):
+            id = "amb"
+            question = "same row, now duplicated"
+            force = True
+        record_amb = record(type("AmbRec", (Amb,), {"baseline": 8.0})())
+        ca = check(type("AmbChk", (Amb,), {"cmd": None})())
+        c.check("a_selector_that_now_matches_two_rows_refuses_at_check",
+                record_amb.get("ok") and ca.get("control_failed") is True
+                and ca.get("kind") == "ambiguous" and "2 rows" in str(ca.get("reason")),
+                str(ca)[:200])
+        c.check("and_the_refused_hypothesis_stays_open",
+                load(td)["hypotheses"]["amb"]["state"] == "open")
+
+        payload.write_text(json.dumps(base), encoding="utf-8")
+        r_nm = record(type("NoMatch", (S,), {
+            "id": "nm", "metric": "queries[query=absent row].avg_position"})())
+        c.check("a_zero_match_selector_refuses_a_baseline",
+                r_nm.get("control_failed") is True and "no row matches" in str(r_nm.get("reason")),
+                str(r_nm)[:160])
+
+
 def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -614,7 +980,11 @@ def _parser() -> argparse.ArgumentParser:
     r.add_argument("--question", required=True, help="the question, in plain words")
     r.add_argument("--cmd", required=True,
                    help="the skill command that answers it, e.g. \"bing.py pages\"")
-    r.add_argument("--metric", required=True, help="dotted JSON path into that output")
+    r.add_argument("--metric", required=True,
+                   help=("dotted JSON path into that output. Name a row of a re-sorted "
+                         "list by content, not position: 'queries[query=red shoes].clicks', "
+                         "'rows[q=\"a.b ] c\"][page=/x].ctr'. Zero matching rows is "
+                         "unmeasured; two or more is refused"))
     r.add_argument("--baseline", type=float,
                    help="omit to measure it now (preferred - it uses the same command)")
     r.add_argument("--expect", required=True, choices=list(DIRECTIONS))
@@ -624,7 +994,8 @@ def _parser() -> argparse.ArgumentParser:
     r.add_argument("--missing-is-zero", action="store_true",
                    help="the metric lives in a SPARSE map where absence genuinely means "
                         "zero (e.g. crawllog top_silos). Off by default: as a default it "
-                        "turns every renamed key and failed read into a zero.")
+                        "turns every renamed key and failed read into a zero. Never zeroes "
+                        "a row a [field=value] selector failed to find.")
     r.add_argument("--denominator",
                    help="dotted path to the metric's DENOMINATOR (e.g. answers_seen for "
                         "answers_citing_us): the check then needs a statistically real move, "

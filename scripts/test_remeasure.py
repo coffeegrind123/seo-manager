@@ -9,6 +9,7 @@ or a bug this file shipped in its first hour.
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -79,10 +80,10 @@ def main() -> int:
     # Addressing a list element by identity rather than position. A positional
     # index into a value-sorted list re-points itself between runs, so the verdict
     # would compare two different bots and call the difference a change.
-    _bots = {"bots": [{"key": "bingbot", "hits": 20, "top_silos": {"/play": 502}},
+    _bots = {"bots": [{"key": "bingbot", "hits": 20, "top_silos": {"/app": 502}},
                       {"key": "googlebot", "hits": 5}]}
     check("a list element is addressable by its key",
-          R.dig(_bots, "bots.bingbot.top_silos./play") == (502, None))
+          R.dig(_bots, "bots.bingbot.top_silos./app") == (502, None))
     check("CONTROL a positional index still works",
           R.dig(_bots, "bots.0.hits") == (20, None))
     check("CONTROL identity addressing picks the RIGHT element",
@@ -97,14 +98,14 @@ def main() -> int:
     a = "crawllog.py scan --ssh-key ~/.ssh/k --bot bingbot"
     b = "crawllog.py scan --ssh-key " + __import__("os").path.expanduser("~/.ssh/k") + " --bot bingbot"
     check("the same command written two ways is one experiment",
-          R.same_experiment(a, "bots.0.top_silos./play")
-          == R.same_experiment(b, "bots.bingbot.top_silos./play"),
+          R.same_experiment(a, "bots.0.top_silos./app")
+          == R.same_experiment(b, "bots.bingbot.top_silos./app"),
           "quoting and ~ expansion differ between sessions; the intervention does not")
     check("CONTROL a different command is a different experiment",
-          R.same_experiment(a, "bots.0.top_silos./play")
-          != R.same_experiment(a + " --days 30", "bots.0.top_silos./play"))
+          R.same_experiment(a, "bots.0.top_silos./app")
+          != R.same_experiment(a + " --days 30", "bots.0.top_silos./app"))
     check("CONTROL a different metric leaf is a different experiment",
-          R.same_experiment(a, "bots.0.top_silos./play")
+          R.same_experiment(a, "bots.0.top_silos./app")
           != R.same_experiment(a, "bots.0.top_silos./guides"),
           "otherwise every hypothesis over one command would collide")
 
@@ -112,10 +113,103 @@ def main() -> int:
           R.dig({"bots": [{"key": "x", "hits": 1}, {"key": "x", "hits": 2}]},
                 "bots.x.hits")[0] is None)
 
+    print("\nrow selectors: a re-sorted list addressed by CONTENT, not position.")
+    print("Expected values are literals read off the fixture, never dig() output:")
+    pq = {"queries": [
+        {"query": "best hiking boots", "avg_position": 8.0},
+        {"query": "a.b c", "avg_position": 2.0},
+        {"query": "x]y", "avg_position": 13.0},
+        {"query": "tent", "page": "/a", "avg_position": 6.0, "rank": 3},
+        {"query": "tent", "page": "/b", "avg_position": 9.0, "rank": 30, "code": "007"},
+    ]}
+    check("a selector picks the row", R.dig(pq, "queries[query=best hiking boots].avg_position")
+          == (8.0, None))
+    check("dots and spaces need no quotes", R.dig(pq, "queries[query=a.b c].avg_position")
+          == (2.0, None))
+    check("the quoted form reads the same row", R.dig(pq, 'queries[query="a.b c"].avg_position')
+          == (2.0, None))
+    check("a ] in a value: quoted", R.dig(pq, 'queries[query="x]y"].avg_position') == (13.0, None))
+    check("a ] in a value: escaped", R.dig(pq, "queries[query=x\\]y].avg_position") == (13.0, None))
+    check("a numeric field is matched by its JSON text",
+          R.dig(pq, "queries[rank=3].avg_position") == (6.0, None)
+          and R.dig(pq, "queries[rank=3.0].avg_position")[0] is None,
+          "3 and 3.0 are different text; a fuzzy numeric compare would make [rank=3] hit both")
+    check("a numeric-looking STRING is a string",
+          R.dig(pq, "queries[code=007].avg_position") == (9.0, None)
+          and R.dig(pq, "queries[code=7].avg_position")[0] is None)
+    _, e0, k0 = R.resolve(pq, "queries[query=missing row].avg_position")
+    check("zero matches is unmeasured, and says so", k0 == "no_match" and "no row" in e0, e0)
+    check("zero matches is NOT zero even with missing_is_zero",
+          R.dig(pq, "queries[query=missing row].avg_position", missing_is_zero=True)[0] is None,
+          "a top-N list omits rows below its cut; a zero position would read as better than #1")
+    check("CONTROL missing_is_zero still zeroes the leaf map below a selector",
+          R.dig({"q": [{"k": "x", "m": {}}]}, "q[k=x].m.gone", missing_is_zero=True) == (0, None))
+    check("CONTROL but not a missing CONTAINER above a selector",
+          R.dig({}, "queries[query=x].avg_position", missing_is_zero=True)[0] is None)
+    _, e2, k2 = R.resolve(pq, "queries[query=tent].avg_position")
+    check("two matches refuse, naming the count", k2 == "ambiguous" and "2 rows" in e2, e2)
+    check("two selectors on a segment must hold on one row",
+          R.dig(pq, "queries[query=tent][page=/b].avg_position") == (9.0, None))
+    check("CONTROL the index syntax is untouched",
+          R.dig(pq, "queries.0.avg_position") == (8.0, None)
+          and R.dig(pq, "queries.-1.rank") == (30, None))
+    for bad in ("queries[query=x", 'queries[query="x', "queries[query].v",
+                "queries[query=x]junk.v", "queries..v"):
+        check(f"malformed {bad!r} is a syntax error", R.resolve(pq, bad)[2] == "syntax")
+    c_ = "bing.py pagequeries --url https://example.com/"
+    check("different selectors are different experiments",
+          R.same_experiment(c_, "queries[query=a].avg_position")
+          != R.same_experiment(c_, "queries[query=b].avg_position"),
+          "the leaf alone collides every query on one page")
+    check("one selector spelled two ways is one experiment",
+          R.same_experiment(c_, "queries[query=a.b c].clicks")
+          == R.same_experiment(c_, 'queries[query="a.b c"].clicks'))
+
+    print("\nend to end through argparse: the row moves from index 0 to index 3:")
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / ".seo").mkdir()
+        payload, emitter = Path(td) / "p.json", Path(td) / "emit.py"
+        emitter.write_text("import sys\nprint(open(sys.argv[1]).read())\n", encoding="utf-8")
+        payload.write_text(json.dumps({"queries": [
+            {"query": "best hiking boots", "avg_position": 8.0},
+            {"query": "rain jacket", "avg_position": 11.0},
+            {"query": "camp stove", "avg_position": 20.0},
+            {"query": "tent", "avg_position": 30.0}]}), encoding="utf-8")
+        cmd = f"{shlex.quote(str(emitter))} {shlex.quote(str(payload))}"
+        common = ["--cmd", cmd, "--expect", "decrease", "--min-change", "2", "--after", "7d"]
+        ns_s = R._parser().parse_args(["--root", td, "record", "--id", "sel", "--question", "q",
+                                       "--metric", "queries[query=best hiking boots].avg_position",
+                                       *common])
+        ns_i = R._parser().parse_args(["--root", td, "record", "--id", "idx", "--question", "q",
+                                       "--metric", "queries.0.avg_position", *common])
+        rs, ri = R.record(ns_s), R.record(ns_i)
+        check("both baselines read 8.0 today",
+              rs.get("recorded", {}).get("baseline") == 8.0
+              and ri.get("recorded", {}).get("baseline") == 8.0, f"{rs} {ri}"[:200])
+        payload.write_text(json.dumps({"queries": [
+            {"query": "rain jacket", "avg_position": 15.0},
+            {"query": "camp stove", "avg_position": 18.0},
+            {"query": "tent", "avg_position": 25.0},
+            {"query": "best hiking boots", "avg_position": 4.0}]}), encoding="utf-8")
+        cs = R.check(R._parser().parse_args(["--root", td, "check", "--id", "sel", "--force"]))
+        ci = R.check(R._parser().parse_args(["--root", td, "check", "--id", "idx", "--force"]))
+        check("the selector compares the SAME row: 8.0 -> 4.0, confirmed",
+              cs.get("value") == 4.0 and cs.get("delta") == -4.0 and cs.get("state") == "confirmed",
+              str(cs)[:200])
+        check("CONTROL the index compares a different row: 8.0 -> 15.0, 'refuted'",
+              ci.get("value") == 15.0 and ci.get("state") == "refuted",
+              "this is the silent failure the selector exists to prevent")
+        bad = R._parser().parse_args(["--root", td, "record", "--id", "bad", "--question", "q",
+                                      "--metric", "queries[query=x", "--baseline", "1",
+                                      *common])
+        rb = R.record(bad)
+        check("a malformed path is refused at record time, even with --baseline given",
+              rb.get("control_failed") is True and "not a valid path" in rb.get("reason", ""),
+              str(rb)[:160])
 
     print("\nquoting: a stored command is round-tripped through a string:")
     check("a quoted argument survives",
-          __import__("shlex").split("serp.py 'cs 1.6 online' --count 20")[1] == "cs 1.6 online",
+          __import__("shlex").split("serp.py 'red running shoes' --count 20")[1] == "red running shoes",
           "a whitespace split makes this three arguments and the measurement fails "
           "with an argparse usage message that reads like a broken tool")
     check("an unbalanced quote is an error, not a crash",
