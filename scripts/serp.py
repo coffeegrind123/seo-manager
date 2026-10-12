@@ -33,11 +33,20 @@ query?" The provider ladder runs cheapest-and-keyless first:
                 its 250 on the checks that need DEPTH; use serper for volume.
                 SERPAPI_KEY or ~/.serpapi_key.
     dataforseo  DataForSEO live SERP. Paid, BYO login/password. Real Google.
+    bing        Bing's HTML results page through the residential proxy with a
+                pinned, CONFIRMED exit. OPT-IN ONLY (--provider bing), never in
+                the default failover: it has two silent wrong-answer modes
+                (results for another query, and the query collapsed onto its
+                leading word) that only the guards in provider_bing catch, and
+                a failover hop must be a provider whose failure is a refusal.
+                It answers a different question anyway - "what does BING rank"
+                - which matters on a site whose traffic is Bing-led.
 
 Keys are read from the environment first, then from a chmod-600 dotfile, so
 they survive a new shell without ever landing in a committed file.
 
-Bing is deliberately NOT a provider. See RELEVANCE below.
+Bing was refused as a provider until 2026-10-12 for the RELEVANCE reason below;
+it is now opt-in behind guards built for exactly that failure.
 
 Two guards sit in front of every provider's output, and they exist because the
 dangerous SERP failures do not look like failures:
@@ -505,6 +514,164 @@ def shape_ok(results: list[dict]) -> bool:
     return bool(results) and any((r.get("url") or "").startswith("http") for r in results)
 
 
+# A collapse is read as "the leading word explains page 1 and the rest of the
+# query explains none of it". Measured 2026-10-12 through a US residential exit:
+# "best hiking boots" came back as Best Buy plus eight dictionary entries for
+# "best" - lead share 1.0, rest share 0.0 - while "hiking boots for women" in the
+# same session was a clean read. Verb-led queries ("play ...") collapsed to the
+# bare verb's generic SERP (app stores, game portals) 15 of 15 times across
+# US/CA/AU exits. Every collapse measured was onto the LEADING word, so only the
+# leading word is tested: testing any word would flag a legitimate brand SERP
+# whose titles carry the brand and not the generic qualifier after it.
+COLLAPSE_LEAD_SHARE = 0.6
+COLLAPSE_REST_SHARE = 0.2
+
+
+def _word_start(token: str, blob: str) -> bool:
+    # Prefix match at a word start: "self" must hit "selfservice" and "best"
+    # must hit "bestbuy.com" (both measured collapses), but "art" must not hit
+    # "start".
+    return re.search(r"(?<![a-z0-9])" + re.escape(token), blob) is not None
+
+
+def detect_collapse(query: str, results: list[dict]) -> dict:
+    """Did the engine answer only the LEADING word of the query?
+
+    Distinct from a wrong-query read on purpose. Wrong-query is a SERP about
+    something unrelated (measured: a plain request answered with speed tests
+    and prediction markets); a collapse is a SERP about the first word alone.
+    They have different fixes - a collapse often clears by rephrasing so the
+    distinctive noun leads, a wrong-query read does not - so they are named
+    apart rather than both reported as "irrelevant".
+
+    It also closes a hole in verify_relevance: "best boots" reduces to one
+    relevance token, so a page of dictionary entries for "best" scores
+    coverage 0 and is waved through by the qualifier_ignored exemption."""
+    words = []
+    for w in re.findall(r"[a-z0-9]+", (query or "").lower()):
+        if len(w) >= 2 and w not in words:
+            words.append(w)
+    top = results[:10]
+    if len(words) < 2 or not top:
+        return {"checked": False, "collapse": False,
+                "note": "needs at least two query words and one result"}
+    lead = words[0]
+    rest = [w for w in words[1:] if w not in RELEVANCE_STOPWORDS] or words[1:]
+    blobs = []
+    for r in top:
+        slug = (r.get("url") or "").replace("-", " ").replace("_", " ").replace("/", " ")
+        blobs.append(" ".join([r.get("title") or "", slug, r.get("snippet") or ""]).lower())
+    # A result "carries the rest" only with a MAJORITY of the remaining words,
+    # not any one of them. A collapsed SERP still shares generic words with the
+    # query: "play <x> games" collapsed to "play" returns game portals whose
+    # titles say "games", and an any-word rule read that as on-topic.
+    need = len(rest) // 2 + 1
+    lead_share = sum(1 for b in blobs if _word_start(lead, b)) / len(blobs)
+    rest_share = sum(1 for b in blobs
+                     if sum(1 for t in rest if _word_start(t, b)) >= need) / len(blobs)
+    collapse = lead_share >= COLLAPSE_LEAD_SHARE and rest_share <= COLLAPSE_REST_SHARE
+    return {"checked": True, "collapse": collapse, "collapsed_to": lead if collapse else None,
+            "lead_word": lead, "rest_words": rest, "rest_required_per_result": need,
+            "lead_share": round(lead_share, 3), "rest_share": round(rest_share, 3),
+            "thresholds": {"lead_share": COLLAPSE_LEAD_SHARE, "rest_share": COLLAPSE_REST_SHARE}}
+
+
+class SerpRefusal(RuntimeError):
+    """A provider read that must not be scored, with a NAMED reason.
+
+    Two classes, never merged, because they have different next steps:
+      cannot_ask    the engine never answered this query from where we asked
+                    (challenge page, transport error, unconfirmable or wrong
+                    exit, no query echo). Says nothing about the SERP.
+      wrong_answer  the engine answered, and the answer is not this query's
+                    page 1 (wrong_query, query_collapse). A finding about the
+                    ENGINE, still never about the SERP."""
+
+    CANNOT_ASK = {"challenge", "transport", "unparsed", "echo_missing",
+                  "exit_mismatch", "unverified_market"}
+    WRONG_ANSWER = {"wrong_query", "query_collapse"}
+
+    def __init__(self, kind: str, reason: str, **detail):
+        super().__init__(f"{kind}: {reason}")
+        self.kind = kind
+        self.reason = reason
+        self.detail = detail
+
+    def as_dict(self) -> dict:
+        cls = "cannot_ask" if self.kind in self.CANNOT_ASK else "wrong_answer"
+        return {"kind": self.kind, "class": cls, "reason": self.reason, **self.detail}
+
+
+# ------------------------------------------------------------ exit country
+
+
+IP_ECHO_URL = "http://ip-api.com/json/?fields=status,countryCode"
+EXIT_KEYS = ("exit_country", "exit_requested", "exit_unconfirmed", "exit_mismatch", "exit_route")
+
+
+def probe_exit(proxy: Proxy | None) -> str | None:
+    """The country the request ACTUALLY left from, asked over the same sticky
+    session the SERP request uses. None = could not confirm, never a guess.
+
+    A requested country is not an observed one: the pool has been measured
+    answering `fr` with a GB exit 3 of 3 times. Same session token = same exit,
+    so one probe on the session describes the SERP fetch on it."""
+    try:
+        status, body = fetch(IP_ECHO_URL, proxy=proxy, timeout=20)
+        if status != 200:
+            return None
+        d = json.loads(body)
+    except Exception:                                            # noqa: BLE001
+        return None
+    cc = d.get("countryCode") if isinstance(d, dict) and d.get("status") == "success" else None
+    return cc.lower() if isinstance(cc, str) and len(cc) == 2 else None
+
+
+def exit_fields(requested: str | None, observed: str | None, proxied: bool) -> dict:
+    """The exit as reported. An unconfirmed exit is said OUT LOUD - `null` with
+    `exit_unconfirmed: true` - instead of the key silently going missing, which
+    reads as "no country was asked for"."""
+    req = requested.lower() if requested else None
+    return {
+        "exit_country": observed,
+        "exit_requested": req,
+        "exit_unconfirmed": observed is None,
+        "exit_mismatch": bool(req and observed and observed != req),
+        "exit_route": "proxy" if proxied else "direct",
+    }
+
+
+def dedupe_results(results: list[dict], seen: set | None = None) -> tuple[list[dict], int]:
+    """Drop repeated destinations, keeping the first (highest) position.
+
+    Measured on DuckDuckGo: paginating returned positions 11-12 as repeats of
+    1-2, which double-counts a domain in the authority ceiling and inflates
+    "results_seen" past what was really read."""
+    seen = set() if seen is None else seen
+    out, dropped = [], 0
+    for r in results:
+        key = _url_key(r.get("url") or "")
+        if key and key in seen:
+            dropped += 1
+            continue
+        if key:
+            seen.add(key)
+        out.append(r)
+    return out, dropped
+
+
+def _url_key(url: str) -> str:
+    try:
+        p = urllib.parse.urlparse(url.strip())
+    except ValueError:
+        return url.strip()
+    host = (p.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = p.path.rstrip("/") or "/"
+    return f"{host}{path}?{p.query}" if p.query else f"{host}{path}"
+
+
 # --------------------------------------------------------------- providers
 
 
@@ -530,6 +697,8 @@ def provider_ddg(query: str, count: int, *, proxy: Proxy | None = None, **_) -> 
     results at the exact moment every HTTP provider was 202-ing.
     """
     results: list[dict] = []
+    seen: set = set()
+    dropped_total, pages_read, repeated_page = 0, 0, False
     backoffs = [4, 10, 25]
     for page in range(0, max(1, (count + 9) // 10)):
         body = urllib.parse.urlencode({"q": query, "s": page * 10, "kl": "us-en"})
@@ -573,6 +742,8 @@ def provider_ddg(query: str, count: int, *, proxy: Proxy | None = None, **_) -> 
         )
         if not found:
             break
+        pages_read += 1
+        page_rows = []
         for href, title_html, tail in found:
             url = html.unescape(href)
             m = re.search(r"uddg=([^&]+)", url)
@@ -583,14 +754,31 @@ def provider_ddg(query: str, count: int, *, proxy: Proxy | None = None, **_) -> 
             sm = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', tail, re.S)
             snippet = re.sub(r"<[^>]+>", " ", sm.group(1) if sm else "")
             snippet = html.unescape(re.sub(r"\s+", " ", snippet)).strip()[:300]
-            results.append({
+            page_rows.append({
                 "title": html.unescape(re.sub(r"<[^>]+>", "", title_html)).strip(),
                 "url": url,
                 "snippet": snippet,
             })
+        fresh, dropped = dedupe_results(page_rows, seen)
+        dropped_total += dropped
+        results.extend(fresh)
+        # A page that is ALL repeats means the endpoint ignored the offset and
+        # served page 1 again; reading further only re-reads the same page.
+        if page_rows and not fresh:
+            repeated_page = True
+            break
         if len(results) >= count:
             break
         time.sleep(1.5)
+
+    # Exit reporting. The proxy may have been rotated above, so this probes the
+    # session the successful page actually came over.
+    requested = proxy.country if proxy else None
+    results_meta.update(exit_fields(requested, probe_exit(proxy), proxy is not None))
+    results_meta["engine"] = "duckduckgo"
+    results_meta["depth"] = {"requested": count, "read": min(len(results), count),
+                             "pages_read": pages_read, "duplicates_dropped": dropped_total,
+                             "pagination_repeated": repeated_page}
     return results[:count]
 
 
@@ -734,7 +922,7 @@ def provider_serpapi(query: str, count: int, *, gl="us", hl="en", proxy=None, **
         # `present: true, references: []` was reported for every AI Overview on
         # earth - and any "are we cited by AI" reading built on it answers no,
         # forever, with no error anywhere. Measured 2026-09-01: the follow-up
-        # call for "how to play counter strike 1.6 in browser" returned 7
+        # call for a "how to play <game> in browser" query returned 7
         # references and 1,450 characters of text.
         refs = ai.get("references") or []
         if not refs and ai.get("serpapi_link"):
@@ -787,7 +975,271 @@ def provider_dataforseo(query: str, count: int, *, gl=2840, hl="en", proxy=None,
     return results[:count]
 
 
+# -------------------------------------------------------------------- bing
+
+
+BING_URL = "https://www.bing.com/search"
+
+# Challenge markers. "One last step" is what Bing served the headed Chrome
+# (2026-10-12). The bare word "challenge" is deliberately NOT a marker: it
+# occurs 3 times in the inline JS of every normal results page measured.
+BING_CHALLENGE_TITLE = re.compile(r"one last step", re.I)
+BING_CHALLENGE_MARKERS = ("one last step", "please solve the challenge", "b_captcha",
+                          "verify you are human", "unusual traffic")
+
+# Tracking parameter Bing appends to some decoded destinations (measured on
+# retailer category pages). It is per-session, so leaving it in makes the same
+# page two different URLs across reads.
+BING_TRACKING_PARAMS = {"msockid"}
+
+# Class attributes, not substrings: `_G.adc:"b_ad"` and `"b_adTop"` occur in
+# the inline JS of a page with no ads at all.
+BING_AD_RE = re.compile(r'class="[^"]*\b(b_ad|b_adTop|b_adBottom|b_adSlug|sb_add)\b')
+BING_LI_RE = re.compile(r'<li class="(b_[A-Za-z_]+)')
+BING_NOT_MODULES = {"b_algo", "b_pag"}
+
+
+def unwrap_bing(href: str) -> tuple[str, bool]:
+    """Bing's click wrapper -> the real destination. Returns (url, resolved).
+
+    Every organic link is `https://www.bing.com/ck/a?...&u=a1<base64>`: the
+    `a1` prefix then URL-safe base64 with the '=' padding STRIPPED (measured:
+    of 190 wrapped links, 139 had a length that is not a multiple of 4). An
+    unwrapped read reports every result as bing.com, and the authority gate
+    then scores the wrapper - the same trap Google's /url?q= set."""
+    url = html.unescape(href or "").strip()
+    try:
+        p = urllib.parse.urlparse(url)
+    except ValueError:
+        return url, False
+    host = (p.hostname or "").lower()
+    if not (host == "bing.com" or host.endswith(".bing.com")):
+        return _strip_tracking(url), True
+    if not p.path.startswith("/ck/"):
+        return url, False
+    u = urllib.parse.parse_qs(p.query).get("u", [""])[0]
+    if not u.startswith("a1"):
+        return url, False
+    raw = u[2:]
+    try:
+        dec = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+    except Exception:                                            # noqa: BLE001
+        return url, False
+    if not dec.lower().startswith(("http://", "https://")):
+        return url, False
+    return _strip_tracking(dec), True
+
+
+def _strip_tracking(url: str) -> str:
+    try:
+        p = urllib.parse.urlparse(url)
+    except ValueError:
+        return url
+    if not p.query:
+        return url
+    kept = [(k, v) for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+            if k.lower() not in BING_TRACKING_PARAMS]
+    return urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(kept)))
+
+
+def _text(fragment: str) -> str:
+    return html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", fragment or ""))).strip()
+
+
+def parse_bing(page: str) -> dict:
+    """Parse one Bing results page. Pure: no network, so the control and the
+    tests drive exactly the code a live read runs."""
+    text = page or ""
+    tm = re.search(r"<title>(.*?)</title>", text, re.S | re.I)
+    title = _text(tm.group(1)) if tm else None
+    echo = None
+    inp = re.search(r'<input[^>]*\bid="sb_form_q"[^>]*>', text, re.S)
+    if inp:
+        vm = re.search(r'\bvalue="([^"]*)"', inp.group(0))
+        echo = html.unescape(vm.group(1)) if vm else ""
+
+    results = []
+    starts = [m.start() for m in re.finditer(r'<li class="b_algo\b', text)]
+    for i, s in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        block = text[s:end]
+        # A block can run on into the pagination / sidebar after the last
+        # result; cut at the list's end so their text is not read as a snippet.
+        cut = block.find("</ol>")
+        if cut > 0:
+            block = block[:cut]
+        h2 = re.search(r"<h2[^>]*>(.*?)</h2>", block, re.S)
+        if not h2:
+            continue
+        a = re.search(r'<a\b[^>]*\bhref="([^"]+)"[^>]*>(.*?)</a>', h2.group(1), re.S)
+        if not a:
+            continue
+        url, resolved = unwrap_bing(a.group(1))
+        sm = (re.search(r'<div class="b_caption[^"]*"[^>]*>.*?<p[^>]*>(.*?)</p>', block, re.S)
+              or re.search(r"<p[^>]*>(.*?)</p>", block, re.S))
+        row = {"position": len(results) + 1, "title": _text(a.group(2)), "url": url,
+               "snippet": _text(sm.group(1))[:300] if sm else ""}
+        if not resolved:
+            row["unresolved_wrapper"] = True
+        results.append(row)
+
+    low = text.lower()
+    markers = [m for m in BING_CHALLENGE_MARKERS if m in low]
+    challenge = None
+    if title and BING_CHALLENGE_TITLE.search(title):
+        challenge = "title: " + title
+    elif not results and markers:
+        challenge = "marker: " + markers[0]
+
+    ads = sorted(set(BING_AD_RE.findall(text)))
+    # Every b_ad* class belongs to the ad block (a real ad nests
+    # <li class="b_adLastChild"> inside it), so none of them is a module.
+    modules = sorted({c for c in BING_LI_RE.findall(text)
+                      if c not in BING_NOT_MODULES and not c.startswith("b_ad")})
+    return {"title": title, "echo": echo, "results": results,
+            "organic_count": len(results), "challenge": challenge,
+            "ads_detected": bool(ads), "ad_markers": ads, "modules_detected": modules}
+
+
+def _norm_q(s: str | None) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def bing_guard(query: str, parsed: dict) -> dict:
+    """Decide whether a parsed Bing page may be scored. Returns
+    {"refused": False, ...} or {"refused": True, "kind": ..., "reason": ...}.
+
+    Order matters: each check assumes the ones before it passed. A challenge
+    page has no echo and no results, and must be reported as a challenge, not
+    as "missing echo" or "no results"."""
+    if parsed.get("challenge"):
+        return {"refused": True, "kind": "challenge",
+                "reason": (f"Bing served a challenge page ({parsed['challenge']}) - the engine never "
+                           "answered. Cannot ask from this exit; rotate the session or use another "
+                           "provider. Never an empty page 1.")}
+    if not parsed.get("results"):
+        return {"refused": True, "kind": "unparsed",
+                "reason": ("HTTP 200 with no li.b_algo results and no challenge marker - a page "
+                           "this parser does not recognise. A failed read, never an empty SERP."),
+                "title": parsed.get("title")}
+
+    q = _norm_q(query)
+    echo = parsed.get("echo")
+    if echo is not None:
+        if _norm_q(echo) != q:
+            return {"refused": True, "kind": "wrong_query",
+                    "reason": f"the search box says Bing answered {echo!r}, not {query!r}",
+                    "echo_mismatch": True, "answered": echo}
+        echo_source = "searchbox"
+    elif parsed.get("title") and _norm_q(parsed["title"]).startswith(q):
+        echo_source = "title"
+    else:
+        return {"refused": True, "kind": "echo_missing",
+                "reason": ("no query echo (search box value or title) - nothing on the page says "
+                           "which query these results answer, so they cannot be attributed to it"),
+                "title": parsed.get("title")}
+
+    rows = parsed["results"]
+    col = detect_collapse(query, rows)
+    if col.get("collapse"):
+        return {"refused": True, "kind": "query_collapse",
+                "reason": (f"Bing answered the leading word {col['collapsed_to']!r} alone "
+                           f"(lead share {col['lead_share']}, rest share {col['rest_share']}). The echo "
+                           "is intact, so this is the ENGINE collapsing the query, not a wrong fetch. "
+                           "Not this query's page 1."),
+                "collapse": col, "echo_source": echo_source,
+                "observed_titles": [r.get("title") for r in rows[:5]]}
+    rel = verify_relevance(query, rows)
+    if not rel["pass"]:
+        return {"refused": True, "kind": "wrong_query",
+                "reason": (f"results are not about the query (coverage {rel['coverage']}, hit_rate "
+                           f"{rel['hit_rate']}) although the echo matches - Bing returned a "
+                           "well-formed SERP for something else"),
+                "relevance": rel, "collapse": col, "echo_source": echo_source,
+                "observed_titles": [r.get("title") for r in rows[:5]]}
+    return {"refused": False, "echo_source": echo_source, "relevance": rel, "collapse": col}
+
+
+def provider_bing(query: str, count: int, *, proxy: Proxy | None = None, gl="us", hl="en",
+                  **_) -> list[dict]:
+    """Bing's HTML results page. Opt-in; see the module docstring for why it is
+    not in the default failover.
+
+    Measured 2026-10-12, and each fact is a guard below:
+      - a DIRECT request (no proxy) returned ten well-formed results for an
+        unrelated query, echo intact -> the topical-overlap guard;
+      - a headed Chrome got the "One last step" challenge -> challenge guard;
+      - through the residential proxy with a FIXED exit it answered correctly
+        for some queries -> the exit is pinned to the market and confirmed;
+      - leading-word collapse (bare verb / "best") -> detect_collapse;
+      - `first=11` and `count=30` were both ignored (page 1 served again, ten
+        rows) -> exactly one page is read and depth says so.
+    """
+    market = ((proxy.country if proxy and proxy.country else gl) or "us").lower()
+    if proxy is not None:
+        if market not in VERIFIED_COUNTRIES:
+            raise SerpRefusal("unverified_market",
+                              f"market {market!r} is not a verified exit country, so the exit "
+                              "cannot be pinned to it", verified_pool=VERIFIED_COUNTRIES)
+        if proxy.country != market:
+            # Pin a fixed exit in the market asked for. An unpinned session
+            # lands wherever the pool puts it, and `cc=` then disagrees with
+            # the IP Bing actually sees.
+            proxy = Proxy(proxy.base, country=market)
+
+    observed = probe_exit(proxy)
+    ex = exit_fields(market if proxy else None, observed, proxy is not None)
+    results_meta.update(ex)
+    if proxy is not None:
+        # The top-level `proxy` label describes the session main() built, which
+        # is unpinned ("auto") unless --proxy-country was given. This one is the
+        # session the read actually went over.
+        results_meta["proxy_pinned"] = proxy.label()
+    results_meta["engine"] = "bing"
+    if ex["exit_mismatch"]:
+        raise SerpRefusal("exit_mismatch",
+                          f"asked for a {market.upper()} exit and the session left from "
+                          f"{observed.upper()} - a SERP read here would be silently from the "
+                          "wrong country", exit_country=observed, exit_requested=market)
+
+    url = BING_URL + "?" + urllib.parse.urlencode({"q": query, "cc": market.upper(), "setlang": hl})
+    status, text = fetch(url, proxy=proxy, timeout=40)
+    if status != 200:
+        raise SerpRefusal("transport", f"bing returned HTTP {status}" + (f" ({text[:80]})" if status == 0 else ""),
+                          http_status=status)
+    parsed = parse_bing(text)
+    verdict = bing_guard(query, parsed)
+    if verdict["refused"]:
+        detail = {k: v for k, v in verdict.items() if k not in ("refused", "kind", "reason")}
+        raise SerpRefusal(verdict["kind"], verdict["reason"], bytes=len(text),
+                          organic_count=parsed["organic_count"], **ex, **detail)
+
+    rows = parsed["results"]
+    results_meta["depth"] = {
+        "requested": count, "read": min(len(rows), count), "pages_read": 1,
+        "note": ("ONE page is read. Measured: Bing ignored first=11 (served page 1 again) and "
+                 "count=30 (ten rows), so asking for more cannot get more from this route. "
+                 "Never report depth beyond `read`."),
+    }
+    results_meta["bing"] = {
+        "organic_count": parsed["organic_count"],
+        "ads_detected": parsed["ads_detected"], "ad_markers": parsed["ad_markers"],
+        "modules_detected": parsed["modules_detected"],
+        "echo_source": verdict["echo_source"],
+        "market": market,
+        "detection_note": ("ads/modules are MARKER-based. `false` / [] means none of the known class "
+                           "markers matched, not that the page had none."),
+    }
+    return rows[:count]
+
+
+ENGINES = {"ddg": "duckduckgo", "serpd": "google", "browser": "google", "serper": "google",
+           "serpapi": "google", "dataforseo": "google", "brave": "brave",
+           "searxng": "searxng (aggregate)", "bing": "bing"}
+
+
 PROVIDERS = {
+    "bing": provider_bing,
     "serpd": provider_serpd,
     "ddg": provider_ddg,
     "searxng": provider_searxng,
@@ -1105,6 +1557,11 @@ def run_control() -> dict:
                         for t in query.split()) for r in rows)
         c.check(f"{name}_would_fool_an_any_token_rule", naive,
                 "if this is False the fixture no longer exercises the trap")
+        # Re-read 2026-10-12: these real reads are leading-word collapses
+        # ("self" out of "self hosted rank tracker"), not unrelated SERPs.
+        col = detect_collapse(query, rows)
+        c.check(f"real_{name}_classifies_as_collapse_onto_self",
+                col.get("collapsed_to") == "self", str(col))
 
     for name in ("ddg-good.json", "browser-google.json"):
         try:
@@ -1116,6 +1573,8 @@ def run_control() -> dict:
         c.check(f"good_read_{name}_is_accepted", rel["pass"],
                 f"coverage={rel['coverage']} hit_rate={rel['hit_rate']}")
         c.check(f"good_read_{name}_passes_the_shape_guard", shape_ok(rows))
+        c.check(f"good_read_{name}_is_not_a_collapse",
+                detect_collapse(query, rows).get("collapse") is False)
 
     c.check("an_empty_result_set_is_refused", not shape_ok([]))
     c.check("a_result_with_no_url_is_refused", not shape_ok([{"title": "x", "url": ""}]))
@@ -1127,7 +1586,159 @@ def run_control() -> dict:
     c.check("the_thresholds_are_real_numbers",
             0 < MIN_COVERAGE <= 1 and 0 < MIN_HIT_RATE <= 1,
             f"coverage>={MIN_COVERAGE} hit_rate>={MIN_HIT_RATE}")
-    return c.verdict(thresholds={"min_coverage": MIN_COVERAGE, "min_hit_rate": MIN_HIT_RATE})
+
+    _bing_controls(c)
+    return c.verdict(thresholds={"min_coverage": MIN_COVERAGE, "min_hit_rate": MIN_HIT_RATE,
+                                 "collapse_lead_share": COLLAPSE_LEAD_SHARE,
+                                 "collapse_rest_share": COLLAPSE_REST_SHARE})
+
+
+def _bing_page(query_echo: str | None, rows: list[tuple[str, str, str]], *, title: str | None = None,
+               ad: bool = False, module: str | None = None) -> str:
+    """A synthetic Bing results page in the measured shape: `sb_form_q` search
+    box, `<li class="b_algo">` blocks with an h2 link and a b_caption snippet.
+    `rows` hold the already-WRAPPED href, so the unwrap is exercised too."""
+    t = title if title is not None else (f"{query_echo} - Search" if query_echo else "Bing")
+    box = (f'<input class="b_searchbox" id="sb_form_q" name="q" type="search" '
+           f'value="{html.escape(query_echo)}" maxlength="1000" />' if query_echo is not None else "")
+    parts = [f"<html><head><title>{html.escape(t)}</title></head><body>{box}",
+             # The JS that sits on every real page and must NOT read as an ad
+             # or a challenge.
+             '<script>var _G={adc:"b_ad"};if(x.className.indexOf("b_adTop")!==-1){};'
+             '/* Challenge challenge */</script><ol id="b_results">']
+    if ad:
+        parts.append('<li class="b_ad b_adTop"><ul><li class="b_adLastChild"><h2>'
+                     '<a href="https://www.bing.com/aclk?ld=1">Sponsored thing</a></h2></li></ul></li>')
+    if module:
+        parts.append(f'<li class="{module}"><div>Some results have been removed</div></li>')
+    for href, ttl, snip in rows:
+        parts.append(f'<li class="b_algo" data-id iid=SERP.1><div class="b_tpcn"></div>'
+                     f'<h2><a target="_blank" href="{html.escape(href)}" h="ID=SERP,1.1">{ttl}</a></h2>'
+                     f'<div class="b_caption"><p class="b_lineclamp2">{snip}</p></div></li>')
+    parts.append('<li class="b_pag"><a href="/search?q=x&first=11">2</a></li></ol></body></html>')
+    return "".join(parts)
+
+
+def _bing_wrap(b64: str) -> str:
+    return ("https://www.bing.com/ck/a?!&&p=0f&ptn=3&ver=2&hsh=4&fclid=00&u=a1" + b64 + "&ntb=1")
+
+
+def _bing_controls(c: Controls) -> None:
+    """The Bing parser and guards, against synthetic pages whose expected
+    verdicts are written down here by hand - never computed by the code under
+    test. The base64 literals were encoded separately; the padding-stripped
+    one is the shape that broke a naive decoder (139 of 190 real links)."""
+    # 'https://www.example.com/' and 'https://example.org/guide?x=1' encoded
+    # URL-safe; the second with its '=' padding stripped exactly as Bing does.
+    W1, U1 = "aHR0cHM6Ly93d3cuZXhhbXBsZS5jb20v", "https://www.example.com/"
+    W2, U2 = "aHR0cHM6Ly9leGFtcGxlLm9yZy9ndWlkZT94PTE", "https://example.org/guide?x=1"
+    c.probe("bing_unwraps_a_redirect_link", lambda: unwrap_bing(_bing_wrap(W1)), (U1, True))
+    c.probe("bing_unwraps_a_padding_stripped_link", lambda: unwrap_bing(_bing_wrap(W2)), (U2, True))
+    c.probe("bing_html_escaped_wrapper_unwraps",
+            lambda: unwrap_bing(_bing_wrap(W1).replace("&", "&amp;"))[0], U1)
+    c.probe("bing_undecodable_wrapper_is_flagged_not_trusted",
+            lambda: unwrap_bing("https://www.bing.com/ck/a?u=zz")[1], False)
+    c.probe("bing_tracking_param_is_stripped",
+            lambda: unwrap_bing("https://shop.example.com/c/boots?msockid=abc123")[0],
+            "https://shop.example.com/c/boots")
+
+    q = "best hiking boots"
+    good_rows = [
+        (_bing_wrap(W1), "The 9 Best Hiking Boots, Tested", "We hiked 400 miles in hiking boots."),
+        ("https://gear.example.net/hiking-boots", "Hiking Boots for Every Trail", "Waterproof hiking boots."),
+        ("https://reviews.example.org/best-hiking-boots", "Best Hiking Boots of the Year", "Our picks."),
+        ("https://shop.example.com/hiking/boots", "Men's Hiking Boots | Shop", "Free shipping on boots."),
+    ]
+    good = parse_bing(_bing_page(q, good_rows, ad=True))
+    c.check("bing_valid_page_counts_four_organic", good["organic_count"] == 4, str(good["organic_count"]))
+    c.check("bing_ad_is_detected_and_not_counted_organic",
+            good["ads_detected"] is True and good["organic_count"] == 4, str(good["ad_markers"]))
+    c.check("bing_ad_internals_are_not_modules", good["modules_detected"] == [],
+            str(good["modules_detected"]))
+    c.check("bing_first_result_is_unwrapped_to_its_real_host",
+            good["results"][0]["url"] == U1, good["results"][0]["url"])
+    c.check("bing_echo_is_read_from_the_search_box", good["echo"] == q, repr(good["echo"]))
+    c.check("bing_valid_page_is_accepted", bing_guard(q, good)["refused"] is False,
+            str(bing_guard(q, good)))
+
+    no_ad = parse_bing(_bing_page(q, good_rows))
+    c.check("bing_inline_js_is_not_an_ad", no_ad["ads_detected"] is False, str(no_ad["ad_markers"]))
+    c.check("bing_inline_js_challenge_word_is_not_a_challenge", no_ad["challenge"] is None)
+    mod = parse_bing(_bing_page(q, good_rows, module="b_msg"))
+    c.check("bing_module_is_recorded", mod["modules_detected"] == ["b_msg"], str(mod["modules_detected"]))
+
+    # Wrong query: echo intact, results about an unrelated subject (the shape
+    # a direct request produced: speed tests).
+    wrong = parse_bing(_bing_page(q, [
+        ("https://speed.example.com/", "Internet Speed Test", "Check your download speed."),
+        ("https://fast.example.net/", "Fast Speed Test", "How fast is your connection?"),
+        ("https://isp.example.org/test", "Test Your Broadband", "Upload and ping."),
+        ("https://net.example.com/speed", "Speed Test Sites Compared", "Latency explained."),
+    ]))
+    wv = bing_guard(q, wrong)
+    c.check("bing_wrong_query_page_is_refused_as_wrong_query", wv.get("kind") == "wrong_query", str(wv))
+
+    # Collapse: every row about the leading word alone. One title shares the
+    # generic word "games" with the query, as a collapsed verb SERP of game
+    # portals does - an any-rest-word rule reads that row as on-topic.
+    cq = "play trail games"
+    col = parse_bing(_bing_page(cq, [
+        ("https://store.example.com/", "Play Store - Apps", "Download apps to play."),
+        ("https://dict.example.org/play", "PLAY Definition & Meaning", "To engage in activity."),
+        ("https://console.example.net/", "PlayConsole Official Site", "Play now."),
+        ("https://portal.example.com/", "Play Free Online Games at Portal", "Thousands to play."),
+    ]))
+    cv = bing_guard(cq, col)
+    c.check("bing_collapsed_page_is_refused_as_query_collapse",
+            cv.get("kind") == "query_collapse" and cv.get("collapse", {}).get("collapsed_to") == "play",
+            str(cv))
+    c.check("collapse_and_wrong_query_are_different_kinds", cv.get("kind") != wv.get("kind"))
+
+    # The hole the collapse check closes: one relevance token left after
+    # stopwords, so verify_relevance's qualifier exemption PASSES a page of
+    # dictionary entries for the leading word.
+    hq = "best boots"
+    hole_rows = [{"title": "BEST Definition & Meaning", "url": "https://dict.example.org/best", "snippet": "best"},
+                 {"title": "Best - Wikipedia", "url": "https://wiki.example.org/Best", "snippet": "the best"},
+                 {"title": "Best Store | Official Site", "url": "https://www.bestshop.example.com/", "snippet": ""}]
+    c.check("relevance_alone_would_pass_a_one_token_collapse", verify_relevance(hq, hole_rows)["pass"] is True,
+            "if this is False the exemption changed and the control no longer exercises the hole")
+    c.check("collapse_check_catches_it", detect_collapse(hq, hole_rows)["collapse"] is True)
+
+    ch = parse_bing("<html><head><title>One last step</title></head><body>"
+                    "<p>Please solve the challenge below to continue</p></body></html>")
+    chv = bing_guard(q, ch)
+    c.check("bing_challenge_page_is_refused_as_challenge", chv.get("kind") == "challenge", str(chv))
+    c.check("bing_challenge_is_cannot_ask_class",
+            SerpRefusal(chv.get("kind", ""), "x").as_dict()["class"] == "cannot_ask")
+    c.check("bing_collapse_is_wrong_answer_class",
+            SerpRefusal("query_collapse", "x").as_dict()["class"] == "wrong_answer")
+
+    mism = parse_bing(_bing_page("internet speed test", good_rows))
+    mv = bing_guard(q, mism)
+    c.check("bing_echo_mismatch_is_wrong_query", mv.get("kind") == "wrong_query" and mv.get("echo_mismatch"),
+            str(mv))
+    miss = parse_bing(_bing_page(None, good_rows, title="Bing"))
+    c.check("bing_missing_echo_is_refused", bing_guard(q, miss).get("kind") == "echo_missing")
+    c.check("bing_empty_200_is_unparsed_not_empty",
+            bing_guard(q, parse_bing(_bing_page(q, []))).get("kind") == "unparsed")
+
+    # Exit reporting and dedupe, the DDG fixes.
+    c.check("exit_unconfirmed_is_said_out_loud",
+            exit_fields("de", None, True) == {"exit_country": None, "exit_requested": "de",
+                                              "exit_unconfirmed": True, "exit_mismatch": False,
+                                              "exit_route": "proxy"})
+    c.check("exit_mismatch_is_flagged", exit_fields("de", "gb", True)["exit_mismatch"] is True)
+    c.check("exit_confirmed_is_not_flagged",
+            exit_fields("us", "us", True)["exit_unconfirmed"] is False
+            and exit_fields("us", "us", True)["exit_mismatch"] is False)
+    page = [{"url": "https://a.example.com/x"}, {"url": "https://b.example.com/"},
+            {"url": "https://www.a.example.com/x/"}, {"url": "https://b.example.com"},
+            {"url": "https://c.example.com/"}]
+    kept, dropped = dedupe_results(page)
+    c.check("dedupe_drops_repeats_and_keeps_first_position",
+            dropped == 2 and [r["url"] for r in kept] == ["https://a.example.com/x", "https://b.example.com/",
+                                                          "https://c.example.com/"], f"{dropped} {kept}")
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1135,10 +1746,13 @@ def main():
     p.add_argument("--control", action="store_true",
                    help="fire the relevance/shape guards at the captured fixtures and exit")
     p.add_argument("--provider", default=os.environ.get("SEO_SERP_PROVIDER", "ddg"),
-                   choices=["ddg", "serpd", "searxng", "brave", "serper", "serpapi", "dataforseo", "browser"])
+                   choices=["ddg", "serpd", "searxng", "brave", "serper", "serpapi", "dataforseo",
+                            "bing", "browser"])
     p.add_argument("--count", type=int, default=10)
     p.add_argument("--instance", help="searxng base URL")
-    p.add_argument("--gl", default="us", help="country (serpapi/brave) or location_code (dataforseo)")
+    p.add_argument("--gl", default="us",
+                   help="country (serpapi/brave; bing's market and pinned exit unless "
+                        "--proxy-country) or location_code (dataforseo)")
     p.add_argument("--hl", default="en")
     p.add_argument("--target-domain", help="report this domain's position if present")
     # Failover is the DEFAULT. Until 2026-09-14 it was opt-in, while the quality
@@ -1253,10 +1867,18 @@ def main():
     if a.fallback:
         chain += [c for c in (keyed_alternatives() + ["ddg"]) if c not in chain]
 
-    errors, results, used = {}, None, a.provider
+    errors, refusals, results, used = {}, {}, None, a.provider
     for cand in chain:
+        # Per-read metadata must not leak from a refused provider into the one
+        # that answered: a bing exit reported on a ddg payload is a false claim.
+        for k in EXIT_KEYS + ("engine", "depth", "bing", "proxy_pinned"):
+            results_meta.pop(k, None)
         try:
             got = PROVIDERS[cand](a.query, a.count, instance=a.instance, gl=a.gl, hl=a.hl, proxy=proxy)
+        except SerpRefusal as exc:
+            errors[cand] = str(exc)
+            refusals[cand] = exc.as_dict()
+            continue
         except Exception as exc:
             errors[cand] = str(exc)
             continue
@@ -1289,6 +1911,7 @@ def main():
             "error": ("; ".join(f"{k}: {v}" for k, v in errors.items())[:400]
                       or "all configured SERP providers failed - see the browser handoff"),
             "errors": errors,
+            "refusals": refusals or None,
             "proxy": proxy.label() if proxy else None,
             "why_this_block": (
                 "Every configured SERP provider failed or returned results that were not for this "
@@ -1308,8 +1931,10 @@ def main():
         "ok": True,
         "query": a.query,
         "provider": used,
+        "engine": ENGINES.get(used, used),
         "fell_back_from": a.provider if used != a.provider else None,
         "provider_errors": errors or None,
+        "provider_refusals": refusals or None,
         "proxy": proxy.label() if proxy else None,
         "results": results,
         "relevance": verify_relevance(a.query, results),
