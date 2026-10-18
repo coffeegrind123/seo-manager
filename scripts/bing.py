@@ -645,7 +645,7 @@ def run_control() -> dict:
     c.check("a_rotation_between_weeks_is_counted", wp.get("leader_changes") == 1,
             str(wp.get("weekly_leaders")))
     c.check("the_summary_counts_each_flag_once", ca["summary"] ==
-            {"split": 1, "owner_absent": 1, "edge_of_page": 1}, str(ca["summary"]))
+            {"split": 1, "locale_split": 0, "stacked": 0, "owner_absent": 1, "edge_of_page": 1}, str(ca["summary"]))
     tight = _cannibal_core(A, OWN, min_share=0.35)
     c.check("min_share_is_tunable_and_a_lone_holder_is_not_a_split",
             "split" not in tight["findings"][0]["flags"] and tight["summary"]["split"] == 0)
@@ -1129,6 +1129,49 @@ EDGE_OF_PAGE = (7, 11)
 PAGE_CALL_PACE_S = 1.0
 
 
+# A leading path segment that is a language tag: /pt/, /zh-hans/, /pt-br/.
+_LOCALE_SEG = re.compile(r"^[a-z]{2}(?:[-_][a-z0-9]{2,8})?$", re.I)
+
+
+def _strip_locale(url):
+    p = urllib.parse.urlparse(url)
+    segs = p.path.split("/")
+    if len(segs) > 1 and _LOCALE_SEG.match(segs[1]):
+        rest = "/" + "/".join(segs[2:])
+        return p.netloc.lower(), rest, True
+    return p.netloc.lower(), p.path or "/", False
+
+
+# A leader this high, unchanged every week, means a second URL on page 1 ADDS a
+# result instead of taking one away.
+STACKED_MAX_POSITION = 3
+
+
+def _stacked(entries, leaders, changes):
+    """True when one URL led every week at position <= 3: the other holders are
+    extra page-1 results under a stable winner, not a rotation that costs rank.
+    Measured 2026-10-18: most same-language splits were /zh/ at #1-2 every week
+    with a /zh/ sibling at #3-7."""
+    if changes or not leaders:
+        return False
+    lead = next((e for e in entries if e["url"] == leaders[0]["url"]), None)
+    return bool(lead and lead["avg_position"] is not None
+                and lead["avg_position"] <= STACKED_MAX_POSITION)
+
+
+def same_page_across_locales(urls):
+    """True when every URL is the SAME page in a different language: one path once
+    a leading language segment is stripped, with at least one URL carrying it.
+
+    Bing's per-query endpoints pool every market, so /pt/ shown to Portuguese
+    searchers and / shown to English ones arrive as one query split two ways.
+    That is hreflang doing its job (measured 2026-10-18: the head "splits" were
+    locale homepages), and is reported as `locale_split`, never as cannibalisation."""
+    parts = [_strip_locale(u) for u in urls]
+    return (len({(h, r.rstrip("/") or "/") for h, r, _ in parts}) == 1
+            and any(tagged for _, _, tagged in parts))
+
+
 def _phrase_in(phrase, query):
     """Case-insensitive WORD match: "guide" is in "setup guide", not in "guidelines".
     A substring match would assign an owner to queries it was never meant for."""
@@ -1185,8 +1228,14 @@ def _cannibal_core(per_page, owners=None, min_share=CANNIBAL_MIN_SHARE,
 
         flags = []
         holders = [e["url"] for e in entries if e["impressions"] / total >= min_share]
+        leaders, changes = _leaders(urls)
         if len(holders) >= 2:
-            flags.append("split")
+            if same_page_across_locales(holders):
+                flags.append("locale_split")
+            elif _stacked(entries, leaders, changes):
+                flags.append("stacked")
+            else:
+                flags.append("split")
         ranked = [e["avg_position"] for e in entries
                   if e["avg_position"] is not None and e["impressions"] > 0]
         best = min(ranked) if ranked else None
@@ -1212,11 +1261,10 @@ def _cannibal_core(per_page, owners=None, min_share=CANNIBAL_MIN_SHARE,
         if not flags:
             continue
 
-        leaders, changes = _leaders(urls)
         f = {"query": q, "flags": flags, "impressions": total,
              "clicks": sum(e["clicks"] for e in entries),
              "best_position": best, "urls": entries,
-             "split_urls": holders if "split" in flags else [],
+             "split_urls": holders if set(flags) & {"split", "locale_split", "stacked"} else [],
              "leader_changes": changes, "weekly_leaders": leaders}
         if owner_rows:
             f["owners"] = owner_rows
@@ -1227,7 +1275,7 @@ def _cannibal_core(per_page, owners=None, min_share=CANNIBAL_MIN_SHARE,
 
     findings.sort(key=lambda f: (-f["impressions"], f["query"]))
     summary = {k: sum(1 for f in findings if k in f["flags"])
-               for k in ("split", "owner_absent", "edge_of_page")}
+               for k in ("split", "locale_split", "stacked", "owner_absent", "edge_of_page")}
     return {"queries_checked": checked, "summary": summary, "findings": findings,
             "unmeasured_pages": sorted(unmeasured)}
 
@@ -2105,7 +2153,9 @@ def querypages(key, site, q, limit, min_share=CANNIBAL_MIN_SHARE):
         "leader_changes": changes, "weekly_leaders": leaders,
         "window_weeks": _span([r for rows in per_url.values() for r in rows]),
         "reading": ("every URL Bing showed for this query, by impressions. `split` = two or "
-                    f"more URLs at >= {min_share:.0%} share each; `edge_of_page` = the best "
+                    f"more URLs at >= {min_share:.0%} share each; `locale_split` = the same page "
+                    "in different languages, which Bing pools across markets (hreflang's job, "
+                    "not cannibalisation); `edge_of_page` = the best "
                     f"URL sits at positions {EDGE_OF_PAGE[0]}-{EDGE_OF_PAGE[1]}; "
                     "`leader_changes` counts weeks where a different URL led."),
     })

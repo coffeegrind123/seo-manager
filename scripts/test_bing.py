@@ -728,6 +728,41 @@ check("and the split now fires", r["summary"]["split"] == 1)
 check("without double-counting /a's own row",
       next(u for u in r["findings"][0]["urls"] if u["url"] == A_)["impressions"] == 500)
 
+print("\n24b. cannibal: the same page in different LANGUAGES is a locale_split, not a split")
+# Measured 2026-10-18: of 174 "splits", the head ones were /zh/, /pt/, /ru/ and /
+# sharing a query - one page per language, which Bing pools across markets.
+L_ = lambda *rows: bing._weekly([{"Query": q, "Date": W1, "Impressions": i, "Clicks": 0,
+                                  "AvgImpressionPosition": p, "AvgClickPosition": -1} for q, i, p in rows])
+core = bing._cannibal_core({"https://x.net/": L_(("q", 300, 8)), "https://x.net/pt/": L_(("q", 500, 4)),
+                            "https://x.net/zh-hans/": L_(("q", 200, 2))})
+f_ = core["findings"][0]
+check("locale variants of one page are a locale_split", "locale_split" in f_["flags"] and "split" not in f_["flags"])
+check("and counted separately", core["summary"]["locale_split"] == 1 and core["summary"]["split"] == 0)
+core = bing._cannibal_core({"https://x.net/pt/": L_(("q", 500, 4)), "https://x.net/pt/modes": L_(("q", 400, 6))})
+check("CONTROL two pages in ONE language are still a split",
+      "split" in core["findings"][0]["flags"] and core["summary"]["locale_split"] == 0)
+core = bing._cannibal_core({"https://x.net/": L_(("q", 500, 4)), "https://x.net/pt/modes": L_(("q", 400, 6))})
+check("CONTROL different pages in different languages are a split",
+      "split" in core["findings"][0]["flags"])
+
+print("\n24c. cannibal: a stable #1 with a sibling also on page 1 is `stacked`, not a split")
+# Measured 2026-10-18: most same-language "splits" were /zh/ at #1-2 every week with
+# /zh/modes at #3-7 - two page-1 results, more SERP space, nothing lost.
+W2_ = D("2026-08-14")
+S_ = lambda *rows: bing._weekly([{"Query": "q", "Date": d, "Impressions": i, "Clicks": 0,
+                                  "AvgImpressionPosition": p, "AvgClickPosition": -1} for d, i, p in rows])
+core = bing._cannibal_core({"https://x.net/zh/": S_((W1, 600, 1.5), (W2_, 600, 1.4)),
+                            "https://x.net/zh/modes": S_((W1, 200, 4), (W2_, 200, 4))})
+check("a stable top-3 leader with a page-1 sibling is stacked",
+      core["findings"][0]["flags"] == ["stacked"] and core["summary"]["stacked"] == 1
+      and core["summary"]["split"] == 0)
+core = bing._cannibal_core({"https://x.net/a": S_((W1, 600, 8), (W2_, 100, 9)),
+                            "https://x.net/b": S_((W1, 100, 9), (W2_, 600, 8))})
+check("CONTROL a rotating leader stays a split", "split" in core["findings"][0]["flags"])
+core = bing._cannibal_core({"https://x.net/a": S_((W1, 600, 6), (W2_, 600, 6)),
+                            "https://x.net/b": S_((W1, 200, 8), (W2_, 200, 8))})
+check("CONTROL a stable leader that is NOT top 3 stays a split", "split" in core["findings"][0]["flags"])
+
 print("\n25. CLI: every new fixed-window command refuses --days")
 for cmd, extra in [("keywordtrend", ["--q", "x"]), ("querypages", ["--q", "x"]),
                    ("querytraffic", ["--q", "x"]), ("children", []), ("urltraffic", ["--url", "x"])]:
