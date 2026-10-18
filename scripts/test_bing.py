@@ -201,6 +201,29 @@ check("CONTROL a reference/measurement disagreement is reported",
       any(x["column"] == "in_index" for x in r2.get("kind_disagrees_with_reference", [])))
 check("CONTROL and the MEASURED kind wins", r2["column_kinds"]["in_index"]["kind"] == "flow")
 
+# Measured 2026-10-18 over 71 steps: InIndex 1,025 -> 8,442 with 2 small dips
+# (largest 2.3% of its peak), Code2xx with 8 (largest 1.6%). Allowing ONE dip
+# called both flows, and InIndex was summed to 366,850 for an 8,442-page index.
+# Daily counts dip on about half the days and by a third or more of their peak.
+rise = [1000 + 100 * i for i in range(72)]
+for i in (20, 45):
+    rise[i] = rise[i - 1] - 150                       # two corrections, ~2% of the peak
+c2xx = [1100 + 90 * i for i in range(72)]
+for i in (5, 12, 19, 26, 33, 40, 47, 54):
+    c2xx[i] = c2xx[i - 1] - 100                       # eight corrections, ~1.4%
+bounce = [300 + (250 if i % 2 else 0) + 5 * i for i in range(72)]   # a real daily count
+long_days = [{"Date": f"/Date({1785715200000 + i * 86400000})/", "InIndex": rise[i],
+              "Code2xx": c2xx[i], "CrawledPages": bounce[i]} for i in range(72)]
+stub_by_method({"GetCrawlStats": long_days})
+r3 = bing.crawlstats("k", "https://x.net/")
+check("a stock with two small corrections is cumulative",
+      r3["column_kinds"]["in_index"]["kind"] == "cumulative")
+check("a stock with eight small corrections is cumulative",
+      r3["column_kinds"]["code_2xx"]["kind"] == "cumulative")
+check("so neither is summed", "in_index" not in r3["window_totals"] and "code_2xx" not in r3["window_totals"])
+check("CONTROL a count that dips every other day is still a flow",
+      r3["column_kinds"]["crawled_pages"]["kind"] == "flow")
+
 print("\n9. an empty crawl-issue list is UNKNOWN when the stats disagree")
 stub_by_method({"GetCrawlIssues": [],
                 "GetCrawlStats": [dict(d, CrawlErrors=e) for d, e in zip(days, [2, 2, 1, 4, 3])]})

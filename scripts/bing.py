@@ -1451,8 +1451,11 @@ def traffic(key, site):
 # re-derives the kind from the series it just fetched and reports a disagreement,
 # because a remembered constraint that nobody re-checks is exactly how the
 # `--days` bug shipped.
-REF_CUMULATIVE = ("Code2xx", "InIndex", "InLinks", "BlockedByRobotsTxt")
-REF_FLOW = ("CrawledPages", "AllOtherCodes", "Code4xx", "Code5xx", "CrawlErrors")
+# AllOtherCodes moved to cumulative 2026-10-18: 486 -> 2,211 over 71 days, no dip
+# above 6.5% of its peak, and summed as a flow it came to 1.96x the pages crawled -
+# impossible for a per-day count of responses.
+REF_CUMULATIVE = ("Code2xx", "InIndex", "InLinks", "BlockedByRobotsTxt", "AllOtherCodes")
+REF_FLOW = ("CrawledPages", "Code4xx", "Code5xx", "CrawlErrors")
 
 # Split before a capital AND before a digit run, so `Code2xx` reads `code_2xx`
 # rather than `code2xx` - these names end up in jq expressions in the workflow
@@ -1464,12 +1467,20 @@ def _snake(name):
     return _SNAKE.sub("_", name).lower()
 
 
+# A stock may dip on at most this share of days, by at most this share of its peak.
+STOCK_MAX_DIP_SHARE = 0.25
+STOCK_MAX_DIP_SIZE = 0.15
+
+
 def _classify_series(values):
     """flow vs cumulative, derived from the numbers rather than assumed.
 
-    A cumulative column never decreases. One correction in a month is tolerated
-    (measured: Code2xx went 5500 -> 5499 once in 28 days) because a hard
-    monotonicity test would misclassify it as a flow and license summing it.
+    A stock dips rarely and SLIGHTLY; a daily count dips often and HARD. Both
+    tests, because either alone fails on real data. Measured 2026-10-18 over 71
+    steps: InIndex dipped 2 times, Code2xx 8, and neither dip exceeded 2.3% of
+    the column's peak; CrawledPages dipped 34 times, by up to 46%. The old rule -
+    at most ONE dip - called every stock with a second correction a flow and
+    summed InIndex to 366,850 for an 8,442-page index.
 
     A column that never changes cannot be classified at all - and reporting that
     honestly is the point, because every all-zero column on the only account
@@ -1479,10 +1490,14 @@ def _classify_series(values):
         return "unclassified", "fewer than 3 days of data"
     if len(set(values)) == 1:
         return "unclassified", f"constant at {values[0]} for the whole window"
-    drops = sum(1 for i in range(1, len(values)) if values[i] < values[i - 1])
-    if drops <= 1:
-        return "cumulative", f"{drops} decrease(s) in {len(values) - 1} steps"
-    return "flow", f"{drops} decrease(s) in {len(values) - 1} steps"
+    steps = len(values) - 1
+    dips = [values[i - 1] - values[i] for i in range(1, len(values)) if values[i] < values[i - 1]]
+    peak = max(values) or 1
+    worst = max(dips, default=0) / peak
+    basis = f"{len(dips)} decrease(s) in {steps} steps, largest {worst:.1%} of the peak"
+    if len(dips) / steps <= STOCK_MAX_DIP_SHARE and worst <= STOCK_MAX_DIP_SIZE:
+        return "cumulative", basis
+    return "flow", basis
 
 
 def crawlstats(key, site):
