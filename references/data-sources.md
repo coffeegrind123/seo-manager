@@ -803,6 +803,16 @@ verified property. `scripts/bing.py`.
 | Who links to us? | `bing.py backlinks` | ✅ works (empty on a new property) |
 | What do we appear for on Bing? | `bing.py queries` | ✅ works |
 | Clicks/impressions over time | `bing.py traffic` | ✅ works |
+| One query's demand, week by week | `bing.py keywordtrend --q "..."` | ✅ 24 weekly rows, exact + broad |
+| Every URL ranking for a query | `bing.py querypages --q "..."` | ✅ with split / edge flags |
+| Where in the SERP a page shows for a query | `bing.py querypagedetail --q --page` | ✅ position histogram |
+| One query's site traffic by DAY | `bing.py querytraffic --q "..."` | ✅ ~76 daily rows |
+| What bingbot is served | `bing.py fetch --url ... [--live]` | ✅ fetched within ~10s |
+| Make Bing re-read the sitemap | `bing.py submitfeed [--yes]` | ✅ read back from GetFeeds |
+| Account configuration | `bingadmin.py state` and its writes | ✅ every write read back |
+| Per-URL traffic | `bing.py urltraffic` | ⚠️ returned 0 for pages with traffic — cross-checked |
+| Index Explorer children | `bing.py children` | ⚠️ empty for every path tried — reported `unknown` |
+| Site moves, deep links (sitelinks) | `bingadmin.py sitemoves` / `deeplinks` | ❌ retired: HTTP 404 |
 
 Measured live (90d, us/en-US): `running shoes` → **10,681 impressions /
 87,198 broad**; `chess openings` → 3,188 / 6,466. And
@@ -852,6 +862,32 @@ before:
 - **Legacy SOAP and POX APIs retire 2026-08-31** (Microsoft's own banner). The
   JSON endpoint used here, `ssl.bing.com/webmaster/api.svc/json/<Method>`, is
   the surviving one.
+
+### The whole API, measured 2026-10-18
+
+All 62 methods of the JSON endpoint now have a caller (`bing.py` measures, `bingadmin.py` configures). Every
+read was called on a live account first, and every write's body was confirmed with a no-op call, because Bing
+rejects an unknown field or a malformed date with InvalidParameter. What that found:
+
+- **Failures are HTTP 400 with the ErrorCode envelope in the BODY**, not HTTP 200. The old client read only the
+  status, so a throttle and NotAuthorized were both a bare "HTTP 400". Codes are now decoded by name.
+- **An empty HTTP 404 means the METHOD is gone** — a made-up method name gets exactly that on GET and POST.
+  `GetSiteMoves`, `SubmitSiteMove`, `GetDeepLink`, `GetDeepLinkAlgoUrls` and `UpdateDeepLink` are retired.
+  `GetChildrenUrlInfo` is POST-only (405 on GET).
+- **Every write answers `{"d": null}` on success AND on a no-op.** Eight Remove* methods returned null for
+  things that did not exist, and `AddSite` / `AddConnectedPage` returned null for a site the account does not own
+  (`AddSite` really added it; the probe removed it again). So writes refuse no-ops up front and are confirmed only
+  by reading the state back.
+- **ThrottleHost (5) fires after ~20 calls at 0.6s spacing** and clears within 20s — retried with 3/8/20s backoff.
+- **Bodies accept ISO dates** (and `/Date(ms)/`); garbage is InvalidParameter.
+- **`GetUrlTrafficInfo` returned 0/0 for the homepage** while GetPageStats showed 82,181 impressions for the same
+  string. **`GetChildrenUrlInfo` / `GetChildrenUrlTrafficInfo` returned `[]` for every path**, with and without
+  filters, while Bing held 8,442 pages. Both are cross-checked, never read alone.
+- **The fetch history is slash-insensitive**: fetching `/zh/` then `/zh` leaves one row, `/zh`. A fetch's Document is
+  the crawler record, then the HTTP head, then the body — already decoded despite `Content-Encoding: br`.
+- **`GetQueryTrafficStats` honours its query** (a nonsense query returns nothing, a different one different numbers);
+  its daily totals are larger than `querypages`' weekly sum because the windows and the counting differ.
+- **The URL and content submission quotas are separate**, both 100/day on the account measured.
 
 ### ⚠️ Empty is only trustworthy because of the control
 

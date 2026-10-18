@@ -211,7 +211,12 @@ full table (research, measurement, guards, tests), the command cookbook, and the
 per-script traps that are not guessable: `serpd.py --start` must never take a
 trailing `&`, `crawllog.py --glob` must be quoted, `hreflang.py control` runs
 before any audit, and `bing.py sites` is the auth control to run first when
-anything looks odd.
+anything looks odd. `bing.py fetch --url` shows what bingbot is served, and
+`bingadmin.py state` reads the Bing account's own configuration (blocks,
+ignored parameters, country targeting, crawl-rate cap, roles) — state no crawl
+of the site can see. Every Bing write is a dry run until `--yes` and is
+confirmed by reading it back, because Bing answers a no-op with the same null
+as a success.
 
 ---
 

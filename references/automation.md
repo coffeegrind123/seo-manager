@@ -98,6 +98,11 @@ After a merge, `scripts/indexnow.py ping --pending` submits every new page to
 IndexNow — free, keyless, instant, and it reaches **Bing, Yandex, Seznam, Naver
 and DuckDuckGo. Not Google**, which has never joined IndexNow.
 
+IndexNow announces URLs; it does not make Bing re-read the sitemap, so the feed count Bing holds stays where it
+was. `postdeploy.py` therefore also runs `bing.py submitfeed` (read back from GetFeeds), and `bing.py submit`
+spends Bing's own per-URL quota — a different channel from IndexNow. `bing.py fetch --url` shows what bingbot is
+actually served when a page will not index.
+
 For Google the only legitimate accelerator is a human clicking "Request
 indexing" in Search Console, so `indexnow.py google-steps` batches everything
 pending into ONE session (the quota is per property per day, so batching costs

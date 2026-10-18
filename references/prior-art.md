@@ -148,6 +148,18 @@ into a silo that is the subject of an open `remeasure.py` hypothesis is a second
 intervention landing inside someone else's experiment, so it is an owner
 decision, not an agent one.
 
+### ✅ #8b — The REST of the Bing API — **BUILT 2026-10-18 (`bing.py`, `bingadmin.py`)**
+
+`bing.py` called 19 of the 62 methods. The other 43 came from the same map (`merj/bing-webmaster-tools`'
+service modules), each probed live first. Measuring before writing paid off again: three endpoints answer
+confidently and wrongly (`GetUrlTrafficInfo` zeros, both Index Explorer endpoints empty everywhere), five are
+retired behind an empty 404, and the existing client had been reading every failure as a bare "HTTP 400". The
+measurements are in data-sources.md, "The whole API, measured 2026-10-18".
+
+- ⚠ **A probe changed the account.** Write methods were probed against an unowned site, expecting NotAuthorized.
+  `AddSite` succeeded and added it; `RemoveSite` took it off again. Probe writes with a no-op on your OWN site
+  (removing something that does not exist), never with an unowned one.
+
 ### ✅ #9 — The unnamed-crawler bucket — **FIXED 2026-09-01 (`crawllog.py`)**
 
 Not on any roadmap, found by using the tool rather than reading about it. The
