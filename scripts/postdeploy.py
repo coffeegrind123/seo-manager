@@ -19,13 +19,17 @@ site this skill manages.
                    markup that just regressed.
   3. INDEXNOW      Bing, Yandex, Seznam, Naver, DuckDuckGo-via-Bing. Free,
                    keyless, no Google.
-  4. GOOGLE        `gsc.py sitemap-submit` - the only programmatic nudge
+  4. BING          `bing.py submitfeed` - makes Bing re-read the SITEMAP, the
+                   one thing IndexNow does not do: IndexNow announces URLs and
+                   leaves Bing's held feed count where it was. Read back from
+                   GetFeeds. No Bing key is `no_key`, not a failure.
+  5. GOOGLE        `gsc.py sitemap-submit` - the only programmatic nudge
                    Google offers, and it asks for a FEED re-read rather than
                    for a URL to be indexed. There is no force-index API for
                    ordinary pages; anything claiming otherwise is describing
                    the JobPosting/BroadcastEvent Indexing API, which does not
                    apply and is against its terms here.
-  5. RECEIPT       every run appends to `.seo/postdeploy.jsonl`.
+  6. RECEIPT       every run appends to `.seo/postdeploy.jsonl`.
 
 Step 5 exists because of a question that could not be answered on 2026-09-01.
 A deploy had rewritten titles across six pages, and "was IndexNow pinged for
@@ -113,6 +117,8 @@ def main():
     ap.add_argument("--yes", action="store_true",
                     help="actually submit. Without it the checks run and nothing is announced")
     ap.add_argument("--skip-indexnow", action="store_true")
+    ap.add_argument("--skip-bing", action="store_true")
+    ap.add_argument("--bing-site", help="Bing Webmaster site url (default: <base>/)")
     ap.add_argument("--skip-google", action="store_true")
     ap.add_argument("--timeout", type=int, default=900)
     # Flag-style, like serp/serpd/seodoctor/rankcheck - this script has no
@@ -209,7 +215,33 @@ def main():
         if not steps["indexnow"]["ok"]:
             problems.append("IndexNow ping failed")
 
-    # ---- 4. Google --------------------------------------------------------
+    # ---- 4. Bing sitemap --------------------------------------------------
+    if a.skip_bing:
+        steps["bing"] = {"ok": True, "state": "skipped"}
+    else:
+        argv = ["bing.py", "submitfeed", "--site", a.bing_site or cfg.get("bing_site") or base + "/",
+                "--feed", sitemap, "--root", str(root)]
+        if a.yes:
+            argv.append("--yes")
+        doc, rc, raw = run(argv, timeout=a.timeout)
+        if doc is None:
+            steps["bing"] = {"ok": False, "state": "unreadable", "output": raw, "exit": rc}
+        elif doc.get("state") == "no_key":
+            # No Bing account is a configuration, not a failed deploy - IndexNow
+            # above still reached Bing.
+            steps["bing"] = {"ok": True, "state": "no_key", "result": doc}
+        else:
+            steps["bing"] = {"ok": doc.get("ok", False),
+                             "state": "submitted" if doc.get("submitted") else "dry_run",
+                             "verified": doc.get("verified"),
+                             "result": doc,
+                             "not_indexnow": ("IndexNow (step 3) announces URLs; this asks Bing to "
+                                              "re-read the feed, which is what moves its held "
+                                              "url count. Different channels.")}
+        if not steps["bing"]["ok"]:
+            problems.append("Bing sitemap submit failed")
+
+    # ---- 5. Google --------------------------------------------------------
     if a.skip_google:
         steps["google"] = {"ok": True, "state": "skipped"}
     else:
