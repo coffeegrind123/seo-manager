@@ -638,6 +638,22 @@ r = bing.removefeed("k", SITE, SITE + "gone.xml", True)
 check("removing a feed Bing does not hold is refused - its null would prove nothing",
       r["error"] == "feed_not_held" and posted == [])
 
+print("\n22b. feeds --verify: a sitemap INDEX is verified, not skipped")
+# Measured 2026-10-18: Bing types the site's only feed "Sitemap Index", and the
+# verify filter accepted only "Sitemap" - so --verify returned [] and read as
+# "nothing to compare".
+stub([{"Url": SITE + "sitemap.xml", "Type": "Sitemap Index", "Status": "Success", "UrlCount": 8299,
+       "LastCrawled": D("2026-10-15"), "Submitted": "/Date(-11644473600000)/"},
+      {"Url": SITE + "feed.rss", "Type": "RSS", "Status": "Success", "UrlCount": 20,
+       "LastCrawled": D("2026-10-15"), "Submitted": "/Date(-11644473600000)/"}])
+REAL_COUNT = bing._count_sitemap
+bing._count_sitemap = lambda url, depth=0, seen=None: (8300, [])
+r = bing.feeds("k", SITE, True)
+bing._count_sitemap = REAL_COUNT
+check("a Sitemap Index row is verified", [v["url"] for v in r["verify"]] == [SITE + "sitemap.xml"])
+check("and its delta against the live count is computed", r["verify"][0].get("delta") == 1)
+check("CONTROL an RSS feed is still not counted as a sitemap", len(r["verify"]) == 1)
+
 print("\n23. fetch: UnknownError retried once, slash-folded history accepted")
 calls = []
 

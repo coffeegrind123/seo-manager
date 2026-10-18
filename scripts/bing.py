@@ -1719,7 +1719,10 @@ def feeds(key, site, verify):
     if verify:
         checks = []
         for row in out_rows:
-            if row["type"] and row["type"].lower() != "sitemap":
+            # "Sitemap" AND "Sitemap Index": _count_sitemap follows an index, and
+            # skipping indexes made --verify return [] on a site whose only feed
+            # is one (measured 2026-10-18).
+            if row["type"] and not row["type"].lower().startswith("sitemap"):
                 continue
             live, errs = _count_sitemap(row["url"])
             bing_n = row.get("url_count_per_bing")
