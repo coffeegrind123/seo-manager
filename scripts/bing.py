@@ -56,6 +56,37 @@ searchers did. First-party: no user-agent to verify, no access log to parse.
                crawl of the site, and they survive every deploy
   crawlsettings  the per-hour crawl-rate cap. Raising it removes a ceiling; it
                does not make Bing crawl more
+  feeddetails  a sitemap INDEX child by child - count, status, last crawl
+  submitfeed   SubmitFeed: make Bing re-read a sitemap. DRY RUN until --yes;
+               the live feed must be 200 and parse first; read back after
+  removefeed   RemoveFeed. Refused unless Bing holds the feed - a no-op answers
+               the same null as a removal
+  submitcontent  SubmitContent: push a page's full HTTP response. DRY RUN until
+               --yes; the content-quota drop is the only proof it counted
+  fetch        FetchUrl: bingbot fetches one URL now, and the response it got
+               is parsed - status, noindex, canonical, truncation. --live diffs
+               it against a normal fetch
+  fetched      the fetch history, or one URL's last fetch parsed
+
+Per-query views, the other direction from `pages`/`pagequeries`:
+
+  keywordtrend  GetKeywordStats - one query's Bing demand, week by week
+  querypages   EVERY url of the site that drew impressions for one query, with
+               split / edge-of-page flags. `cannibal --query/--top-queries`
+               uses it to see URLs nobody listed
+  querypagedetail  the POSITION DISTRIBUTION for one query on one page - the
+               shape an average position hides
+  querytraffic  one query's clicks/impressions for the site, by DAY
+  urltraffic   GetUrlTrafficInfo, cross-checked: measured returning 0 for pages
+               with real traffic, so a zero is never read alone
+  children     Index Explorer, one level - measured empty on every path tried,
+               so an empty answer is cross-checked and reported unknown
+
+Account CONFIGURATION (sites, roles, blocks, query parameters, regions, crawl
+rate, connected pages, deep-link blocks) is `bingadmin.py`, not this script.
+
+Every failure decodes Bing's ErrorCode (it arrives in an HTTP 400 body), a 404
+means the METHOD is retired, and throttles are retried with backoff.
 
 ⚠️ THE ONE THING THAT MATTERS MOST HERE: these are **BING IMPRESSIONS**, not
 Google search volume, and the two are different quantities by more than a
@@ -94,6 +125,7 @@ Stdlib only. Key from BING_WEBMASTER_API_KEY or ~/.bing_webmaster_key (0600).
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import os
@@ -102,7 +134,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 
 BASE = "https://ssl.bing.com/webmaster/api.svc/json"
@@ -127,29 +160,114 @@ def read_key():
     return ""
 
 
+# Bing's ErrorCode enum (Microsoft.Bing.Webmaster.Api.ApiErrorCode).
+ERROR_CODES = {
+    0: "None", 1: "InternalError", 2: "UnknownError", 3: "InvalidApiKey",
+    4: "ThrottleUser", 5: "ThrottleHost", 6: "UserBlocked", 7: "InvalidUrl",
+    8: "InvalidParameter", 9: "TooManySites", 10: "UserNotFound", 11: "NotFound",
+    12: "AlreadyExists", 13: "NotAllowed", 14: "NotAuthorized", 15: "UnexpectedState",
+    16: "Deprecated",
+}
+THROTTLE_CODES = (4, 5)
+THROTTLE_HTTP = (429, 503)
+# Seconds before each retry. Measured 2026-10-18: ThrottleHost fired after ~20
+# calls at 0.6s spacing and had cleared 20s later.
+THROTTLE_BACKOFF_S = (3, 8, 20)
+_sleep = time.sleep
+
+
+def _envelope(status, body):
+    """A failed response -> the standard error shape, with Bing's code decoded.
+
+    Measured 2026-10-18: failures arrive as HTTP 400 with the ErrorCode envelope
+    in the BODY (NotAuthorized, InvalidParameter, ThrottleHost alike), not as
+    HTTP 200. Read only the status and every one of them is a bare "HTTP 400",
+    so a throttle and "you do not own this site" become the same answer.
+
+    An HTTP 404 with an empty body is a METHOD Bing no longer serves: a made-up
+    method name returns exactly that, on GET and POST alike, which is the control
+    that makes 404 mean "retired" rather than "this site has none"."""
+    try:
+        data = json.loads(body) if body.strip() else None
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict) and "ErrorCode" in data:
+        code = data.get("ErrorCode")
+        return {"ok": False, "error": data.get("Message", "unknown"), "error_code": code,
+                "error_name": ERROR_CODES.get(code, "unknown"), "http_status": status}
+    if status == 404:
+        return {"ok": False, "error": "method_not_served", "http_status": 404,
+                "detail": ("Bing answered 404 for the METHOD - the same answer a method name "
+                           "that never existed gets. The endpoint is retired or renamed; this "
+                           "says nothing about the site.")}
+    if status == 405:
+        return {"ok": False, "error": "wrong_http_verb", "http_status": 405,
+                "detail": "this method is served on the other verb (GET vs POST)"}
+    return {"ok": False, "error": f"HTTP {status}", "http_status": status, "detail": body[:300]}
+
+
+def _redact(res, req):
+    """Scrub the API key out of every string in an error result.
+
+    The key travels in the query string, so any exception text that quotes the
+    URL would print it into JSON output, receipts and CI logs."""
+    key = urllib.parse.parse_qs(urllib.parse.urlparse(req.full_url).query).get("apikey", [""])[0]
+    if not key:
+        return res
+    return {k: (v.replace(key, "<redacted>") if isinstance(v, str) else v) for k, v in res.items()}
+
+
+def _send(req, timeout):
+    return _redact(_send_raw(req, timeout), req)
+
+
+def _send_raw(req, timeout):
+    """urlopen with Bing's error envelope decoded and throttles retried.
+
+    A throttle that is NOT retried reads as an answer - 35 of 46 urlinfo calls in a
+    tight loop (2026-09-01) - so it is retried with backoff here, once, for every
+    caller, and if it still throttles the result says `throttled` rather than
+    passing as some other failure."""
+    res = None
+    for attempt in range(len(THROTTLE_BACKOFF_S) + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            res = _envelope(e.code, e.read().decode("utf-8", "replace"))
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        else:
+            if not body.strip():
+                return {"ok": True, "d": None}
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                return {"ok": False, "error": "unparseable response", "detail": body[:200]}
+            # The envelope can also arrive on a 200. Treating it as data is how "we
+            # have no backlinks" gets reported when the truth is "you do not own
+            # this site".
+            if isinstance(data, dict) and "ErrorCode" in data:
+                res = _envelope(200, body)
+            else:
+                return {"ok": True, "d": data.get("d") if isinstance(data, dict) else data}
+
+        if res.get("error_code") in THROTTLE_CODES or res.get("http_status") in THROTTLE_HTTP:
+            if attempt < len(THROTTLE_BACKOFF_S):
+                _sleep(THROTTLE_BACKOFF_S[attempt])
+                continue
+            res["throttled"] = True
+            res["throttled_means"] = ("still throttled after every retry. This is CANNOT ASK, "
+                                      "never an empty answer - re-run later.")
+        return res
+    return res
+
+
 def call(method, key, **params):
-    """One API call. Distinguishes an ERROR from an empty-but-valid answer."""
+    """One GET. Distinguishes an ERROR from an empty-but-valid answer."""
     qs = urllib.parse.urlencode({"apikey": key, **{k: v for k, v in params.items() if v is not None}})
     req = urllib.request.Request(f"{BASE}/{method}?{qs}", headers={"User-Agent": UA, "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=45) as r:
-            body = r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return {"ok": False, "error": f"HTTP {e.code}", "detail": e.read().decode("utf-8", "replace")[:200]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "unparseable response", "detail": body[:200]}
-
-    # The API answers HTTP 200 with an ErrorCode envelope for real failures,
-    # including NotAuthorized. Treating that as data is how "we have no
-    # backlinks" gets reported when the truth is "you do not own this site".
-    if isinstance(data, dict) and "ErrorCode" in data:
-        return {"ok": False, "error": data.get("Message", "unknown"), "error_code": data.get("ErrorCode")}
-    return {"ok": True, "d": data.get("d")}
+    return _send(req, 45)
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -551,6 +669,66 @@ def run_control() -> dict:
     c.check("a_query_below_min_impressions_is_not_judged",
             _cannibal_core({"https://example.com/a": pq(("thin", W1, 5, 9)),
                             "https://example.com/b": pq(("thin", W1, 4, 9))})["queries_checked"] == 0)
+
+    # THE ERROR ENVELOPE. Measured 2026-10-18: failures are HTTP 400 with the code
+    # in the body. Reading only the status made a throttle and NotAuthorized equal.
+    e = _envelope(400, '{"ErrorCode":14,"Message":"ERROR!!! NotAuthorized"}')
+    c.check("a_400_body_envelope_is_decoded", e.get("error_name") == "NotAuthorized", str(e))
+    c.check("CONTROL_a_throttle_decodes_differently",
+            _envelope(400, '{"ErrorCode":5,"Message":"ERROR!!! ThrottleHost"}').get("error_code") == 5)
+    c.check("an_empty_404_is_a_retired_method", _envelope(404, "").get("error") == "method_not_served")
+    c.check("a_non_envelope_400_keeps_its_status", _envelope(400, "<html>").get("error") == "HTTP 400")
+    c.check("throttle_codes_are_user_and_host", set(THROTTLE_CODES) == {4, 5})
+
+    # FETCH-AS-BINGBOT: three blocks, CRLF-separated, body already decoded.
+    doc = ("Document-URL: https://x.test/a\r\nLast-DownLoad-Http-Code: 200\r\nTruncation: 0\r\n"
+           "Robots-Rule: 0\r\nSFSDownloadDuration: 120\r\n\r\n"
+           "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Encoding: br\r\n"
+           "X-Robots-Tag: noindex\r\nLink: <https://x.test/a>; rel=\"canonical\"\r\n\r\n"
+           "<html lang=\"de\"><head><title> Hallo  Welt </title>"
+           "<link rel=\"canonical\" href=\"https://x.test/a\">"
+           "<link rel=\"alternate\" hreflang=\"en\" href=\"https://x.test/en/a\">"
+           "</head><body><h1>x</h1></body></html>")
+    pf = parse_fetched(doc)
+    c.check("the_fetched_document_parses_into_its_three_blocks",
+            pf.get("parsed") and pf["crawler"]["http_code"] == 200 and pf["response"]["status"] == 200,
+            str(pf)[:300])
+    c.check("the_title_is_whitespace_normalised", pf["body"].get("title") == "Hallo Welt")
+    c.check("an_x_robots_noindex_header_is_seen", pf["noindex"] is True)
+    c.check("a_link_header_canonical_is_read", pf["response"]["link_canonical"] == ["https://x.test/a"])
+    c.check("hreflang_and_lang_are_read", (pf["body"]["hreflang"], pf["body"]["lang"]) == (1, "de"))
+    c.check("a_noindex_fetch_is_a_problem_verdict", _fetched_verdict(pf)[0] == "problem")
+    clean = parse_fetched(doc.replace("X-Robots-Tag: noindex\r\n", ""))
+    c.check("CONTROL_the_same_page_without_noindex_is_clean",
+            _fetched_verdict(clean) == ("clean", []), str(_fetched_verdict(clean)))
+    c.check("an_unrecognised_document_is_unparsed_not_clean",
+            parse_fetched("garbage").get("parsed") is False)
+    c.check("fetch_history_folds_a_trailing_slash",
+            same_fetch_url("https://x.test/zh", "https://x.test/zh/"))
+    c.check("CONTROL_different_paths_do_not_fold",
+            not same_fetch_url("https://x.test/zh", "https://x.test/z"))
+    live = {"status": 200, "x_robots_tag": [], "body": dict(clean["body"])}
+    c.check("CONTROL_identical_views_do_not_differ", compare_views(clean, live)["differs"] is False)
+    live["body"]["title"] = "Access denied"
+    c.check("a_different_title_is_a_view_difference",
+            [d["field"] for d in compare_views(clean, live)["differences"]] == ["title"])
+
+    # SubmitContent's message: wire-encoding headers dropped, length recomputed.
+    msg = build_http_message(200, "OK", [("Content-Type", "text/html"), ("Content-Encoding", "br"),
+                                         ("Content-Length", "9")], b"<p>hi</p>!")
+    c.check("the_content_message_drops_wire_encoding",
+            b"Content-Encoding" not in msg and b"Content-Length: 10\r\n\r\n<p>hi</p>!" in msg, msg[:120])
+
+    # Trends compare equal halves or nothing.
+    c.check("a_trend_compares_the_last_window_with_the_one_before",
+            _trend([{"v": x} for x in (1, 1, 2, 2)], "v", 2) == {
+                "window": 2, "last": 4, "previous": 2, "change": 2, "change_pct": 1.0})
+    c.check("a_short_series_has_no_trend_rather_than_a_half_one",
+            _trend([{"v": 1}] * 3, "v", 2) is None)
+    c.check("is_on_site_is_host_exact",
+            is_on_site("https://x.test/", "https://x.test/a")
+            and not is_on_site("https://x.test/", "https://www.x.test/a")
+            and not is_on_site("https://x.test/", "ftp://x.test/a"))
 
     # A key is not needed to run this control, and its ABSENCE must be reported
     # as "cannot ask", never folded into a data verdict.
@@ -1100,8 +1278,34 @@ def _page_rows(key, site, page, pace):
     return None, r.get("error")
 
 
+def _add_query_side(key, site, per_page, queries, pace):
+    """Merge GetQueryPageStats rows into the page-side set, so a URL nobody listed
+    can still appear in a split. Returns (urls found only this way, errors).
+
+    A page whose page-side call FAILED stays unmeasured: giving it the rows of a
+    few queries would make it look measured for all of them."""
+    found, errors = [], {}
+    for i, q in enumerate(queries):
+        if i and pace:
+            _sleep(pace)
+        rows, err = _query_rows(key, site, q)
+        if err:
+            errors[q] = err.get("error")
+            continue
+        for url, rs in rows.items():
+            if url in per_page and per_page[url] is None:
+                continue
+            if url not in per_page:
+                per_page[url] = []
+                found.append(url)
+            have = {(r["query"], r["date"]) for r in per_page[url]}
+            per_page[url].extend(r for r in rs if (r["query"], r["date"]) not in have)
+    return found, errors
+
+
 def cannibal(key, site, explicit_pages, top, owners, min_share=CANNIBAL_MIN_SHARE,
-             min_impressions=CANNIBAL_MIN_IMPRESSIONS, max_findings=50, pace=PAGE_CALL_PACE_S):
+             min_impressions=CANNIBAL_MIN_IMPRESSIONS, max_findings=50, pace=PAGE_CALL_PACE_S,
+             queries=None, top_queries=0):
     ps = pages(key, site, 10 ** 9)
     if not ps.get("ok"):
         return ps
@@ -1148,11 +1352,20 @@ def cannibal(key, site, explicit_pages, top, owners, min_share=CANNIBAL_MIN_SHAR
     site_totals = ({q: a["impressions"] for q, a in _summarise(_weekly(sq["d"] or [])).items()}
                    if sq.get("ok") else None)
 
+    qlist = list(queries or [])
+    if top_queries and site_totals:
+        qlist += sorted(site_totals, key=lambda q: (-site_totals[q], q))[:top_queries]
+    qlist = list(dict.fromkeys(qlist))
+    found_by_query, query_errors = (_add_query_side(key, site, per_page, qlist, pace)
+                                    if qlist else ([], {}))
+
     core = _cannibal_core(per_page, owners, min_share, min_impressions, site_totals)
     out = {"ok": True, "site": site,
            "params": {"min_share": min_share, "min_impressions": min_impressions,
-                      "edge_of_page": list(EDGE_OF_PAGE), "owners": owners},
+                      "edge_of_page": list(EDGE_OF_PAGE), "owners": owners,
+                      "queries_asked": qlist},
            "pages_measured": [u for u in page_set if per_page[u] is not None],
+           "pages_found_by_query": found_by_query,
            "unmeasured_pages": core["unmeasured_pages"],
            "queries_checked": core["queries_checked"],
            "summary": core["summary"],
@@ -1163,9 +1376,13 @@ def cannibal(key, site, explicit_pages, top, owners, min_share=CANNIBAL_MIN_SHAR
                "impressions for the query, with its share and impression-weighted "
                "position; `weekly_leaders` / `leader_changes` show a rotation directly. "
                "Only the pages in `pages_measured` are visible: a URL outside the set "
-               "cannot appear in a split. `site_impressions` (per query) and "
+               "cannot appear in a split - unless the query was in `queries_asked`, "
+               "where every URL Bing showed was added (`pages_found_by_query`, measured "
+               "for those queries only). `site_impressions` (per query) and "
                "`measured_page_impressions` (per URL appearance) are different counts "
                "and are not a coverage ratio.")}
+    if query_errors:
+        out["query_errors"] = query_errors
     if errors:
         out["errors"] = errors
         out["unmeasured_means"] = ("these pages could not be asked (throttle or API error). "
@@ -1464,6 +1681,22 @@ def _count_sitemap(url, depth=0, seen=None):
     return len(locs), []
 
 
+def _feed_row(x):
+    submitted = _dotnet_date(x.get("Submitted"))
+    row = {
+        "url": x.get("Url"), "type": x.get("Type"), "status": x.get("Status"),
+        "url_count_per_bing": x.get("UrlCount"),
+        "last_crawled": _dotnet_date(x.get("LastCrawled")),
+        "submitted": submitted,
+        "file_size": x.get("FileSize"), "compressed": x.get("Compressed"),
+    }
+    if submitted is None:
+        row["submitted_means"] = ("the .NET 'never' sentinel - Bing discovered this feed "
+                                  "itself (robots.txt or a crawl) rather than being handed "
+                                  "it. Not a defect; it does mean no submission is on record.")
+    return row
+
+
 def feeds(key, site, verify):
     """The sitemap AS BING HOLDS IT - which is not necessarily the one you shipped.
 
@@ -1474,22 +1707,7 @@ def feeds(key, site, verify):
     r = call("GetFeeds", key, siteUrl=site)
     if not r["ok"]:
         return r
-    rows = r["d"] or []
-    out_rows = []
-    for x in rows:
-        submitted = _dotnet_date(x.get("Submitted"))
-        row = {
-            "url": x.get("Url"), "type": x.get("Type"), "status": x.get("Status"),
-            "url_count_per_bing": x.get("UrlCount"),
-            "last_crawled": _dotnet_date(x.get("LastCrawled")),
-            "submitted": submitted,
-            "file_size": x.get("FileSize"), "compressed": x.get("Compressed"),
-        }
-        if submitted is None:
-            row["submitted_means"] = ("the .NET 'never' sentinel - Bing discovered this feed "
-                                      "itself (robots.txt or a crawl) rather than being handed "
-                                      "it. Not a defect; it does mean no submission is on record.")
-        out_rows.append(row)
+    out_rows = [_feed_row(x) for x in r["d"] or []]
 
     out = {"ok": True, "site": site, "count": len(out_rows), "feeds": out_rows}
     if not out_rows:
@@ -1556,31 +1774,47 @@ def quota(key, site):
 
 
 def post(method, key, payload):
-    """POST half of the API. The mutating calls need a JSON body, not a query string."""
+    """POST half of the API. The mutating calls need a JSON body, not a query string.
+
+    ⚠ Every write answers `{"d": null}` on success AND on a no-op - removing a
+    feed, block or parameter that does not exist returns the identical null
+    (measured 2026-10-18 on eight Remove* methods). A write is therefore only ever
+    confirmed by reading the state back, never by its own response."""
     qs = urllib.parse.urlencode({"apikey": key})
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{BASE}/{method}?{qs}", data=data,
         headers={"User-Agent": UA, "Accept": "application/json",
                  "Content-Type": "application/json; charset=utf-8"})
+    return _send(req, 60)
+
+
+def receipt(root, payload):
+    """Append one line to <root>/.seo/bing.jsonl - only when <root>/.seo exists.
+
+    Bing keeps no queryable history of submissions or account changes, so without
+    this "did we submit that / who blocked that URL" has no answer. A directory
+    that is not a managed site is not littered with a .seo/ it never had."""
+    if not root:
+        return None
+    d = Path(root) / ".seo"
+    if not d.is_dir():
+        return None
+    row = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), **payload}
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            body = r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return {"ok": False, "error": f"HTTP {e.code}",
-                "detail": e.read().decode("utf-8", "replace")[:300]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    if not body.strip():
-        return {"ok": True, "d": None}
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "unparseable response", "detail": body[:200]}
-    if isinstance(data, dict) and "ErrorCode" in data:
-        return {"ok": False, "error": data.get("Message", "unknown"),
-                "error_code": data.get("ErrorCode")}
-    return {"ok": True, "d": data.get("d") if isinstance(data, dict) else data}
+        with (d / "bing.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        return None
+    return str(d / "bing.jsonl")
+
+
+def is_on_site(site, url):
+    """True when url is http(s) on the verified site's host. Measured 2026-10-18:
+    an off-site URL or feed is refused whole with AuthorizationFailed, so it is
+    dropped before the call rather than costing it."""
+    p = urllib.parse.urlparse(url or "")
+    return p.scheme in ("http", "https") and p.netloc.lower() == urllib.parse.urlparse(site).netloc.lower()
 
 
 def _read_url_list(urls, from_file):
@@ -1596,21 +1830,22 @@ def _read_url_list(urls, from_file):
     return uniq
 
 
-def submit(key, site, urls, from_file, confirm):
-    """SubmitUrlBatch - ask bingbot to come and look, now.
+def submit(key, site, urls, from_file, confirm, root=None):
+    """SubmitUrl / SubmitUrlBatch - ask bingbot to come and look, now.
 
-    DRY RUN unless --yes. It spends a finite quota and it is the only mutating
-    call in this script, so the default is to show what would be sent.
+    DRY RUN unless --yes: it spends a finite quota, so the default is to show what
+    would be sent. One URL goes through SubmitUrl, several through SubmitUrlBatch -
+    same quota, same effect. The quota is read again afterwards, because the call
+    itself returns null whatever happened and the drop in quota is the only
+    evidence the submission was counted.
     """
     wanted = _read_url_list(urls, from_file)
     if not wanted:
         return {"ok": False, "error": "no urls", "detail": "pass --url (repeatable) or --from-file"}
 
-    host = urllib.parse.urlparse(site).netloc.lower()
     on_site, off_site = [], []
     for u in wanted:
-        p = urllib.parse.urlparse(u)
-        (on_site if p.scheme in ("http", "https") and p.netloc.lower() == host else off_site).append(u)
+        (on_site if is_on_site(site, u) else off_site).append(u)
 
     q = quota(key, site)
     daily = (q.get("url_submission") or {}).get("daily") if q.get("ok") else None
@@ -1640,16 +1875,30 @@ def submit(key, site, urls, from_file, confirm):
         plan["what_to_do"] = "re-run with --yes to actually submit"
         return plan
 
-    r = post("SubmitUrlBatch", key, {"siteUrl": site, "urlList": on_site})
+    if len(on_site) == 1:
+        method, r = "SubmitUrl", post("SubmitUrl", key, {"siteUrl": site, "url": on_site[0]})
+    else:
+        method, r = "SubmitUrlBatch", post("SubmitUrlBatch", key, {"siteUrl": site, "urlList": on_site})
+    plan["method"] = method
     if not r["ok"]:
         plan["ok"] = False
         plan.update({k: v for k, v in r.items() if k != "ok"})
         return plan
     plan["submitted"] = True
     plan["urls"] = on_site[:50]
+    after = quota(key, site)
+    left = (after.get("url_submission") or {}).get("daily") if after.get("ok") else None
+    plan["quota_daily_after"] = left
+    if isinstance(daily, int) and isinstance(left, int):
+        plan["quota_spent"] = daily - left
+        plan["quota_means"] = ("the drop in remaining quota is the only evidence Bing COUNTED "
+                               "the submission - the call itself returns null either way. "
+                               f"{daily - left} spent for {len(on_site)} url(s).")
     plan["note"] = ("accepted for submission. Bing returns no per-URL result, so this is a "
                     "receipt for the REQUEST, not a crawl confirmation - verify with "
                     "`urlinfo --url <u>` in a few days, and `crawlstats` for the aggregate.")
+    plan["receipt"] = receipt(root, {"action": method, "site": site, "urls": on_site,
+                                     "quota_before": daily, "quota_after": left})
     return plan
 
 
@@ -1711,6 +1960,882 @@ def crawlsettings(key, site):
     return out
 
 
+# --------------------------------------------------------------------------
+# The rest of the read surface (2026-10-18). Every endpoint below was called on
+# a live account before a line was written; what each one actually returned is
+# in its docstring, because three of them answer confidently and wrongly.
+# --------------------------------------------------------------------------
+
+def _trend(points, field, window):
+    """Sum of `field` over the last `window` points against the `window` before.
+    None when the series cannot fill both halves - a half-window comparison is a
+    different question, not a shorter answer to this one."""
+    vals = [p.get(field) or 0 for p in points]
+    if len(vals) < 2 * window:
+        return None
+    last, prev = sum(vals[-window:]), sum(vals[-2 * window:-window])
+    return {"window": window, "last": last, "previous": prev, "change": last - prev,
+            "change_pct": round((last - prev) / prev, 4) if prev else None}
+
+
+def _dated(rows, fields):
+    """Bing rows -> [{date, <fields>}] in date order, undated rows last (kept)."""
+    pts = [{"date": _dotnet_date(x.get("Date")), **{k: x.get(src) or 0 for k, src in fields.items()}}
+           for x in rows or []]
+    pts.sort(key=lambda p: (p["date"] is None, p["date"] or ""))
+    return pts
+
+
+def keywordtrend(key, q, country, language):
+    """GetKeywordStats - one query's Bing demand, week by week.
+
+    Measured 2026-10-18: 24 weekly rows (about six months) for a head query, each
+    with `Impressions` (exact) and `BroadImpressions` (the query inside longer
+    ones). The window is Bing's own - there is no date parameter - so --days is
+    refused. Same caveat as `keyword`: Bing impressions, never Google volume, and
+    an empty answer is UNMEASURED, not zero demand.
+    """
+    r = call("GetKeywordStats", key, q=q, country=country, language=language)
+    if not r["ok"]:
+        return r
+    pts = _dated(r["d"], {"impressions": "Impressions", "broad_impressions": "BroadImpressions"})
+    out = {"ok": True, "query": q, "market": {"country": country, "language": language},
+           "known_to_bing": bool(pts), "weeks": len(pts), "series": pts,
+           "caveat": "BING impressions, not Google search volume. Use the SHAPE, not the size."}
+    if not pts:
+        out["empty_means"] = ("Bing's keyword database has no weekly row for this exact string in "
+                              "this market. That is UNMEASURED, not zero demand - see `keyword`'s "
+                              "coverage note.")
+        return out
+    dated = [p for p in pts if p["date"]]
+    peak = max(dated, key=lambda p: p["impressions"]) if dated else None
+    out.update({
+        "range": {"first": dated[0]["date"], "last": dated[-1]["date"]} if dated else None,
+        "totals": {"impressions": sum(p["impressions"] for p in pts),
+                   "broad_impressions": sum(p["broad_impressions"] for p in pts)},
+        "peak_week": peak,
+        "trend_4w": _trend(dated, "impressions", 4),
+        "trend_12w": _trend(dated, "impressions", 12),
+        "reading": ("`impressions` is the exact query, `broad_impressions` the query inside "
+                    "longer ones. trend_Nw compares the last N weeks with the N before; a "
+                    "null trend means the series is too short to fill both halves."),
+    })
+    return out
+
+
+def _url_entries(per_url, total=None):
+    """{url: weekly rows for ONE query} -> per-URL totals, share, weighted position."""
+    entries = []
+    for url, rows in per_url.items():
+        imps = sum(r["impressions"] for r in rows)
+        clicks = sum(r["clicks"] for r in rows)
+        w = [(r["avg_position"], r["impressions"]) for r in rows if r["avg_position"] is not None]
+        entries.append({"url": url, "impressions": imps, "clicks": clicks,
+                        "ctr": round(clicks / imps, 4) if imps else None,
+                        "avg_position": page_position(w),
+                        "weeks": len({r["date"] for r in rows if r["date"]})})
+    total = total if total is not None else sum(e["impressions"] for e in entries)
+    for e in entries:
+        e["share"] = round(e["impressions"] / total, 4) if total else None
+    entries.sort(key=lambda e: (-e["impressions"], e["url"]))
+    return entries
+
+
+def _query_rows(key, site, q):
+    """GetQueryPageStats -> ({url: weekly rows with query=q}, error). The page URL
+    arrives in a field named `Query`, exactly as in GetPageStats."""
+    r = call("GetQueryPageStats", key, siteUrl=site, query=q)
+    if not r["ok"]:
+        return None, r
+    per_url = {}
+    for row in _weekly(r["d"] or []):
+        per_url.setdefault(row["query"], []).append(dict(row, query=q))
+    return per_url, None
+
+
+def querypages(key, site, q, limit, min_share=CANNIBAL_MIN_SHARE):
+    """GetQueryPageStats - EVERY URL of the site that drew impressions for one query.
+
+    The other direction from `pagequeries`, and the one `cannibal` was missing:
+    `cannibal` can only see the pages it was told to measure, so a URL outside the
+    set never appears in a split. This asks the query and gets every URL back.
+
+    Measured 2026-10-18: 47 weekly rows for a head query, the page URL in a field
+    named `Query` (Bing's naming, same trap as GetPageStats).
+    """
+    per_url, err = _query_rows(key, site, q)
+    if err:
+        return err
+    entries = _url_entries(per_url)
+    out = {"ok": True, "site": site, "query": q, "url_count": len(entries),
+           "impressions": sum(e["impressions"] for e in entries),
+           "clicks": sum(e["clicks"] for e in entries),
+           "urls": entries[:limit]}
+    if not entries:
+        out["empty_means"] = ("no URL of this site drew impressions for this exact string in "
+                              "Bing's window. NOT 'we do not rank' - Bing omits low-volume "
+                              "queries and matches the string exactly. Find Bing's wording "
+                              "with `queries --contains <word>`.")
+        return out
+    core = _cannibal_core(per_url, None, min_share, 1)
+    finding = core["findings"][0] if core["findings"] else None
+    leaders, changes = _leaders(per_url)
+    out.update({
+        "flags": finding["flags"] if finding else [],
+        "split_urls": finding["split_urls"] if finding else [],
+        "best_position": min((e["avg_position"] for e in entries if e["avg_position"]), default=None),
+        "leader_changes": changes, "weekly_leaders": leaders,
+        "window_weeks": _span([r for rows in per_url.values() for r in rows]),
+        "reading": ("every URL Bing showed for this query, by impressions. `split` = two or "
+                    f"more URLs at >= {min_share:.0%} share each; `edge_of_page` = the best "
+                    f"URL sits at positions {EDGE_OF_PAGE[0]}-{EDGE_OF_PAGE[1]}; "
+                    "`leader_changes` counts weeks where a different URL led."),
+    })
+    return out
+
+
+def querypagedetail(key, site, q, page):
+    """GetQueryPageDetailStats - the POSITION DISTRIBUTION for one query on one page.
+
+    Every other endpoint gives an average position, which hides the shape: a page
+    that is #3 half the time and #15 the other half averages #9 and reads as
+    "edge of page 1" when it is really a page-1 result that keeps falling off.
+    Measured 2026-10-18: 39 rows for a query x page, several rows per DAY - one per
+    position the page was shown at, each with its own impressions and clicks.
+    """
+    r = call("GetQueryPageDetailStats", key, siteUrl=site, query=q, page=page)
+    if not r["ok"]:
+        return r
+    rows = [{"date": _dotnet_date(x.get("Date")), "position": _pos(x.get("Position")),
+             "impressions": x.get("Impressions") or 0, "clicks": x.get("Clicks") or 0}
+            for x in r["d"] or []]
+    out = {"ok": True, "site": site, "query": q, "page": page, "rows": len(rows)}
+    if not rows:
+        out["empty_means"] = ("no detail rows for this query on this page. Either the page did "
+                              "not show for it, or either string differs from Bing's record "
+                              "(a trailing slash is enough) - confirm both with `querypages`.")
+        return out
+
+    hist, days = {}, {}
+    for x in rows:
+        if x["position"] is not None:
+            b = int(round(x["position"]))
+            h = hist.setdefault(b, {"position": b, "impressions": 0, "clicks": 0})
+            h["impressions"] += x["impressions"]
+            h["clicks"] += x["clicks"]
+        d = days.setdefault(x["date"], {"date": x["date"], "impressions": 0, "clicks": 0, "_w": []})
+        d["impressions"] += x["impressions"]
+        d["clicks"] += x["clicks"]
+        if x["position"] is not None:
+            d["_w"].append((x["position"], x["impressions"]))
+    series = []
+    for d in sorted(days.values(), key=lambda d: (d["date"] is None, d["date"] or "")):
+        w = d.pop("_w")
+        d["avg_position"] = page_position(w)
+        d["best"] = min((p for p, _ in w), default=None)
+        d["worst"] = max((p for p, _ in w), default=None)
+        series.append(d)
+
+    ranked = sum(h["impressions"] for h in hist.values())
+    on_p1 = sum(h["impressions"] for b, h in hist.items() if b <= 10)
+    top3 = sum(h["impressions"] for b, h in hist.items() if b <= 3)
+    out.update({
+        "impressions": sum(x["impressions"] for x in rows),
+        "clicks": sum(x["clicks"] for x in rows),
+        "avg_position": page_position([(x["position"], x["impressions"]) for x in rows
+                                       if x["position"] is not None]),
+        "page1_share": round(on_p1 / ranked, 4) if ranked else None,
+        "top3_share": round(top3 / ranked, 4) if ranked else None,
+        "histogram": [hist[b] for b in sorted(hist)],
+        "days": len([d for d in series if d["date"]]),
+        "series": series,
+        "reading": ("`histogram` is impressions by position across the window; `page1_share` the "
+                    "fraction shown at 1-10. A page-1 average with a low page1_share is a page "
+                    "that keeps dropping off, which the average alone cannot show."),
+    })
+    return out
+
+
+def querytraffic(key, site, q):
+    """GetQueryTrafficStats - one query's clicks and impressions for the whole SITE, by DAY.
+
+    The daily counterpart to `queries --q`, which is weekly. Measured 2026-10-18:
+    76 daily rows for a head query, Clicks and Impressions only (no position - use
+    `querypagedetail` for that). Daily is what dates an algorithm update or a
+    deploy to the day rather than to the week.
+    """
+    r = call("GetQueryTrafficStats", key, siteUrl=site, query=q)
+    if not r["ok"]:
+        return r
+    pts = _dated(r["d"], {"impressions": "Impressions", "clicks": "Clicks"})
+    out = {"ok": True, "site": site, "query": q, "days": len(pts), "series": pts}
+    if not pts:
+        out["empty_means"] = ("no daily rows for this exact string. NOT zero traffic - Bing "
+                              "omits low-volume queries and matches exactly. Find Bing's "
+                              "wording with `queries --contains <word>`.")
+        return out
+    dated = [p for p in pts if p["date"]]
+    imps = sum(p["impressions"] for p in pts)
+    clicks = sum(p["clicks"] for p in pts)
+    out.update({
+        "range": {"first": dated[0]["date"], "last": dated[-1]["date"]} if dated else None,
+        "totals": {"impressions": imps, "clicks": clicks,
+                   "ctr": round(clicks / imps, 4) if imps else None},
+        "trend_7d": {"impressions": _trend(dated, "impressions", 7),
+                     "clicks": _trend(dated, "clicks", 7)},
+        "trend_28d": {"impressions": _trend(dated, "impressions", 28),
+                      "clicks": _trend(dated, "clicks", 28)},
+        "reading": ("one point per day Bing has data for - days with no impressions are "
+                    "ABSENT, not zero-filled, so `days` is days with data, not calendar days."),
+    })
+    return out
+
+
+def urltraffic(key, site, url):
+    """GetUrlTrafficInfo - Bing's per-URL clicks/impressions, cross-examined.
+
+    ⚠ MEASURED 2026-10-18: it returned Clicks 0 / Impressions 0 for the homepage
+    and a locale homepage - while GetPageStats and GetQueryPageStats both showed
+    those exact URLs with hundreds of impressions a week. A zero here is NOT a
+    traffic verdict on its own, so every answer is checked against GetPageStats
+    and a disagreement is reported as one rather than as "no traffic".
+    """
+    r = call("GetUrlTrafficInfo", key, siteUrl=site, url=url)
+    if not r["ok"]:
+        return r
+    d = r["d"] or {}
+    out = {"ok": True, "site": site, "url": url, "is_page": d.get("IsPage"),
+           "clicks": d.get("Clicks"), "impressions": d.get("Impressions")}
+    ps = pages(key, site, 10 ** 9)
+    if not ps.get("ok"):
+        out["verdict"] = "uncorroborated"
+        out["why"] = "the GetPageStats cross-check failed, so a zero cannot be read either way"
+        return out
+    row = next((p for p in ps["pages"] if p["url"] == url), None)
+    out["page_stats"] = ({"impressions": row["impressions"], "clicks": row["clicks"]}
+                         if row else None)
+    mine = d.get("Impressions") or 0
+    theirs = row["impressions"] if row else 0
+    if theirs and not mine:
+        out["verdict"] = "disagrees"
+        out["why"] = ("GetPageStats shows impressions for this exact URL and GetUrlTrafficInfo "
+                      "says zero. The same disagreement was measured on 2026-10-18 for every "
+                      "URL tried. Read `pages` / `querypages`, not this, for traffic.")
+    elif mine and not theirs:
+        out["verdict"] = "disagrees"
+        out["why"] = "this endpoint reports traffic GetPageStats does not show for the same string"
+    elif not row:
+        out["verdict"] = "no_page_stats_row"
+        out["why"] = ("GetPageStats has no row for this string: either no impressions in its "
+                      "window or a URL spelled differently from Bing's record")
+    else:
+        out["verdict"] = "consistent"
+        out["why"] = ("both endpoints report traffic. Their windows differ and are not "
+                      "documented, so compare them as ordering, not as equal totals.")
+    return out
+
+
+CHILD_HTTP = {"any": 0, "2xx": 1, "3xx": 2, "301": 4, "302": 8, "4xx": 16, "5xx": 32, "other": 64}
+CHILD_CRAWLED = {"any": 0, "week": 1, "2weeks": 2, "3weeks": 4}
+CHILD_DISCOVERED = {"any": 0, "week": 1, "month": 2}
+CHILD_FLAGS = {"any": 0, "robots": 1, "malware": 2}
+CHILD_MAX_PAGES = 20
+
+
+def children(key, site, url, traffic=False, http="any", crawled="any", discovered="any",
+             flags="any", max_pages=CHILD_MAX_PAGES, pace=PAGE_CALL_PACE_S):
+    """GetChildrenUrlInfo / GetChildrenUrlTrafficInfo - Bing's Index Explorer, one level.
+
+    The bulk counterpart to `urlinfo`: every child URL Bing holds under a path,
+    filterable by HTTP code, crawl date, discovery date and robots/malware flag.
+
+    ⚠ MEASURED 2026-10-18: both returned [] for the site root and for every
+    subpath tried, with and without filters, on a site Bing holds thousands of
+    pages for - and GetUrlInfo on the root reported TotalChildUrlCount 0. The
+    endpoint answers (no error) and says nothing. So an empty result is checked
+    against crawlstats' in_index and reported UNKNOWN when Bing holds pages, never
+    as "nothing under this path". GetChildrenUrlInfo is POST-only (405 on GET).
+    """
+    filters = {"CrawlDateFilter": CHILD_CRAWLED[crawled],
+               "DiscoveredDateFilter": CHILD_DISCOVERED[discovered],
+               "DocFlagsFilters": CHILD_FLAGS[flags],
+               "HttpCodeFilters": CHILD_HTTP[http]}
+    rows, seen, read, stopped = [], set(), 0, None
+    for page in range(max_pages):
+        if page and pace:
+            _sleep(pace)
+        if traffic:
+            r = call("GetChildrenUrlTrafficInfo", key, siteUrl=site, url=url, page=page)
+        else:
+            r = post("GetChildrenUrlInfo", key, {"siteUrl": site, "url": url, "page": page,
+                                                 "filterProperties": filters})
+        if not r["ok"]:
+            if page == 0:
+                return r
+            stopped = {"page": page, **{k: v for k, v in r.items() if k != "ok"}}
+            break
+        read += 1
+        batch = [x for x in r["d"] or [] if x.get("Url") and x["Url"] not in seen]
+        if not batch:
+            break
+        for x in batch:
+            seen.add(x["Url"])
+            if traffic:
+                rows.append({"url": x["Url"], "is_page": x.get("IsPage"),
+                             "impressions": x.get("Impressions"), "clicks": x.get("Clicks")})
+            else:
+                rows.append({"url": x["Url"], "is_page": x.get("IsPage"),
+                             "discovered": _dotnet_date(x.get("DiscoveryDate")),
+                             "last_crawled": _dotnet_date(x.get("LastCrawledDate")),
+                             "document_size": x.get("DocumentSize"),
+                             "anchor_count": x.get("AnchorCount"),
+                             "child_urls": x.get("TotalChildUrlCount")})
+    else:
+        stopped = {"page": max_pages, "error": "max_pages reached - raise --max-pages for more"}
+
+    filtered = {k: v for k, v in {"http": http, "crawled": crawled, "discovered": discovered,
+                                   "flags": flags}.items() if v != "any"}
+    out = {"ok": True, "site": site, "url": url, "kind": "traffic" if traffic else "index",
+           "filters": filtered, "pages_read": read, "count": len(rows), "children": rows}
+    if stopped:
+        out["stopped"] = stopped
+    if rows:
+        return out
+
+    stats = crawlstats(key, site)
+    # The LAST row's value, not latest_stock: the column-kind classifier can call
+    # in_index a flow (measured 2026-10-18: 2 dips in 71 days), which drops it from
+    # latest_stock - and the latest point-in-time value is right either way.
+    held = ((stats.get("series") or [{}])[-1].get("in_index")) if stats.get("ok") else None
+    if held and not filtered:
+        out["verdict"] = "unknown"
+        out["why_not_none"] = (f"Bing holds {held} pages for this site (crawlstats in_index) and "
+                               "this endpoint returned no children with no filter applied. Measured "
+                               "2026-10-18: the same empty answer for every path tried. The "
+                               "instrument is not answering; use `urlinfo` per URL or `feeds` "
+                               "for coverage.")
+    elif held:
+        out["verdict"] = "empty_under_filter"
+        out["why"] = ("nothing matched the filter. The endpoint also returns nothing UNFILTERED "
+                      "on the account measured, so re-run without filters before reading this "
+                      "as 'no URL has that property'.")
+    else:
+        out["verdict"] = "unknown" if not stats.get("ok") else "empty"
+        out["why"] = ("Bing reports no indexed pages for this site, so an empty child list "
+                      "agrees" if stats.get("ok") else "the in_index cross-check failed")
+    return out
+
+
+def feeddetails(key, site, feed):
+    """GetFeedDetails - a sitemap INDEX as Bing holds it, child by child.
+
+    `feeds` shows the top-level feed. This shows each child sitemap Bing read
+    from it, with its own count, status and last crawl - which is where a stale
+    or failing child hides. Measured 2026-10-18: 14 rows for a sitemap index,
+    the index itself first (UrlCount 8,299) then each child (1,000 each).
+    """
+    r = call("GetFeedDetails", key, siteUrl=site, feedUrl=feed)
+    if not r["ok"]:
+        return r
+    rows = [_feed_row(x) for x in r["d"] or []]
+    out = {"ok": True, "site": site, "feed": feed, "count": len(rows)}
+    if not rows:
+        out["empty_means"] = ("Bing holds no feed at this exact URL. Compare against `feeds`: "
+                              "if it lists the feed, the string differs; if not, Bing has never "
+                              "read it - `submitfeed` hands it over.")
+        return out
+    index = next((x for x in rows if x["url"] == feed), None)
+    kids = [x for x in rows if x["url"] != feed]
+    out["feed_row"] = index
+    out["children"] = kids
+    if kids:
+        total = sum(x["url_count_per_bing"] or 0 for x in kids)
+        crawled = sorted(x["last_crawled"] for x in kids if x["last_crawled"])
+        out["children_summary"] = {
+            "count": len(kids), "url_count_sum": total,
+            "not_success": [x["url"] for x in kids if (x["status"] or "").lower() != "success"],
+            "oldest_crawl": crawled[0] if crawled else None,
+            "newest_crawl": crawled[-1] if crawled else None,
+        }
+        if index and isinstance(index.get("url_count_per_bing"), int):
+            out["children_summary"]["index_url_count"] = index["url_count_per_bing"]
+            out["children_summary"]["index_vs_children_delta"] = index["url_count_per_bing"] - total
+        out["reading"] = ("`oldest_crawl` is the child Bing has gone longest without re-reading - "
+                          "a URL added there is invisible to Bing until it does. A non-zero "
+                          "index_vs_children_delta means the index count and its children were "
+                          "read at different times.")
+    return out
+
+
+def _held_feed(key, site, feed):
+    """(row, error) - the feed as Bing holds it, top-level or as a child of an index."""
+    r = call("GetFeeds", key, siteUrl=site)
+    if not r["ok"]:
+        return None, r
+    for x in r["d"] or []:
+        if x.get("Url") == feed:
+            return _feed_row(x), None
+    for x in r["d"] or []:
+        if (x.get("Type") or "").lower().startswith("sitemap index"):
+            d = call("GetFeedDetails", key, siteUrl=site, feedUrl=x.get("Url"))
+            for y in (d.get("d") or []) if d.get("ok") else []:
+                if y.get("Url") == feed:
+                    return dict(_feed_row(y), parent=x.get("Url")), None
+    return None, None
+
+
+def _live_feed(url):
+    """(status, kind, error) for the live feed: kind is urlset / sitemapindex / rss / None."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            status, body = r.status, r.read(2_000_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, None, None
+    except Exception as e:
+        return None, None, str(e)
+    kind = next((k for k in ("sitemapindex", "urlset", "rss", "feed") if f"<{k}" in body), None)
+    return status, kind, None
+
+
+def submitfeed(key, site, feed, confirm, root=None):
+    """SubmitFeed - hand Bing a sitemap and ask it to re-read it.
+
+    The sitemap counterpart of `submit`, and the Bing half of what `gsc.py
+    sitemap-submit` does for Google. IndexNow announces URLs; this makes Bing
+    re-read the FEED, which is what updates `feeds`' UrlCount.
+
+    Guards, all before the call: off-site feed refused (measured: Bing refuses it
+    with AuthorizationFailed), and the live feed must answer 200 and parse as a
+    sitemap - submitting a 404 inside a deploy window points Bing at a dead feed.
+    DRY RUN until --yes. Confirmed by reading GetFeeds back.
+    """
+    if not is_on_site(site, feed):
+        return {"ok": False, "error": "feed_off_site",
+                "detail": f"{feed} is not on {site}; Bing refuses it whole (AuthorizationFailed)"}
+    status, kind, err = _live_feed(feed)
+    plan = {"ok": True, "site": site, "feed": feed, "submitted": False,
+            "live": {"status": status, "kind": kind, **({"error": err} if err else {})}}
+    if status != 200 or kind is None:
+        plan["ok"] = False
+        plan["error"] = "feed_not_healthy"
+        plan["detail"] = ("the live feed must return 200 and parse as a sitemap/feed before Bing "
+                          "is pointed at it")
+        return plan
+    before, e = _held_feed(key, site, feed)
+    if e:
+        return e
+    plan["held_before"] = before
+    if not confirm:
+        plan["dry_run"] = True
+        plan["what_to_do"] = "re-run with --yes to submit"
+        return plan
+
+    r = post("SubmitFeed", key, {"siteUrl": site, "feedUrl": feed})
+    if not r["ok"]:
+        plan["ok"] = False
+        plan.update({k: v for k, v in r.items() if k != "ok"})
+        return plan
+    plan["submitted"] = True
+    after, _ = _held_feed(key, site, feed)
+    plan["held_after"] = after
+    today = datetime.now(timezone.utc).strftime(DATE_FMT)
+    if after and after.get("submitted") == today:
+        plan["verified"] = "confirmed"
+        plan["verified_means"] = "GetFeeds now carries today's submission date for this feed"
+    elif after:
+        plan["verified"] = "held_not_redated"
+        plan["verified_means"] = ("Bing holds the feed but its submission date did not move to "
+                                  "today. The call returns null whatever happened, so re-check "
+                                  "`feeds` in a few minutes before re-submitting.")
+    else:
+        plan["verified"] = "not_held"
+        plan["verified_means"] = ("the call succeeded and Bing does not list the feed yet. It may "
+                                  "lag; re-check `feeds` before re-submitting.")
+    plan["receipt"] = receipt(root, {"action": "SubmitFeed", "site": site, "feed": feed,
+                                     "verified": plan["verified"]})
+    return plan
+
+
+def removefeed(key, site, feed, confirm, root=None):
+    """RemoveFeed - tell Bing to forget a sitemap.
+
+    Refused unless Bing currently holds the feed: RemoveFeed returns null for a
+    feed it never had (measured 2026-10-18), so "removed" would be unprovable. A
+    feed still referenced from robots.txt will be re-discovered - removing it
+    here is only half the job. DRY RUN until --yes; confirmed by reading back.
+    """
+    if not is_on_site(site, feed):
+        return {"ok": False, "error": "feed_off_site", "detail": f"{feed} is not on {site}"}
+    before, e = _held_feed(key, site, feed)
+    if e:
+        return e
+    if not before:
+        return {"ok": False, "error": "feed_not_held",
+                "detail": ("Bing holds no feed at this exact URL, and RemoveFeed answers a no-op "
+                           "with the same null as a removal - nothing to remove, nothing sent.")}
+    plan = {"ok": True, "site": site, "feed": feed, "removed": False, "held_before": before}
+    if before.get("parent"):
+        plan["warning"] = (f"this is a CHILD of {before['parent']}. Bing will re-read it from the "
+                           "index; remove it from the index file instead.")
+    if not confirm:
+        plan["dry_run"] = True
+        plan["what_to_do"] = "re-run with --yes to remove"
+        return plan
+    r = post("RemoveFeed", key, {"siteUrl": site, "feedUrl": feed})
+    if not r["ok"]:
+        plan["ok"] = False
+        plan.update({k: v for k, v in r.items() if k != "ok"})
+        return plan
+    plan["removed"] = True
+    after, _ = _held_feed(key, site, feed)
+    plan["verified"] = "confirmed" if after is None else "still_held"
+    plan["robots_note"] = ("a Sitemap: line in robots.txt re-introduces it on Bing's next read "
+                           "of robots.txt")
+    plan["receipt"] = receipt(root, {"action": "RemoveFeed", "site": site, "feed": feed,
+                                     "verified": plan["verified"]})
+    return plan
+
+
+# dynamicServing, per Bing's Content Submission API documentation.
+DYNAMIC_SERVING = {"none": 0, "pc": 1, "mobile": 2, "amp": 3, "tablet": 4, "nonvisual": 5}
+# Headers that describe the WIRE encoding of the fetched bytes. urllib hands back
+# the body decoded, so passing these through would tell Bing the body is still
+# compressed or chunked when it is not.
+WIRE_HEADERS = {"content-encoding", "transfer-encoding", "content-length", "connection",
+                "keep-alive", "alt-svc", "report-to", "nel", "set-cookie"}
+
+
+def build_http_message(status, reason, headers, body):
+    """The raw HTTP response SubmitContent wants, before base64: status line,
+    headers (wire-encoding ones dropped, Content-Length recomputed), blank line, body."""
+    lines = [f"HTTP/1.1 {status} {reason}"]
+    lines += [f"{k}: {v}" for k, v in headers if k.lower() not in WIRE_HEADERS]
+    lines.append(f"Content-Length: {len(body)}")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace") + body
+
+
+def submitcontent(key, site, url, dynamic, confirm, root=None):
+    """SubmitContent - push a page's full HTTP response to Bing, no crawl needed.
+
+    The live page is fetched here and sent as Bing would have received it. merj's
+    client marks the method deprecated; measured 2026-10-18 the endpoint still
+    answers (NotAuthorized for an unowned site, not 404) and the content quota
+    reads 100/day. DRY RUN until --yes. There is no read-back for submitted
+    content, so the quota drop is the only proof it was counted.
+    """
+    if not is_on_site(site, url):
+        return {"ok": False, "error": "url_off_site", "detail": f"{url} is not on {site}"}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            status, reason = r.status, r.reason
+            headers, body = list(r.headers.items()), r.read()
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": "page_not_200", "status": e.code,
+                "detail": "only a live 200 is worth submitting as content"}
+    except Exception as e:
+        return {"ok": False, "error": "page_unreachable", "detail": str(e)}
+    msg = build_http_message(status, reason, headers, body)
+    q = quota(key, site)
+    left = (q.get("content_submission") or {}).get("daily") if q.get("ok") else None
+    plan = {"ok": True, "site": site, "url": url, "submitted": False,
+            "status": status, "body_bytes": len(body), "message_bytes": len(msg),
+            "dynamic_serving": dynamic, "content_quota_daily": left}
+    if left == 0:
+        plan["ok"] = False
+        plan["error"] = "content_quota_exhausted"
+        return plan
+    if not confirm:
+        plan["dry_run"] = True
+        plan["headers_sent"] = [k for k, _ in headers if k.lower() not in WIRE_HEADERS]
+        plan["what_to_do"] = "re-run with --yes to submit"
+        return plan
+    r = post("SubmitContent", key, {"siteUrl": site, "url": url,
+                                    "httpMessage": base64.b64encode(msg).decode("ascii"),
+                                    "structuredData": "",
+                                    "dynamicServing": DYNAMIC_SERVING[dynamic]})
+    if not r["ok"]:
+        plan["ok"] = False
+        plan.update({k: v for k, v in r.items() if k != "ok"})
+        return plan
+    plan["submitted"] = True
+    a = quota(key, site)
+    after = (a.get("content_submission") or {}).get("daily") if a.get("ok") else None
+    plan["content_quota_after"] = after
+    if isinstance(left, int) and isinstance(after, int):
+        plan["quota_spent"] = left - after
+    plan["receipt"] = receipt(root, {"action": "SubmitContent", "site": site, "url": url,
+                                     "bytes": len(msg), "quota_before": left,
+                                     "quota_after": after})
+    return plan
+
+
+class _Facts(HTMLParser):
+    """The SEO-relevant facts of one HTML document - what bingbot was served."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.f = {"title": None, "lang": None, "meta_robots": [], "canonical": [],
+                  "hreflang": 0, "h1": 0, "meta_description": False}
+        self._in_title = False
+        self._title = []
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "html" and a.get("lang"):
+            self.f["lang"] = a["lang"]
+        elif tag == "title" and self.f["title"] is None:
+            self._in_title = True
+        elif tag == "meta":
+            name = a.get("name", "").lower()
+            if name in ("robots", "bingbot"):
+                self.f["meta_robots"].append(f"{name}: {a.get('content', '')}")
+            elif name == "description" and a.get("content", "").strip():
+                self.f["meta_description"] = True
+        elif tag == "link":
+            rel = a.get("rel", "").lower().split()
+            if "canonical" in rel:
+                self.f["canonical"].append(a.get("href"))
+            if "alternate" in rel and a.get("hreflang"):
+                self.f["hreflang"] += 1
+        elif tag == "h1":
+            self.f["h1"] += 1
+
+    def handle_endtag(self, tag):
+        if tag == "title" and self._in_title:
+            self._in_title = False
+            self.f["title"] = " ".join("".join(self._title).split())
+
+    def handle_data(self, data):
+        if self._in_title:
+            self._title.append(data)
+
+
+def html_facts(body):
+    p = _Facts()
+    try:
+        p.feed(body or "")
+        p.close()
+    except Exception as e:
+        p.f["parse_error"] = str(e)
+    p.f["body_chars"] = len(body or "")
+    return p.f
+
+
+def _header_lines(block):
+    out = []
+    for ln in block.split("\r\n"):
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            out.append((k.strip(), v.strip()))
+    return out
+
+
+def parse_fetched(doc):
+    """GetFetchedUrlDetails.Document -> crawler record, HTTP response, body facts.
+
+    Measured 2026-10-18, the Document is three blocks separated by blank lines:
+      1. the crawler's own record - Last-DownLoad-Http-Code, IP-Address,
+         Truncation, Robots-Rule, Download-Status, SFSSendUserAgent, ...
+      2. the HTTP status line and response headers bingbot received
+      3. the body, already DECODED even where the headers say Content-Encoding: br
+    """
+    if not isinstance(doc, str) or not doc:
+        return {"parsed": False, "why": "empty document"}
+    parts = doc.split("\r\n\r\n", 2)
+    if len(parts) < 2 or not parts[1].startswith("HTTP/"):
+        return {"parsed": False, "why": "unrecognised shape", "head": doc[:200]}
+    meta = dict(_header_lines(parts[0]))
+    status_line, _, hblock = parts[1].partition("\r\n")
+    headers = _header_lines(hblock)
+    body = parts[2] if len(parts) > 2 else ""
+    m = re.match(r"HTTP/\S+\s+(\d+)", status_line)
+    hv = lambda name: [v for k, v in headers if k.lower() == name]
+    facts = html_facts(body) if "html" in " ".join(hv("content-type")).lower() or "<html" in body[:2000].lower() else {}
+    x_robots = hv("x-robots-tag")
+    robots_all = " ".join(x_robots + facts.get("meta_robots", [])).lower()
+    link_canon = [re.search(r"<([^>]+)>", v).group(1) for v in hv("link")
+                  if "canonical" in v.lower() and re.search(r"<([^>]+)>", v)]
+    return {
+        "parsed": True,
+        "crawler": {
+            "http_code": int(meta["Last-DownLoad-Http-Code"]) if meta.get("Last-DownLoad-Http-Code", "").isdigit() else meta.get("Last-DownLoad-Http-Code"),
+            "ip": meta.get("IP-Address"),
+            "user_agent": meta.get("SFSSendUserAgent"),
+            "download_ms": int(meta["SFSDownloadDuration"]) if meta.get("SFSDownloadDuration", "").isdigit() else None,
+            "document_length": int(meta["Document-Length"]) if meta.get("Document-Length", "").isdigit() else None,
+            "truncated": meta.get("Truncation") not in (None, "0"),
+            "robots_rule": meta.get("Robots-Rule"),
+            "download_status": meta.get("Download-Status"),
+            "crawl_region": meta.get("SFSCrawlRegion"),
+            "redirect_policy": meta.get("SFSRedirectPolicy"),
+        },
+        "response": {
+            "status": int(m.group(1)) if m else None,
+            "status_line": status_line,
+            "content_type": (hv("content-type") or [None])[0],
+            "location": (hv("location") or [None])[0],
+            "x_robots_tag": x_robots,
+            "link_canonical": link_canon,
+            "headers": [k for k, _ in headers],
+        },
+        "body": facts,
+        "noindex": "noindex" in robots_all,
+        "nofollow": "nofollow" in robots_all,
+    }
+
+
+def _fetched_verdict(p):
+    problems = []
+    if not p.get("parsed"):
+        return "unreadable", ["the fetched document did not parse"]
+    st = p["response"]["status"]
+    if st != 200:
+        problems.append(f"bingbot got HTTP {st}")
+    if p["noindex"]:
+        problems.append("noindex served to bingbot (meta robots or X-Robots-Tag)")
+    if p["crawler"]["truncated"]:
+        problems.append("Bing truncated the document")
+    if p["crawler"]["robots_rule"] not in (None, "0"):
+        problems.append(f"Robots-Rule {p['crawler']['robots_rule']} (only 0 has been measured, "
+                        "on an allowed page)")
+    canon = p["body"].get("canonical") or [] if p.get("body") else []
+    if len(set(canon)) > 1:
+        problems.append(f"{len(set(canon))} different canonical tags")
+    return ("problem" if problems else "clean"), problems
+
+
+def _live_view(url):
+    """The page as an ordinary client sees it, for comparison with bingbot's copy.
+    Not a bingbot user agent on purpose: a CDN's verified-bot check blocks a forged
+    one, and that block would read as the SITE cloaking."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read().decode("utf-8", "replace")
+            return {"status": r.status, "x_robots_tag": r.headers.get_all("X-Robots-Tag") or [],
+                    "body": html_facts(body)}
+    except urllib.error.HTTPError as e:
+        return {"status": e.code}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def compare_views(bot, live):
+    """Structural differences between bingbot's copy and the live one. Body length
+    is compared as a ratio with a wide band, because a nonce or a timestamp makes
+    two fetches of the same page differ in bytes."""
+    if "error" in live:
+        return {"compared": False, "why": live["error"]}
+    diffs = []
+    if bot["response"]["status"] != live.get("status"):
+        diffs.append({"field": "status", "bingbot": bot["response"]["status"], "live": live.get("status")})
+    b, l_ = bot.get("body") or {}, live.get("body") or {}
+    for f in ("title", "lang", "canonical", "hreflang", "h1", "meta_robots", "meta_description"):
+        if b.get(f) != l_.get(f):
+            diffs.append({"field": f, "bingbot": b.get(f), "live": l_.get(f)})
+    if bot["response"]["x_robots_tag"] != live.get("x_robots_tag", []):
+        diffs.append({"field": "x_robots_tag", "bingbot": bot["response"]["x_robots_tag"],
+                      "live": live.get("x_robots_tag")})
+    bc, lc = b.get("body_chars") or 0, l_.get("body_chars") or 0
+    if bc and lc and not (0.8 <= bc / lc <= 1.25):
+        diffs.append({"field": "body_chars", "bingbot": bc, "live": lc,
+                      "note": "more than 20% apart - a different template, an error page or a block"})
+    return {"compared": True, "differs": bool(diffs), "differences": diffs}
+
+
+FETCH_POLL_S = 5
+FETCH_WAIT_S = 90
+FETCH_RETRY_CODES = (1, 2)
+
+
+def same_fetch_url(held, asked):
+    """Bing's fetch history is keyed slash-insensitively. Measured 2026-10-18:
+    fetching /zh/ then /zh left ONE row, `/zh`, and GetFetchedUrlDetails for
+    /zh/ returned that /zh fetch. An exact match would wait forever for a row
+    that was folded into its twin."""
+    return bool(held) and held.rstrip("/") == (asked or "").rstrip("/")
+
+
+def fetched(key, site, url=None):
+    """GetFetchedUrls / GetFetchedUrlDetails - the fetch-as-bingbot history.
+
+    With no url: every URL this account asked Bing to fetch, and whether it did.
+    With a url: what bingbot was served on the latest fetch, parsed. Measured
+    2026-10-18: details for a URL never fetched come back d: null - reported as
+    `never_fetched`, not as an empty page.
+    """
+    if not url:
+        r = call("GetFetchedUrls", key, siteUrl=site)
+        if not r["ok"]:
+            return r
+        rows = [{"url": x.get("Url"), "date": _dotnet_date(x.get("Date")),
+                 "fetched": x.get("Fetched"), "expired": x.get("Expired")} for x in r["d"] or []]
+        out = {"ok": True, "site": site, "count": len(rows), "fetched": rows}
+        if not rows:
+            out["empty_means"] = "this account has not asked Bing to fetch anything (or it expired)"
+        return out
+    r = call("GetFetchedUrlDetails", key, siteUrl=site, url=url)
+    if not r["ok"]:
+        return r
+    d = r["d"]
+    if not d:
+        return {"ok": True, "site": site, "url": url, "state": "never_fetched",
+                "what_to_do": "run `bing.py fetch --url <url>` to have bingbot fetch it now"}
+    p = parse_fetched(d.get("Document"))
+    verdict, problems = _fetched_verdict(p)
+    return {"ok": True, "site": site, "url": url, "state": d.get("Status"),
+            "fetched_at": _dotnet_date(d.get("Date")), "verdict": verdict,
+            "problems": problems, **{k: v for k, v in p.items() if k != "parsed"}}
+
+
+def fetch(key, site, url, wait=FETCH_WAIT_S, live=False, root=None):
+    """FetchUrl - have bingbot fetch one URL NOW, then read what it was served.
+
+    The Bing counterpart of a live URL Inspection, and the only way to see the
+    page as bingbot gets it: a CDN, a bot rule or a geo redirect can serve it
+    something different from what a browser gets. Measured 2026-10-18: the fetch
+    completed within 10 seconds, from a US proxy, as `bingbot/2.0`. It changes no
+    index state, so it is not gated behind --yes. `--live` also fetches the page
+    normally and lists the structural differences.
+    """
+    if not is_on_site(site, url):
+        return {"ok": False, "error": "url_off_site", "detail": f"{url} is not on {site}"}
+    asked = time.time()
+    r = post("FetchUrl", key, {"siteUrl": site, "url": url})
+    if not r["ok"] and r.get("error_code") in FETCH_RETRY_CODES:
+        # Measured 2026-10-18: one UnknownError on a URL the same call accepted a
+        # minute later. A fetch changes nothing, so repeating it is safe.
+        _sleep(FETCH_POLL_S)
+        r = post("FetchUrl", key, {"siteUrl": site, "url": url})
+    if not r["ok"]:
+        return r
+    receipt(root, {"action": "FetchUrl", "site": site, "url": url})
+    deadline = asked + wait
+    done = False
+    while time.time() < deadline:
+        _sleep(FETCH_POLL_S)
+        lst = call("GetFetchedUrls", key, siteUrl=site)
+        for x in (lst.get("d") or []) if lst.get("ok") else []:
+            m = re.search(r"\((-?\d+)", x.get("Date") or "")
+            # Bing's clock and ours: two minutes of slack, so a fresh fetch is not
+            # mistaken for a stale one and vice versa.
+            fresh = m and int(m.group(1)) / 1000 >= asked - 120
+            if same_fetch_url(x.get("Url"), url) and x.get("Fetched") and fresh:
+                done = True
+        if done:
+            break
+    if not done:
+        return {"ok": False, "error": "fetch_pending", "site": site, "url": url,
+                "detail": (f"Bing accepted the fetch request but had not completed it after "
+                           f"{wait}s. Read it later with `bing.py fetched --url {url}`.")}
+    out = fetched(key, site, url)
+    if out.get("ok") and live and out.get("response"):
+        out["live_comparison"] = compare_views(out, _live_view(url))
+    return out
+
+
 def main():
     # Shared options live on a parent parser so they are accepted on EITHER
     # side of the subcommand. Putting them only on the top-level parser makes
@@ -1760,6 +2885,64 @@ def main():
     sb.add_argument("--from-file", help="file of URLs, one per line, # comments allowed")
     sb.add_argument("--yes", action="store_true",
                     help="actually submit. Without it this prints the batch and spends nothing")
+    sb.add_argument("--root", default=".", help="site repo; a receipt goes to <root>/.seo/bing.jsonl if .seo/ exists")
+    sf = sub.add_parser("submitfeed", help="SubmitFeed - make Bing re-read a sitemap (DRY RUN by default)",
+                        parents=[common])
+    sf.add_argument("--feed", help="absolute sitemap URL (default: <site>sitemap.xml)")
+    sf.add_argument("--yes", action="store_true", help="actually submit")
+    sf.add_argument("--root", default=".", help="site repo, for the receipt")
+    rf = sub.add_parser("removefeed", help="RemoveFeed - make Bing forget a sitemap (DRY RUN by default)",
+                        parents=[common])
+    rf.add_argument("--feed", required=True, help="absolute sitemap URL, exactly as `feeds` lists it")
+    rf.add_argument("--yes", action="store_true", help="actually remove")
+    rf.add_argument("--root", default=".", help="site repo, for the receipt")
+    fdd = sub.add_parser("feeddetails", help="a sitemap INDEX as Bing holds it, child by child",
+                         parents=[common])
+    fdd.add_argument("--feed", help="absolute sitemap URL (default: <site>sitemap.xml)")
+    sc = sub.add_parser("submitcontent", help="SubmitContent - push a page's HTTP response to Bing "
+                        "(DRY RUN by default)", parents=[common])
+    sc.add_argument("--url", required=True)
+    sc.add_argument("--dynamic-serving", choices=sorted(DYNAMIC_SERVING), default="none",
+                    help="which device class this response is for (default: none = all)")
+    sc.add_argument("--yes", action="store_true", help="actually submit")
+    sc.add_argument("--root", default=".", help="site repo, for the receipt")
+    ft = sub.add_parser("fetch", help="FetchUrl - bingbot fetches the URL now; show what it was served",
+                        parents=[common])
+    ft.add_argument("--url", required=True)
+    ft.add_argument("--wait", type=int, default=FETCH_WAIT_S, help="seconds to wait for the fetch")
+    ft.add_argument("--live", action="store_true",
+                    help="also fetch the page normally and list structural differences")
+    ft.add_argument("--root", default=".", help="site repo, for the receipt")
+    fh = sub.add_parser("fetched", help="fetch-as-bingbot history, or one URL's last fetch parsed",
+                        parents=[common])
+    fh.add_argument("--url", help="show what bingbot was served for this URL")
+    fh.add_argument("--live", action="store_true", help="with --url: compare against a normal fetch")
+    kt = sub.add_parser("keywordtrend", help="one query's Bing impressions week by week", parents=[common])
+    kt.add_argument("--q", required=True)
+    qp = sub.add_parser("querypages", help="EVERY url of the site that drew impressions for a query",
+                        parents=[common])
+    qp.add_argument("--q", required=True)
+    qp.add_argument("--min-share", type=float, default=CANNIBAL_MIN_SHARE)
+    qd = sub.add_parser("querypagedetail", help="position distribution for one query on one page",
+                        parents=[common])
+    qd.add_argument("--q", required=True)
+    qd.add_argument("--page", required=True, help="exact URL as `querypages` reports it")
+    qt = sub.add_parser("querytraffic", help="one query's clicks/impressions for the site, by DAY",
+                        parents=[common])
+    qt.add_argument("--q", required=True)
+    ut = sub.add_parser("urltraffic", help="GetUrlTrafficInfo, cross-checked against GetPageStats",
+                        parents=[common])
+    ut.add_argument("--url", required=True)
+    ch = sub.add_parser("children", help="Index Explorer: child URLs Bing holds under a path",
+                        parents=[common])
+    ch.add_argument("--url", help="parent path (default: the site root)")
+    ch.add_argument("--traffic", action="store_true", help="clicks/impressions per child instead of index facts")
+    ch.add_argument("--http", choices=sorted(CHILD_HTTP), default="any")
+    ch.add_argument("--crawled", choices=sorted(CHILD_CRAWLED), default="any")
+    ch.add_argument("--discovered", choices=sorted(CHILD_DISCOVERED), default="any")
+    ch.add_argument("--flags", choices=sorted(CHILD_FLAGS), default="any")
+    ch.add_argument("--max-pages", type=int, default=CHILD_MAX_PAGES)
+    ch.add_argument("--pace", type=float, default=PAGE_CALL_PACE_S)
 
     qy = sub.add_parser("queries", help="queries this site appears for - dated weekly rows + by_query",
                         parents=[common])
@@ -1782,6 +2965,10 @@ def main():
     cn.add_argument("--max-findings", type=int, default=50)
     cn.add_argument("--pace", type=float, default=PAGE_CALL_PACE_S,
                     help="seconds between per-page calls (Bing throttles tight loops)")
+    cn.add_argument("--query", action="append", default=[],
+                    help="also ask Bing for EVERY url ranking for this query (repeatable)")
+    cn.add_argument("--top-queries", type=int, default=0,
+                    help="also ask that for the site's top N queries by impressions")
 
     ui = sub.add_parser("urlinfo", help="Bing's own record of ONE url: discovered, last crawled, size",
                         parents=[common])
@@ -1804,7 +2991,8 @@ def main():
         sys.exit(0 if out.get("ok") else 1)
     key = read_key()
     if not key:
-        print(json.dumps({"ok": False, "error": "no BING_WEBMASTER_API_KEY and no ~/.bing_webmaster_key"}))
+        print(json.dumps({"ok": False, "state": "no_key",
+                          "error": "no BING_WEBMASTER_API_KEY and no ~/.bing_webmaster_key"}))
         sys.exit(2)
 
     if a.days is not None and a.cmd not in WINDOWED:
@@ -1851,8 +3039,15 @@ def main():
     start = end - timedelta(days=a.days if a.days is not None else 90)
     s, e_ = start.strftime(DATE_FMT), end.strftime(DATE_FMT)
 
+    if a.cmd == "querypages" and not (0 < a.min_share <= 0.5):
+        print(json.dumps({"ok": False, "error": "min_share_out_of_range",
+                          "detail": "--min-share must be in (0, 0.5]; above 0.5 a split is impossible"}))
+        sys.exit(2)
+
     if a.cmd == "sites":
         out = sites(key)
+    elif a.cmd == "keywordtrend":
+        out = keywordtrend(key, a.q, a.country, a.language)
     elif a.cmd == "keyword":
         out = keyword(key, a.q, a.country, a.language, s, e_)
     elif a.cmd == "expand":
@@ -1873,7 +3068,32 @@ def main():
         elif a.cmd == "quota":
             out = quota(key, site)
         elif a.cmd == "submit":
-            out = submit(key, site, a.url, a.from_file, a.yes)
+            out = submit(key, site, a.url, a.from_file, a.yes, a.root)
+        elif a.cmd == "submitfeed":
+            out = submitfeed(key, site, a.feed or site + "sitemap.xml", a.yes, a.root)
+        elif a.cmd == "removefeed":
+            out = removefeed(key, site, a.feed, a.yes, a.root)
+        elif a.cmd == "feeddetails":
+            out = feeddetails(key, site, a.feed or site + "sitemap.xml")
+        elif a.cmd == "submitcontent":
+            out = submitcontent(key, site, a.url, a.dynamic_serving, a.yes, a.root)
+        elif a.cmd == "fetch":
+            out = fetch(key, site, a.url, a.wait, a.live, a.root)
+        elif a.cmd == "fetched":
+            out = fetched(key, site, a.url)
+            if a.live and a.url and out.get("response"):
+                out["live_comparison"] = compare_views(out, _live_view(a.url))
+        elif a.cmd == "querypages":
+            out = querypages(key, site, a.q, a.limit, a.min_share)
+        elif a.cmd == "querypagedetail":
+            out = querypagedetail(key, site, a.q, a.page)
+        elif a.cmd == "querytraffic":
+            out = querytraffic(key, site, a.q)
+        elif a.cmd == "urltraffic":
+            out = urltraffic(key, site, a.url)
+        elif a.cmd == "children":
+            out = children(key, site, a.url or site, a.traffic, a.http, a.crawled, a.discovered,
+                           a.flags, a.max_pages, a.pace)
         elif a.cmd == "blocked":
             out = blocked(key, site)
         elif a.cmd == "crawlsettings":
@@ -1884,7 +3104,7 @@ def main():
             out = queries(key, site, a.limit, a.exact, a.contains)
         elif a.cmd == "cannibal":
             out = cannibal(key, site, explicit, top, owners, a.min_share, a.min_impressions,
-                           a.max_findings, a.pace)
+                           a.max_findings, a.pace, a.query, a.top_queries)
         else:
             out = {"backlinks": backlinks,
                    "traffic": traffic, "pages": pages}[a.cmd](
@@ -1894,7 +3114,8 @@ def main():
 
     # State the window on every report that has one it did not choose, so a
     # reader who never passed --days still knows the span is Bing's, not theirs.
-    if a.cmd in ("queries", "pages", "pagequeries", "traffic", "cannibal") and out.get("ok"):
+    if a.cmd in ("queries", "pages", "pagequeries", "traffic", "cannibal", "keywordtrend",
+                 "querypages", "querypagedetail", "querytraffic") and out.get("ok"):
         out.setdefault(
             "window",
             "Bing's own fixed reporting window - not selectable here; --days is refused "

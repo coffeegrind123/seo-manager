@@ -255,7 +255,12 @@ check("CONTROL the refusal did not send a partial batch", sent == {})
 
 r = bing.submit("k", "https://x.net/", ["https://x.net/a", "https://x.net/a"], None, True)
 check("CONTROL a within-quota batch DOES send", r["submitted"] is True)
-check("deduplicated on the way", sent["urlList"] == ["https://x.net/a"])
+check("deduplicated on the way, and ONE url goes through SubmitUrl",
+      sent.get("url") == "https://x.net/a" and r["method"] == "SubmitUrl")
+sent.clear()
+r = bing.submit("k", "https://x.net/", ["https://x.net/a", "https://x.net/b"], None, True)
+check("CONTROL several urls go through SubmitUrlBatch",
+      sent.get("urlList") == ["https://x.net/a", "https://x.net/b"] and r["method"] == "SubmitUrlBatch")
 check("and the receipt does not claim a crawl happened", "not a crawl confirmation" in r["note"])
 
 print("\n12. weekly query rows keep their date, and aggregate per query")
@@ -430,6 +435,267 @@ rc, out = cli("cannibal", "--owner", "pricing")
 check("a malformed --owner is refused", out.get("error") == "bad_cannibal_input")
 rc, out = cli("cannibal", "--days", "7")
 check("cannibal --days refuses like the other fixed-window commands", out.get("error") == "window_not_selectable")
+
+# --------------------------------------------------------------------------
+# The rest of the API surface (2026-10-18).
+# --------------------------------------------------------------------------
+import io  # noqa: E402
+import urllib.error  # noqa: E402
+import urllib.request  # noqa: E402
+
+print("\n14. transport: the error envelope lives in an HTTP 400 body, and throttles retry")
+REAL_URLOPEN = urllib.request.urlopen
+import importlib  # noqa: E402
+fresh = importlib.reload(bing)   # the module's own call()/post(), not a stub from above
+slept = []
+fresh._sleep = slept.append
+
+
+class _Resp(io.BytesIO):
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def answers(*seq):
+    """urlopen that returns each answer in turn: (status, body)."""
+    q = list(seq)
+
+    def _open(req, timeout=None):
+        status, body = q.pop(0)
+        if status != 200:
+            raise urllib.error.HTTPError(req.full_url, status, "x", {}, io.BytesIO(body.encode()))
+        return _Resp(body.encode())
+    return _open
+
+
+urllib.request.urlopen = answers((400, '{"ErrorCode":14,"Message":"ERROR!!! NotAuthorized"}'))
+r = fresh.call("GetCrawlStats", "k", siteUrl="https://x.net/")
+check("a 400 envelope is decoded to its NAME, not 'HTTP 400'",
+      r["ok"] is False and r["error_name"] == "NotAuthorized" and r["error_code"] == 14)
+check("and an auth failure is not retried", slept == [])
+
+urllib.request.urlopen = answers((400, '{"ErrorCode":5,"Message":"ERROR!!! ThrottleHost"}'),
+                                 (200, '{"d":[1,2]}'))
+r = fresh.call("GetCrawlStats", "k", siteUrl="https://x.net/")
+check("a ThrottleHost is retried and the retry's answer returned", r == {"ok": True, "d": [1, 2]})
+check("after the first backoff", slept == [fresh.THROTTLE_BACKOFF_S[0]])
+
+slept.clear()
+urllib.request.urlopen = answers(*[(400, '{"ErrorCode":4,"Message":"ERROR!!! ThrottleUser"}')] * 4)
+r = fresh.call("GetCrawlStats", "k", siteUrl="https://x.net/")
+check("a throttle that never clears is `throttled`, never data",
+      r["ok"] is False and r.get("throttled") is True and len(slept) == len(fresh.THROTTLE_BACKOFF_S))
+
+urllib.request.urlopen = answers((404, ""))
+r = fresh.call("GetSiteMoves", "k", siteUrl="https://x.net/")
+check("an empty 404 is a RETIRED method", r["error"] == "method_not_served")
+urllib.request.urlopen = answers((200, '{"ErrorCode":14,"Message":"x"}'))
+check("CONTROL the envelope is still caught on a 200",
+      fresh.call("GetUserSites", "k").get("error_name") == "NotAuthorized")
+urllib.request.urlopen = answers((200, ""))
+check("a write's empty body is ok with d None", fresh.post("SubmitFeed", "k", {}) == {"ok": True, "d": None})
+SECRET = "k3y-that-must-never-print"
+
+
+def _boom(req, timeout=None):
+    raise ValueError(f"cannot open {req.full_url}")
+
+
+urllib.request.urlopen = _boom
+r = fresh.call("GetUserSites", SECRET)
+check("an exception quoting the URL never prints the API key",
+      SECRET not in json.dumps(r) and "<redacted>" in r["error"])
+urllib.request.urlopen = answers((400, f"bad key {SECRET}"))
+check("nor does an error BODY that echoes it",
+      SECRET not in json.dumps(fresh.post("SubmitFeed", SECRET, {})))
+urllib.request.urlopen = REAL_URLOPEN
+bing = fresh
+bing._sleep = lambda s: None
+SITE = "https://x.net/"
+D = lambda iso: f"/Date({int(__import__('calendar').timegm(__import__('time').strptime(iso, '%Y-%m-%d'))) * 1000})/"
+
+print("\n15. keywordtrend: weekly, date-ordered, trend only when both halves exist")
+stub([{"Date": D(f"2026-0{m}-0{d}"), "Impressions": i, "BroadImpressions": i * 2, "Query": "q"}
+      for (m, d, i) in [(5, 9, 40), (5, 2, 30), (4, 4, 10), (4, 1, 20)]])
+r = bing.keywordtrend("k", "q", "us", "en-US")
+check("weeks come back in date order whatever order Bing sent",
+      [p["date"] for p in r["series"]] == ["2026-04-01", "2026-04-04", "2026-05-02", "2026-05-09"])
+check("totals keep exact and broad apart", r["totals"] == {"impressions": 100, "broad_impressions": 200})
+check("a 4-week trend needs 8 weeks, so it is null here", r["trend_4w"] is None)
+stub([])
+r = bing.keywordtrend("k", "q", "us", "en-US")
+check("an empty answer is unmeasured, not zero demand",
+      r["known_to_bing"] is False and "UNMEASURED" in r["empty_means"])
+
+print("\n16. querypages: the URL arrives in `Query`, and a split across URLs is flagged")
+W1, W2 = D("2026-08-07"), D("2026-08-14")
+stub([{"Query": "https://x.net/a", "Date": W1, "Impressions": 600, "Clicks": 6, "AvgImpressionPosition": 8},
+      {"Query": "https://x.net/b", "Date": W2, "Impressions": 400, "Clicks": 1, "AvgImpressionPosition": 9},
+      {"Query": "https://x.net/c", "Date": W2, "Impressions": 5, "Clicks": 0, "AvgImpressionPosition": 30}])
+r = bing.querypages("k", SITE, "widget", 10)
+check("rows are keyed by the URL from the `Query` field", [u["url"] for u in r["urls"]][:2] ==
+      ["https://x.net/a", "https://x.net/b"])
+check("two URLs over min_share are a split", "split" in r["flags"] and len(r["split_urls"]) == 2)
+check("a best position of 8 is edge-of-page", "edge_of_page" in r["flags"])
+check("the leader changed between the two weeks", r["leader_changes"] == 1)
+stub([{"Query": "https://x.net/a", "Date": W1, "Impressions": 600, "Clicks": 6, "AvgImpressionPosition": 2}])
+r = bing.querypages("k", SITE, "widget", 10)
+check("CONTROL one URL at #2 raises no flag", r["flags"] == [])
+stub([])
+check("an empty answer says NOT 'we do not rank'",
+      "NOT" in bing.querypages("k", SITE, "widget", 10)["empty_means"])
+
+print("\n17. querypagedetail: the position distribution an average hides")
+stub([{"Date": W1, "Position": 3, "Impressions": 50, "Clicks": 5},
+      {"Date": W1, "Position": 15, "Impressions": 50, "Clicks": 0},
+      {"Date": W2, "Position": 3, "Impressions": 100, "Clicks": 9}])
+r = bing.querypagedetail("k", SITE, "q", "https://x.net/a")
+check("the histogram sums impressions per position",
+      r["histogram"] == [{"position": 3, "impressions": 150, "clicks": 14},
+                         {"position": 15, "impressions": 50, "clicks": 0}])
+check("page1_share is the fraction shown at 1-10", r["page1_share"] == 0.75)
+check("each day keeps its best and worst", (r["series"][0]["best"], r["series"][0]["worst"]) == (3, 15))
+check("the average is impression-weighted: (3*150 + 15*50)/200 = 6.0", r["avg_position"] == 6.0)
+
+print("\n18. querytraffic: daily, with 7-day halves")
+stub([{"Date": D(f"2026-08-{d:02d}"), "Impressions": 10 if d <= 7 else 20, "Clicks": 1}
+      for d in range(1, 15)])
+r = bing.querytraffic("k", SITE, "q")
+check("14 days give a 7-day trend", r["trend_7d"]["impressions"]["change"] == 70)
+check("and no 28-day one", r["trend_28d"]["impressions"] is None)
+
+print("\n19. urltraffic: a zero is cross-examined against GetPageStats")
+stub_by_method({"GetUrlTrafficInfo": {"Clicks": 0, "Impressions": 0, "IsPage": True, "Url": SITE},
+                "GetPageStats": [{"Query": SITE, "Impressions": 900, "Clicks": 20, "AvgImpressionPosition": 5}]})
+r = bing.urltraffic("k", SITE, SITE)
+check("zero here and traffic in page stats is `disagrees`, not 'no traffic'", r["verdict"] == "disagrees")
+stub_by_method({"GetUrlTrafficInfo": {"Clicks": 3, "Impressions": 90, "IsPage": True, "Url": SITE},
+                "GetPageStats": [{"Query": SITE, "Impressions": 900, "Clicks": 20, "AvgImpressionPosition": 5}]})
+check("CONTROL both reporting traffic is consistent",
+      bing.urltraffic("k", SITE, SITE)["verdict"] == "consistent")
+
+print("\n20. children: an empty Index Explorer is UNKNOWN while Bing holds pages")
+stats = [{"Date": D(f"2026-08-{d:02d}"), "InIndex": 1000 + d, "CrawledPages": d % 3}
+         for d in range(1, 8)]
+bing.post = lambda m, k, p: {"ok": True, "d": []}
+stub_by_method({"GetCrawlStats": stats})
+r = bing.children("k", SITE, SITE, pace=0)
+check("no children + pages in index = unknown", r["verdict"] == "unknown" and "1007" in r["why_not_none"])
+pages_seen = []
+
+
+def _kids(m, k, p):
+    pages_seen.append(p["page"])
+    return {"ok": True, "d": [{"Url": "https://x.net/a"}, {"Url": "https://x.net/b"}]}
+
+
+bing.post = _kids
+r = bing.children("k", SITE, SITE, pace=0)
+check("a page that adds no NEW url stops the paging", r["count"] == 2 and pages_seen == [0, 1])
+
+print("\n21. feeddetails: an index and its children")
+stub([{"Url": SITE + "sitemap.xml", "Type": "Sitemap Index", "Status": "Success", "UrlCount": 1500,
+       "LastCrawled": D("2026-10-15"), "Submitted": "/Date(-11644473600000)/"},
+      {"Url": SITE + "s1.xml", "Type": "Sitemap", "Status": "Success", "UrlCount": 1000,
+       "LastCrawled": D("2026-10-01"), "Submitted": "/Date(-11644473600000)/"},
+      {"Url": SITE + "s2.xml", "Type": "Sitemap", "Status": "Error", "UrlCount": 400,
+       "LastCrawled": D("2026-10-14"), "Submitted": "/Date(-11644473600000)/"}])
+r = bing.feeddetails("k", SITE, SITE + "sitemap.xml")
+cs_ = r["children_summary"]
+check("children are separated from the index row", cs_["count"] == 2 and r["feed_row"]["url_count_per_bing"] == 1500)
+check("a failing child is named", cs_["not_success"] == [SITE + "s2.xml"])
+check("the stalest child is reported", cs_["oldest_crawl"] == "2026-10-01")
+check("index vs children delta is computed, not assumed zero", cs_["index_vs_children_delta"] == 100)
+
+print("\n22. submitfeed / removefeed: guards before the network, read-back after")
+posted = []
+bing.post = lambda m, k, p: posted.append((m, p)) or {"ok": True, "d": None}
+r = bing.submitfeed("k", SITE, "https://evil.example/sitemap.xml", True)
+check("an off-site feed is refused before anything is sent", r["error"] == "feed_off_site" and posted == [])
+bing._live_feed = lambda u: (404, None, None)
+r = bing.submitfeed("k", SITE, SITE + "sitemap.xml", True)
+check("a feed that is not live is refused - the deploy-window case",
+      r["error"] == "feed_not_healthy" and posted == [])
+bing._live_feed = lambda u: (200, "urlset", None)
+stub_by_method({"GetFeeds": []})
+r = bing.submitfeed("k", SITE, SITE + "sitemap.xml", False)
+check("no --yes is a dry run that sends nothing", r.get("dry_run") is True and posted == [])
+today = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%d")
+stub_by_method({"GetFeeds": [{"Url": SITE + "sitemap.xml", "Type": "Sitemap", "Status": "Success",
+                              "UrlCount": 5, "Submitted": D(today), "LastCrawled": D(today)}]})
+r = bing.submitfeed("k", SITE, SITE + "sitemap.xml", True)
+check("--yes sends SubmitFeed with siteUrl + feedUrl",
+      posted == [("SubmitFeed", {"siteUrl": SITE, "feedUrl": SITE + "sitemap.xml"})])
+check("and today's submission date read back is `confirmed`", r["verified"] == "confirmed")
+posted.clear()
+stub_by_method({"GetFeeds": []})
+r = bing.removefeed("k", SITE, SITE + "gone.xml", True)
+check("removing a feed Bing does not hold is refused - its null would prove nothing",
+      r["error"] == "feed_not_held" and posted == [])
+
+print("\n23. fetch: UnknownError retried once, slash-folded history accepted")
+calls = []
+
+
+def _fetch_post(m, k, p):
+    calls.append(m)
+    return ({"ok": False, "error": "x", "error_code": 2} if len(calls) == 1 else {"ok": True, "d": None})
+
+
+bing.post = _fetch_post
+now_ms = int(__import__("time").time() * 1000)
+doc = ("Last-DownLoad-Http-Code: 200\r\nTruncation: 0\r\nRobots-Rule: 0\r\n\r\n"
+       "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><title>t</title></html>")
+stub_by_method({"GetFetchedUrls": [{"Url": "https://x.net/zh", "Fetched": True, "Date": f"/Date({now_ms})/"}],
+                "GetFetchedUrlDetails": {"Status": "Completed", "Date": f"/Date({now_ms})/", "Document": doc}})
+r = bing.fetch("k", SITE, "https://x.net/zh/", wait=30)
+check("an UnknownError on FetchUrl is retried once", calls == ["FetchUrl", "FetchUrl"])
+check("/zh in the history completes a fetch of /zh/", r["ok"] and r["verdict"] == "clean")
+stub_by_method({"GetFetchedUrls": [], "GetFetchedUrlDetails": None})
+bing.time.time = (lambda t0=[0]: (t0.__setitem__(0, t0[0] + 50) or t0[0]))  # each poll costs 50s
+r = bing.fetch("k", SITE, "https://x.net/p", wait=60)
+bing.time.time = __import__("time").time
+check("a fetch that never completes is `fetch_pending`, not a result", r.get("error") == "fetch_pending")
+r = bing.fetch("k", SITE, "https://evil.example/", wait=1)
+check("an off-site fetch is refused", r.get("error") == "url_off_site")
+
+print("\n24. cannibal --query: a URL nobody listed can join a split")
+A_, B_ = "https://x.net/a", "https://x.net/b"
+
+
+def _cn_call(method, key, **kw):
+    if method == "GetPageStats":
+        return {"ok": True, "d": [{"Query": A_, "Impressions": 500, "Clicks": 5, "AvgImpressionPosition": 8}]}
+    if method == "GetPageQueryStats":
+        return {"ok": True, "d": [{"Query": "widget", "Date": W1, "Impressions": 500, "Clicks": 5,
+                                   "AvgImpressionPosition": 8}]}
+    if method == "GetQueryPageStats":
+        return {"ok": True, "d": [{"Query": A_, "Date": W1, "Impressions": 500, "Clicks": 5, "AvgImpressionPosition": 8},
+                                  {"Query": B_, "Date": W1, "Impressions": 400, "Clicks": 2, "AvgImpressionPosition": 9}]}
+    return {"ok": True, "d": []}
+
+
+bing.call = _cn_call
+r = bing.cannibal("k", SITE, [A_], 0, {}, pace=0)
+check("CONTROL page-side alone cannot see /b", r["summary"]["split"] == 0)
+r = bing.cannibal("k", SITE, [A_], 0, {}, pace=0, queries=["widget"])
+check("query-side finds /b", r["pages_found_by_query"] == [B_])
+check("and the split now fires", r["summary"]["split"] == 1)
+check("without double-counting /a's own row",
+      next(u for u in r["findings"][0]["urls"] if u["url"] == A_)["impressions"] == 500)
+
+print("\n25. CLI: every new fixed-window command refuses --days")
+for cmd, extra in [("keywordtrend", ["--q", "x"]), ("querypages", ["--q", "x"]),
+                   ("querytraffic", ["--q", "x"]), ("children", []), ("urltraffic", ["--url", "x"])]:
+    rc, out = cli(cmd, *extra, "--days", "7")
+    check(f"{cmd} --days refuses", out.get("error") == "window_not_selectable")
+rc, out = cli("querypages", "--q", "x", "--min-share", "0.9")
+check("querypages refuses an impossible --min-share", out.get("error") == "min_share_out_of_range")
 
 print()
 if FAILS:
