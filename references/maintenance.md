@@ -43,6 +43,16 @@ python3 ~/.claude/skills/skill-refiner/skills/anthropic-skills/skills/skill-crea
 
 ---
 
+## This repo stays site-agnostic
+
+The skill is run against real sites, and its measurements are what motivate most
+changes. They are written here **generically**: "a games site", `<game>`,
+`example.com`, never the site's name, domain, competitors, product terms, IPs or
+local paths. That applies to references, test fixtures, code comments and commit
+messages. The real numbers belong in that site's own `.seo/` directory. A run that
+learns something from a site records it there, and brings only the general lesson
+here.
+
 ## Upgrade protocol — the prior-art pass
 
 Run when asked to "upgrade", "run the upgrade protocol", or "search GitHub for
