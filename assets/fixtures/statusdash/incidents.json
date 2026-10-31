@@ -1,0 +1,123 @@
+[
+ {
+  "id": "XhUDXP7A67iHCD2kmbVu",
+  "number": "5986798205446974932",
+  "begin": "2026-09-24T16:15:00+00:00",
+  "created": "2026-09-24T16:15:47+00:00",
+  "modified": "2026-09-24T16:15:47+00:00",
+  "external_desc": "September 2026 spam update",
+  "updates": [
+   {
+    "created": "2026-09-24T16:15:47+00:00",
+    "modified": "2026-09-24T16:15:47+00:00",
+    "when": "2026-09-24T16:15:47+00:00",
+    "text": "Released the September 2026 spam update <https://developers.google.com/search/docs/appearance/spam-updates>, which applies globally and to all languages. The rollout may take up to two weeks to complete.",
+    "status": "SERVICE_INFORMATION"
+   }
+  ],
+  "most_recent_update": {
+   "created": "2026-09-24T16:15:47+00:00",
+   "modified": "2026-09-24T16:15:47+00:00",
+   "when": "2026-09-24T16:15:47+00:00",
+   "text": "Released the September 2026 spam update <https://developers.google.com/search/docs/appearance/spam-updates>, which applies globally and to all languages. The rollout may take up to two weeks to complete.",
+   "status": "SERVICE_INFORMATION"
+  },
+  "status_impact": "SERVICE_INFORMATION",
+  "severity": "low",
+  "service_key": "rGHU1u87FJnkP6W2GwMi",
+  "service_name": "Ranking",
+  "affected_products": [
+   {
+    "title": "Ranking",
+    "id": "rGHU1u87FJnkP6W2GwMi"
+   }
+  ],
+  "uri": "incidents/XhUDXP7A67iHCD2kmbVu"
+ },
+ {
+  "id": "LEubPCm2octf2uMqCFKE",
+  "number": "453832737276420062",
+  "begin": "2026-08-18T16:27:00+00:00",
+  "created": "2026-08-18T16:28:47+00:00",
+  "end": "2026-08-21T08:49:00+00:00",
+  "modified": "2026-08-21T08:50:34+00:00",
+  "external_desc": "August 2026 spam update",
+  "updates": [
+   {
+    "created": "2026-08-21T08:49:58+00:00",
+    "modified": "2026-08-21T08:50:34+00:00",
+    "when": "2026-08-21T08:49:58+00:00",
+    "text": "The rollout was complete as of August 21, 2026.",
+    "status": "AVAILABLE"
+   },
+   {
+    "created": "2026-08-18T16:28:47+00:00",
+    "modified": "2026-08-21T08:49:58+00:00",
+    "when": "2026-08-18T16:28:47+00:00",
+    "text": "Released the August 2026 spam update <https://developers.google.com/search/docs/appearance/spam-updates>, which applies globally and to all languages. The rollout may take a few days to complete.",
+    "status": "SERVICE_INFORMATION"
+   }
+  ],
+  "most_recent_update": {
+   "created": "2026-08-21T08:49:58+00:00",
+   "modified": "2026-08-21T08:50:34+00:00",
+   "when": "2026-08-21T08:49:58+00:00",
+   "text": "The rollout was complete as of August 21, 2026.",
+   "status": "AVAILABLE"
+  },
+  "status_impact": "SERVICE_INFORMATION",
+  "severity": "low",
+  "service_key": "rGHU1u87FJnkP6W2GwMi",
+  "service_name": "Ranking",
+  "affected_products": [
+   {
+    "title": "Ranking",
+    "id": "rGHU1u87FJnkP6W2GwMi"
+   }
+  ],
+  "uri": "incidents/LEubPCm2octf2uMqCFKE"
+ },
+ {
+  "id": "TZF4pLmbzFdoBPP6o3iv",
+  "number": "8891693348028902943",
+  "begin": "2026-02-25T03:55:00+00:00",
+  "created": "2026-02-25T06:33:39+00:00",
+  "end": "2026-02-25T04:10:00+00:00",
+  "modified": "2026-02-25T06:34:29+00:00",
+  "external_desc": "Serving was experiencing an issue",
+  "updates": [
+   {
+    "created": "2026-02-25T06:34:29+00:00",
+    "modified": "2026-02-25T06:34:29+00:00",
+    "when": "2026-02-25T06:34:29+00:00",
+    "text": "We fixed the issue with serving search results. There will be no more updates.",
+    "status": "AVAILABLE"
+   },
+   {
+    "created": "2026-02-25T06:33:39+00:00",
+    "modified": "2026-02-25T06:34:29+00:00",
+    "when": "2026-02-25T06:33:39+00:00",
+    "text": "Serving was experiencing an issue.",
+    "status": "SERVICE_DISRUPTION"
+   }
+  ],
+  "most_recent_update": {
+   "created": "2026-02-25T06:34:29+00:00",
+   "modified": "2026-02-25T06:34:29+00:00",
+   "when": "2026-02-25T06:34:29+00:00",
+   "text": "We fixed the issue with serving search results. There will be no more updates.",
+   "status": "AVAILABLE"
+  },
+  "status_impact": "SERVICE_DISRUPTION",
+  "severity": "medium",
+  "service_key": "pKUD9XkLn3TBLquSpQMD",
+  "service_name": "Serving",
+  "affected_products": [
+   {
+    "title": "Serving",
+    "id": "pKUD9XkLn3TBLquSpQMD"
+   }
+  ],
+  "uri": "incidents/TZF4pLmbzFdoBPP6o3iv"
+ }
+]

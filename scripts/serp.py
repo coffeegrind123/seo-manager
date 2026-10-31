@@ -1,0 +1,2034 @@
+#!/usr/bin/env python3
+"""SERP provider layer for the seo-manager skill.
+
+One question, several ways to answer it: "what is actually on page 1 for this
+query?" The provider ladder runs cheapest-and-keyless first:
+
+    ddg         DuckDuckGo HTML endpoint. Keyless, free, no account.
+                DEFAULT. Verified working, but it goes through periods of
+                blanket HTTP 202 refusal that NO proxy, endpoint or request
+                shape works around - see provider_ddg. Fail over to browser.
+    serpd       The local SERP daemon (scripts/serpd.py): the same headed-Chrome
+                route to real Google, but held open behind an HTTP server, so a
+                check is one call with no DOM in your context. ~1.4s/query, and
+                its /batch endpoint does a whole 25-check research run in ~37s.
+                Start it with `serpd.py --start`. Preferred when it is up.
+    browser     Real Google through the browser MCP. Keyless, highest fidelity,
+                and the ONLY route to real Google results - Google serves a
+                JS-only shell to every HTTP client regardless of IP or UA
+                (measured: 200 / ~90KB / zero <h3>, direct AND proxied, with a
+                Googlebot UA too). This script cannot call MCP tools, so
+                --provider browser prints a hardened recipe to run.
+    searxng     Any SearXNG instance with the JSON API enabled (self-hosted is
+                the reliable form - public instances antibot).
+    brave       Brave Search API. NO LONGER a flat free tier: usage-billed at
+                $5/1k with $5/month in credits, and a key needs a card-backed
+                subscription. BYO key / ~/.brave_search_key.
+    serper      Serper.dev. Real Google, 1 credit per search, 2500 free
+                credits, no monthly reset. Cheapest real-Google query here and
+                the one to reach for first among the keyed providers.
+                SERPER_API_KEY or ~/.serper_key.
+    serpapi     SerpApi. Free tier 250 searches/month, BYO key. Real Google,
+                top-100 in one credit, includes the AI Overview inline. Spend
+                its 250 on the checks that need DEPTH; use serper for volume.
+                SERPAPI_KEY or ~/.serpapi_key.
+    dataforseo  DataForSEO live SERP. Paid, BYO login/password. Real Google.
+    bing        Bing's HTML results page through the residential proxy with a
+                pinned, CONFIRMED exit. OPT-IN ONLY (--provider bing), never in
+                the default failover: it has two silent wrong-answer modes
+                (results for another query, and the query collapsed onto its
+                leading word) that only the guards in provider_bing catch, and
+                a failover hop must be a provider whose failure is a refusal.
+                It answers a different question anyway - "what does BING rank"
+                - which matters on a site whose traffic is Bing-led.
+
+Keys are read from the environment first, then from a chmod-600 dotfile, so
+they survive a new shell without ever landing in a committed file.
+
+Bing was refused as a provider until 2026-10-12 for the RELEVANCE reason below;
+it is now opt-in behind guards built for exactly that failure.
+
+Two guards sit in front of every provider's output, and they exist because the
+dangerous SERP failures do not look like failures:
+
+  SHAPE      An HTTP 200 with no parseable results is not an empty page 1. A
+             parser that reports "no competitors" there feeds the research
+             quality bar an authority count of zero and waves through a keyword
+             the site cannot win.
+  RELEVANCE  Worse: some engines return well-formed results FOR A DIFFERENT
+             QUERY. Measured 2026-07-30 - Bing, asked for "self hosted rank
+             tracker" through residential exits, returned ten clean
+             <li class="b_algo"> blocks about Laposte.net webmail, and on a
+             second session about Rufus/Windows XP. HTTP 200, no captcha, ten
+             rows that parse perfectly. Status code and result count both look
+             healthy. Only checking that the results are ABOUT the query
+             catches it.
+
+Stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import html
+import json
+import os
+import random
+import re
+import shutil
+import string
+import subprocess
+import sys
+import time
+from pathlib import Path
+import urllib.error
+import urllib.parse
+import urllib.request
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# The full browser header set, not just a User-Agent. Measured against a
+# scraping-hostile endpoint: a bare UA gets the request reset or 403'd, the
+# full set returns 200. It is also what made DuckDuckGo answer consistently
+# here. Sending only User-Agent is the common mistake - the Sec-Fetch-* and
+# Sec-Ch-Ua headers are part of what makes the request look real.
+BROWSER_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# Domains whose presence on page 1 is a WEAKNESS signal: a forum thread, a
+# Q&A post, a raw repo or a video is not a guide-shaped competitor, and a
+# young site can out-answer it. (The quality bar's "strong SERP weakness".)
+WEAK_DOMAINS = {
+    "reddit.com", "news.ycombinator.com", "stackoverflow.com", "stackexchange.com",
+    "quora.com", "youtube.com", "youtu.be", "gist.github.com", "pastebin.com",
+    "medium.com", "dev.to", "hashnode.dev", "linkedin.com", "facebook.com",
+    "x.com", "twitter.com", "discourse.org", "serverfault.com", "superuser.com",
+    "answers.microsoft.com", "community.spiceworks.com", "tiktok.com",
+}
+DOCS_DOMAINS = {"github.com", "gitlab.com", "readthedocs.io", "npmjs.com", "pypi.org", "crates.io"}
+
+THIN_TITLE = re.compile(
+    r"^\s*(?:top\s+)?\d{1,2}\s+(?:best|top|free|great|awesome|essential)\b"
+    r"|\b(?:best|top)\s+\d{1,2}\b",
+    re.I,
+)
+YEAR_IN_TITLE = re.compile(r"\b(20[0-2]\d)\b")
+
+results_meta: dict = {}
+
+
+# ------------------------------------------------------------------- proxy
+
+
+# Exit countries verified against one commercial residential pool, by asking for
+# each one on several FRESH sessions and checking where the exit actually landed
+# (`serp.py verify-countries` re-runs exactly that).
+#
+# ⚠ THIS LIST GOES STALE. It was previously EU-only and excluded "us" on the
+# grounds that the pool silently returned a random non-US exit. Re-measured
+# 2026-08-02: "us" now lands in the US on 4 of 4 fresh sessions, as does "tr" —
+# so the list was refusing two perfectly good countries and, worse, telling the
+# caller a measured-sounding reason that was no longer true. Re-verify before
+# trusting an absence here; do not treat this list as a fact about the internet.
+#
+# Two DIFFERENT failure modes, and only one of them is dangerous:
+#   fr  -> returns a GB exit, 3 of 3. A SILENT LIE: the caller believes it has a
+#          French SERP. This is the reason the whitelist exists at all.
+#   jp, kr, in, id, ir -> intermittent timeouts, never a wrong country. Merely
+#          unreliable, not lying. Excluded so a run cannot half-succeed, but they
+#          may work on a retry and are safe to re-verify.
+VERIFIED_COUNTRIES = [
+    # EU (original set, still passing)
+    "at", "be", "ch", "cz", "de", "dk", "es", "gr", "ie", "it", "nl", "pl", "pt", "ro", "se",
+    # verified 2026-08-02
+    "au", "bd", "br", "ca", "cn", "gb", "mx", "pk", "ru", "sa", "th", "tr", "ua", "us", "vn",
+]
+# Back-compat: older callers imported EU_COUNTRIES.
+EU_COUNTRIES = VERIFIED_COUNTRIES
+
+# Countries measured as returning the WRONG country rather than failing. Named so
+# the refusal can say why, instead of the generic "unverified".
+LYING_COUNTRIES = {"fr": "gb"}
+
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls, refuse  # noqa: E402
+from providers import registrable as _shared_registrable  # noqa: E402
+
+def verify_exit_countries(codes, tries=3, timeout=35):
+    """Ask the pool for an exit in each country on FRESH sessions and report where
+    it actually landed.
+
+    This exists because the verified list above went stale and nobody could tell:
+    the refusal message quoted a measured-sounding reason ("us is not honoured")
+    that had stopped being true, so two good countries were being refused on the
+    authority of an old measurement. A list you cannot re-measure is a belief.
+
+    A country passes only if EVERY session lands in it - one wrong exit is the
+    whole failure mode, since a caller pinning a country believes the SERP is
+    local to it. Uses curl because urllib cannot tunnel HTTPS through this proxy
+    (see provider_ddg), and a fresh Proxy() per try so sticky sessions cannot
+    make one lucky exit look like N.
+    """
+    import subprocess
+    base = _read_proxy_file().get("SEO_PROXY_URL", "")
+    if not base:
+        return {"ok": False, "error": "no proxy configured - nothing to verify",
+                "fix": "set SEO_PROXY_URL or ~/.seo-proxy"}
+    out = {}
+    for cc in codes:
+        seen = []
+        for _ in range(tries):
+            try:
+                pr = Proxy(base, country=cc)
+                r = subprocess.run(
+                    ["curl", "-s", "--max-time", str(timeout), "--proxy", pr.url(),
+                     "http://ip-api.com/json/?fields=status,countryCode"],
+                    capture_output=True, text=True, timeout=timeout + 15)
+                d = json.loads(r.stdout)
+                seen.append(d.get("countryCode") if d.get("status") == "success" else "ERR")
+            except Exception:
+                seen.append("ERR")
+        want = cc.upper()
+        wrong = sorted({x for x in seen if x not in (want, "ERR")})
+        out[cc] = {
+            "requested": want, "observed": seen,
+            "honoured": all(x == want for x in seen),
+            "verdict": ("honoured" if all(x == want for x in seen)
+                        else "LIES - returns " + ",".join(wrong) if wrong
+                        else "unreliable (timeouts, never a wrong country)"),
+        }
+    passed = [c for c, v in out.items() if v["honoured"]]
+    return {
+        "ok": True, "checked": len(codes), "tries_each": tries,
+        "honoured": passed,
+        "not_honoured": [c for c in out if c not in passed],
+        "detail": out,
+        "reading": ("A country is honoured only if EVERY fresh session landed in it. "
+                    "'LIES' is the dangerous class - the caller gets a SERP from the "
+                    "wrong country and cannot tell. 'unreliable' only times out and is "
+                    "safe to retry. Update VERIFIED_COUNTRIES from `honoured`."),
+    }
+
+
+def _read_proxy_file() -> dict:
+    path = os.path.expanduser("~/.seo-proxy")
+    out = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+class Proxy:
+    """A residential proxy with password-encoded sticky sessions.
+
+    What this is actually for, after measurement: a non-datacenter exit for the
+    browser, and geo-pinned SERPs (checking how a page ranks from Germany).
+    It is NOT a way around DuckDuckGo's 202 - see provider_ddg.
+
+    Selectors ride on the PASSWORD, '_'-joined (reverse-engineered in
+    against one commercial provider):
+
+        <pass>[_country-<cc>]_session-<6char>_lifetime-<min>
+
+    Same session token => same exit IP. No token => a NEW exit IP per request,
+    which sounds better and is not: a rotating exit breaks any engine that does
+    a redirect + cookie hop, because each hop lands on a different country.
+    So this class is sticky by default and rotates only on demand.
+    """
+
+    def __init__(self, url: str, country: str | None = None, lifetime: int = 10):
+        self.base = url
+        self.country = country
+        self.lifetime = lifetime
+        self.session = self._token()
+
+    @staticmethod
+    def _token() -> str:
+        return "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+
+    def rotate(self):
+        """New exit IP on the next request.
+
+        Worth one attempt against a block that MIGHT be exit-scoped, but do not
+        build a retry strategy on it: DuckDuckGo's 202 was measured surviving
+        six fresh exits across six countries in the same minute.
+        """
+        self.session = self._token()
+
+    def url(self) -> str:
+        sel = f"_country-{self.country}" if self.country else ""
+        sel += f"_session-{self.session}_lifetime-{self.lifetime}"
+        # Insert the selector at the end of the password, i.e. just before the
+        # final '@' that separates credentials from the host.
+        at = self.base.rfind("@")
+        return self.base[:at] + sel + self.base[at:] if at > 0 else self.base
+
+    def label(self) -> str:
+        """Loggable identity. NEVER returns credentials."""
+        try:
+            host = urllib.parse.urlparse(self.base).hostname or "proxy"
+        except ValueError:
+            host = "proxy"
+        cc = self.country or "auto"
+        return f"{host} (session {self.session}, {cc})"
+
+
+def resolve_proxy(country: str | None, enabled: bool) -> Proxy | None:
+    """env -> ~/.seo-proxy -> none. Never auto-discovers another repo's .env."""
+    if not enabled:
+        return None
+    fromfile = _read_proxy_file()
+    url = (
+        os.environ.get("SEO_PROXY_URL")
+        or fromfile.get("SEO_PROXY_URL")
+        or os.environ.get("SEO_PROXY_SOCKS")
+        or fromfile.get("SEO_PROXY_SOCKS")
+        or ""
+    ).strip()
+    if not url:
+        return None
+    return Proxy(url, country)
+
+
+# ------------------------------------------------------------------- http
+
+
+_HAVE_CURL: bool | None = None
+
+
+def have_curl() -> bool:
+    global _HAVE_CURL
+    if _HAVE_CURL is None:
+        _HAVE_CURL = shutil.which("curl") is not None
+    return _HAVE_CURL
+
+
+def _fetch_curl(url, data, hdrs, timeout, proxy) -> tuple[int, str]:
+    cmd = ["curl", "-sS", "-L", "--compressed", "-m", str(timeout), "--write-out", "\n%{http_code}"]
+    for k, v in hdrs.items():
+        cmd += ["-H", f"{k}: {v}"]
+    if proxy:
+        cmd += ["--proxy", proxy.url()]
+    if data is not None:
+        cmd += ["--data-binary", data if isinstance(data, str) else data.decode()]
+    cmd.append(url)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 15)
+    except subprocess.TimeoutExpired:
+        return 0, "curl timed out"
+    if proc.returncode != 0:
+        # Never surface stderr verbatim: curl echoes the proxy URL (with
+        # credentials) in several of its error messages.
+        return 0, f"curl exit {proc.returncode}"
+    body, _, code = proc.stdout.rpartition("\n")
+    try:
+        return int(code.strip()), body
+    except ValueError:
+        return 0, "curl produced no status code"
+
+
+def fetch(url: str, *, data=None, headers=None, timeout=30, proxy: Proxy | None = None) -> tuple[int, str]:
+    """HTTP with curl as the transport, urllib only as a fallback.
+
+    curl is not a stylistic choice. urllib's ProxyHandler mishandles the HTTPS
+    CONNECT tunnel through this residential proxy: measured 2026-07-30, every
+    request died with IncompleteRead(~7900 of ~29000 bytes) or
+    RemoteDisconnected, across Connection:close, identity encoding, and gzip.
+    The identical request through curl and the same proxy returned the full
+    body. curl also matches the convention of the sibling search-console and
+    adsense skills - no dependencies, just curl.
+    """
+    hdrs = {**BROWSER_HEADERS, **(headers or {})}
+    if proxy and proxy.url().startswith("socks") and not have_curl():
+        raise RuntimeError(
+            "SEO_PROXY_SOCKS is set but curl is unavailable and urllib cannot speak SOCKS5. "
+            "Install curl, or use the HTTP CONNECT endpoint in SEO_PROXY_URL "
+            "(many providers serve both; :8080 is typically HTTP CONNECT, and SOCKS5 has been measured "
+            ":1080 dropping streamed responses anyway)."
+        )
+    if have_curl():
+        return _fetch_curl(url, data, hdrs, timeout, proxy)
+
+    opener_args = []
+    if proxy:
+        p = proxy.url()
+        opener_args.append(urllib.request.ProxyHandler({"http": p, "https": p}))
+    opener = urllib.request.build_opener(*opener_args)
+    req = urllib.request.Request(url, data=data.encode() if isinstance(data, str) else data, headers=hdrs)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            raw = resp.read()
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.status, raw.decode(charset, errors="replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return 0, type(exc).__name__
+
+
+def registrable(host: str) -> str:
+    return _shared_registrable(host)
+
+
+def host_of(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url).hostname or ""
+    except ValueError:
+        return ""
+
+
+# --------------------------------------------------------------- relevance
+
+
+RELEVANCE_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "for", "in", "on", "with", "how",
+    "what", "why", "is", "are", "was", "were", "best", "vs", "versus", "my",
+    "your", "you", "can", "does", "do", "from", "that", "this", "it",
+}
+# Tuned on real fixtures (2026-07-30): the poisoned Bing reads scored
+# coverage 0.25 / hit_rate 0.00; a good DuckDuckGo read for the same query
+# scored 1.00 / 0.90. These sit in the middle of a very wide gap.
+MIN_COVERAGE = 0.6
+MIN_HIT_RATE = 0.3
+
+
+def relevance_tokens(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if t not in RELEVANCE_STOPWORDS and len(t) > 2]
+
+
+def verify_relevance(query: str, results: list[dict]) -> dict:
+    """Are these results actually ABOUT the query?
+
+    Two numbers, because one is not enough:
+
+      coverage   how many DISTINCT query tokens appear anywhere in the top 10.
+                 Catches the engine that latched onto one token and ignored the
+                 rest - the real Bing failure matched only "self" out of
+                 "self hosted rank tracker" and returned Self-brand furniture
+                 and Wikipedia's article on selfhood. A naive "at least one
+                 query token appears" rule PASSES that; this does not.
+      hit_rate   what fraction of results carry at least half the query tokens.
+                 Catches a result set where the tokens are scattered one per
+                 page rather than concentrated in relevant pages.
+    """
+    qt = relevance_tokens(query)
+    top = results[:10]
+    if not qt or not top:
+        # Nothing to judge against. Fail open with a note rather than blocking:
+        # a one-word query after stopword removal is legitimate.
+        return {"checked": False, "pass": True, "coverage": None, "hit_rate": None,
+                "note": "not enough query tokens or results to judge relevance"}
+    blobs = []
+    for r in top:
+        slug = (r.get("url") or "").replace("-", " ").replace("_", " ").replace("/", " ")
+        blobs.append(" ".join([r.get("title") or "", slug, r.get("snippet") or ""]).lower())
+    joined = " ".join(blobs)
+    coverage = sum(1 for t in qt if t in joined) / len(qt)
+    need = max(2, (len(qt) + 1) // 2) if len(qt) >= 2 else 1
+    hit_rate = sum(1 for b in blobs if sum(1 for t in qt if t in b) >= need) / len(blobs)
+    ok = coverage >= MIN_COVERAGE and hit_rate >= MIN_HIT_RATE
+
+    # Two measured FALSE POSITIVES (2026-08-01). Both were on-topic SERPs that
+    # this guard called "results for a different query", which under the quality
+    # bar means the candidate cannot be queued at all - so an over-strict guard
+    # silently deletes exactly the long-tail research a young site depends on.
+    # The failure this guard exists for (Bing answering "self hosted rank
+    # tracker" with Self-brand furniture) is characterised by LOW COVERAGE - it
+    # matched 1 of 4 tokens. Neither exemption below touches that case.
+    verdict_override = None
+
+    # (1) One surviving token cannot discriminate. "foo 1.6 unblocked" reduces to
+    # ["unblocked"], so coverage is a binary "does this exact word appear". The
+    # real page 1 was entirely browser-play results - the RIGHT intent - and
+    # scored 0.0 because no title said "unblocked". Google broadening a
+    # qualifier is not the engine answering a different question, and it is
+    # itself a useful finding: the qualifier has no distinct SERP to win.
+    if not ok and len(qt) == 1 and coverage < MIN_COVERAGE:
+        ok, verdict_override = True, "qualifier_ignored"
+
+    # (2) Full coverage means every distinct query token IS present across the
+    # top 10, which definitionally excludes the wrong-query failure. A low
+    # hit_rate there measures synonym spread, not correctness: "foo 1.6 zombie
+    # mode online" returned Zombie Plague servers, Zombie Escape and zombie-mod
+    # server lists - unmistakably the right SERP - and missed by 0.25 vs 0.30
+    # because titles say "mod"/"servers" rather than "mode"/"online".
+    elif not ok and coverage >= 1.0:
+        ok, verdict_override = True, "low_concentration"
+
+    out = {
+        "checked": True,
+        "pass": ok,
+        "coverage": round(coverage, 3),
+        "hit_rate": round(hit_rate, 3),
+        "query_tokens": qt,
+        "tokens_required_per_result": need,
+        "thresholds": {"coverage": MIN_COVERAGE, "hit_rate": MIN_HIT_RATE},
+        "note": (
+            "results are about the query"
+            if ok and not verdict_override
+            else "THESE RESULTS ARE NOT FOR THIS QUERY - the engine returned a well-formed SERP "
+                 "for something else. Do not score it, do not derive an authority count from it, "
+                 "and do not treat it as an empty page 1. Retry on another provider."
+        ),
+    }
+    if verdict_override == "qualifier_ignored":
+        out["qualifier_ignored"] = True
+        out["note"] = ("PASSED WITH A CAVEAT - the query reduced to one distinctive token and the "
+                       "engine did not honour it, so page 1 is the BROADER query's. Score it, but "
+                       "read the authority count as the broad term's, and treat the qualifier as "
+                       "having no SERP of its own to win.")
+    elif verdict_override == "low_concentration":
+        out["low_concentration"] = True
+        out["note"] = ("PASSED WITH A CAVEAT - every query token appears across page 1 (coverage "
+                       "1.0), so these ARE this query's results; the low hit_rate reflects synonym "
+                       "variation in titles rather than a wrong SERP.")
+    return out
+
+
+def extract_accounted(data: dict) -> str | None:
+    """Why a browser extraction cannot be trusted, or None. Every result
+    heading must be either extracted or skipped for a named reason; a heading
+    that vanished means positions after it are wrong too."""
+    acct = (data or {}).get("accounting")
+    if not isinstance(acct, dict):
+        return None               # an older extractor; nothing to check against
+    got = len((data or {}).get("results") or [])
+    explained = sum(int(acct.get(k) or 0) for k in ("no_link", "search_link", "duplicate_href"))
+    if got + explained != int(acct.get("headings") or 0):
+        return (f"{acct.get('headings')} result headings, {got} extracted, {explained} skipped "
+                f"for a named reason - {int(acct.get('headings') or 0) - got - explained} lost")
+    return None
+
+
+def shape_ok(results: list[dict]) -> bool:
+    return bool(results) and any((r.get("url") or "").startswith("http") for r in results)
+
+
+# A collapse is read as "the leading word explains page 1 and the rest of the
+# query explains none of it". Measured 2026-10-12 through a US residential exit:
+# "best hiking boots" came back as Best Buy plus eight dictionary entries for
+# "best" - lead share 1.0, rest share 0.0 - while "hiking boots for women" in the
+# same session was a clean read. Verb-led queries ("play ...") collapsed to the
+# bare verb's generic SERP (app stores, game portals) 15 of 15 times across
+# US/CA/AU exits. Every collapse measured was onto the LEADING word, so only the
+# leading word is tested: testing any word would flag a legitimate brand SERP
+# whose titles carry the brand and not the generic qualifier after it.
+COLLAPSE_LEAD_SHARE = 0.6
+COLLAPSE_REST_SHARE = 0.2
+
+
+def _word_start(token: str, blob: str) -> bool:
+    # Prefix match at a word start: "self" must hit "selfservice" and "best"
+    # must hit "bestbuy.com" (both measured collapses), but "art" must not hit
+    # "start".
+    return re.search(r"(?<![a-z0-9])" + re.escape(token), blob) is not None
+
+
+def detect_collapse(query: str, results: list[dict]) -> dict:
+    """Did the engine answer only the LEADING word of the query?
+
+    Distinct from a wrong-query read on purpose. Wrong-query is a SERP about
+    something unrelated (measured: a plain request answered with speed tests
+    and prediction markets); a collapse is a SERP about the first word alone.
+    They have different fixes - a collapse often clears by rephrasing so the
+    distinctive noun leads, a wrong-query read does not - so they are named
+    apart rather than both reported as "irrelevant".
+
+    It also closes a hole in verify_relevance: "best boots" reduces to one
+    relevance token, so a page of dictionary entries for "best" scores
+    coverage 0 and is waved through by the qualifier_ignored exemption."""
+    words = []
+    for w in re.findall(r"[a-z0-9]+", (query or "").lower()):
+        if len(w) >= 2 and w not in words:
+            words.append(w)
+    top = results[:10]
+    if len(words) < 2 or not top:
+        return {"checked": False, "collapse": False,
+                "note": "needs at least two query words and one result"}
+    lead = words[0]
+    rest = [w for w in words[1:] if w not in RELEVANCE_STOPWORDS] or words[1:]
+    blobs = []
+    for r in top:
+        slug = (r.get("url") or "").replace("-", " ").replace("_", " ").replace("/", " ")
+        blobs.append(" ".join([r.get("title") or "", slug, r.get("snippet") or ""]).lower())
+    # A result "carries the rest" only with a MAJORITY of the remaining words,
+    # not any one of them. A collapsed SERP still shares generic words with the
+    # query: "play <x> games" collapsed to "play" returns game portals whose
+    # titles say "games", and an any-word rule read that as on-topic.
+    need = len(rest) // 2 + 1
+    lead_share = sum(1 for b in blobs if _word_start(lead, b)) / len(blobs)
+    rest_share = sum(1 for b in blobs
+                     if sum(1 for t in rest if _word_start(t, b)) >= need) / len(blobs)
+    collapse = lead_share >= COLLAPSE_LEAD_SHARE and rest_share <= COLLAPSE_REST_SHARE
+    return {"checked": True, "collapse": collapse, "collapsed_to": lead if collapse else None,
+            "lead_word": lead, "rest_words": rest, "rest_required_per_result": need,
+            "lead_share": round(lead_share, 3), "rest_share": round(rest_share, 3),
+            "thresholds": {"lead_share": COLLAPSE_LEAD_SHARE, "rest_share": COLLAPSE_REST_SHARE}}
+
+
+class SerpRefusal(RuntimeError):
+    """A provider read that must not be scored, with a NAMED reason.
+
+    Two classes, never merged, because they have different next steps:
+      cannot_ask    the engine never answered this query from where we asked
+                    (challenge page, transport error, unconfirmable or wrong
+                    exit, no query echo). Says nothing about the SERP.
+      wrong_answer  the engine answered, and the answer is not this query's
+                    page 1 (wrong_query, query_collapse). A finding about the
+                    ENGINE, still never about the SERP."""
+
+    CANNOT_ASK = {"challenge", "transport", "unparsed", "echo_missing",
+                  "exit_mismatch", "unverified_market"}
+    WRONG_ANSWER = {"wrong_query", "query_collapse"}
+
+    def __init__(self, kind: str, reason: str, **detail):
+        super().__init__(f"{kind}: {reason}")
+        self.kind = kind
+        self.reason = reason
+        self.detail = detail
+
+    def as_dict(self) -> dict:
+        cls = "cannot_ask" if self.kind in self.CANNOT_ASK else "wrong_answer"
+        return {"kind": self.kind, "class": cls, "reason": self.reason, **self.detail}
+
+
+# ------------------------------------------------------------ exit country
+
+
+IP_ECHO_URL = "http://ip-api.com/json/?fields=status,countryCode"
+EXIT_KEYS = ("exit_country", "exit_requested", "exit_unconfirmed", "exit_mismatch", "exit_route")
+
+
+def probe_exit(proxy: Proxy | None) -> str | None:
+    """The country the request ACTUALLY left from, asked over the same sticky
+    session the SERP request uses. None = could not confirm, never a guess.
+
+    A requested country is not an observed one: the pool has been measured
+    answering `fr` with a GB exit 3 of 3 times. Same session token = same exit,
+    so one probe on the session describes the SERP fetch on it."""
+    try:
+        status, body = fetch(IP_ECHO_URL, proxy=proxy, timeout=20)
+        if status != 200:
+            return None
+        d = json.loads(body)
+    except Exception:                                            # noqa: BLE001
+        return None
+    cc = d.get("countryCode") if isinstance(d, dict) and d.get("status") == "success" else None
+    return cc.lower() if isinstance(cc, str) and len(cc) == 2 else None
+
+
+def exit_fields(requested: str | None, observed: str | None, proxied: bool) -> dict:
+    """The exit as reported. An unconfirmed exit is said OUT LOUD - `null` with
+    `exit_unconfirmed: true` - instead of the key silently going missing, which
+    reads as "no country was asked for"."""
+    req = requested.lower() if requested else None
+    return {
+        "exit_country": observed,
+        "exit_requested": req,
+        "exit_unconfirmed": observed is None,
+        "exit_mismatch": bool(req and observed and observed != req),
+        "exit_route": "proxy" if proxied else "direct",
+    }
+
+
+def dedupe_results(results: list[dict], seen: set | None = None) -> tuple[list[dict], int]:
+    """Drop repeated destinations, keeping the first (highest) position.
+
+    Measured on DuckDuckGo: paginating returned positions 11-12 as repeats of
+    1-2, which double-counts a domain in the authority ceiling and inflates
+    "results_seen" past what was really read."""
+    seen = set() if seen is None else seen
+    out, dropped = [], 0
+    for r in results:
+        key = _url_key(r.get("url") or "")
+        if key and key in seen:
+            dropped += 1
+            continue
+        if key:
+            seen.add(key)
+        out.append(r)
+    return out, dropped
+
+
+def _url_key(url: str) -> str:
+    try:
+        p = urllib.parse.urlparse(url.strip())
+    except ValueError:
+        return url.strip()
+    host = (p.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = p.path.rstrip("/") or "/"
+    return f"{host}{path}?{p.query}" if p.query else f"{host}{path}"
+
+
+# --------------------------------------------------------------- providers
+
+
+def provider_ddg(query: str, count: int, *, proxy: Proxy | None = None, **_) -> list[dict]:
+    """DuckDuckGo's no-JS HTML endpoint. Keyless. ~10 results/page.
+
+    Throttling is real and it is NOT an HTTP 429: exhaustion returns HTTP 202
+    with a ~14KB anomaly page. Everything else about it was measured on
+    2026-07-30, and most of it contradicts the obvious guesses:
+
+      - It is NOT per-IP, and a proxy does not rescue it. Six fresh residential
+        exits across six countries (nl se it pl ie cz) all returned 202 in the
+        same minute that a direct request did.
+      - It is NOT the request shape. POST and GET, the full browser header set
+        and a bare User-Agent, html.duckduckgo.com and lite.duckduckgo.com and
+        duckduckgo.com/html - all 202 together.
+      - It IS time-based. The same client got 10 clean results ~20 minutes
+        earlier and again ~40 minutes later.
+
+    So the honest handling is: retry with backoff, rotate the proxy session
+    once in case this instance happens to be exit-scoped, and otherwise fail
+    over to --provider browser, which was verified returning real Google
+    results at the exact moment every HTTP provider was 202-ing.
+    """
+    results: list[dict] = []
+    seen: set = set()
+    dropped_total, pages_read, repeated_page = 0, 0, False
+    backoffs = [4, 10, 25]
+    for page in range(0, max(1, (count + 9) // 10)):
+        body = urllib.parse.urlencode({"q": query, "s": page * 10, "kl": "us-en"})
+        status, text = 0, ""
+        rotated = False
+        for attempt in range(len(backoffs) + 1):
+            status, text = fetch(
+                "https://html.duckduckgo.com/html/", data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded",
+                         "Origin": "https://html.duckduckgo.com",
+                         "Referer": "https://html.duckduckgo.com/"},
+                proxy=proxy,
+            )
+            if status == 200 and "result__a" in text:
+                break
+            # Cheap and occasionally right - but measured NOT to clear the 202,
+            # so it is one attempt, not a strategy.
+            if proxy and not rotated and status in (200, 202, 403, 429):
+                proxy.rotate()
+                rotated = True
+                continue
+            if attempt < len(backoffs):
+                time.sleep(backoffs[attempt])
+        if status != 200 or "result__a" not in text:
+            if not results:
+                hint = ""
+                if status in (200, 202):
+                    hint = (
+                        " - the anomaly page. Measured: this is time-based, not per-IP and not "
+                        "request-shape, so neither a proxy rotation nor a different endpoint "
+                        "clears it"
+                        + (" (a rotation was already tried this call)" if rotated else "")
+                        + ". Use --provider browser, which returns real Google and has been "
+                        "verified working while this endpoint was refusing, or wait it out."
+                    )
+                raise RuntimeError(f"duckduckgo returned HTTP {status}{hint}")
+            break
+        found = re.findall(
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>(.*?)(?=class="result__a"|</html>)',
+            text, re.S,
+        )
+        if not found:
+            break
+        pages_read += 1
+        page_rows = []
+        for href, title_html, tail in found:
+            url = html.unescape(href)
+            m = re.search(r"uddg=([^&]+)", url)
+            if m:
+                url = urllib.parse.unquote(m.group(1))
+            if url.startswith("//"):
+                url = "https:" + url
+            sm = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', tail, re.S)
+            snippet = re.sub(r"<[^>]+>", " ", sm.group(1) if sm else "")
+            snippet = html.unescape(re.sub(r"\s+", " ", snippet)).strip()[:300]
+            page_rows.append({
+                "title": html.unescape(re.sub(r"<[^>]+>", "", title_html)).strip(),
+                "url": url,
+                "snippet": snippet,
+            })
+        fresh, dropped = dedupe_results(page_rows, seen)
+        dropped_total += dropped
+        results.extend(fresh)
+        # A page that is ALL repeats means the endpoint ignored the offset and
+        # served page 1 again; reading further only re-reads the same page.
+        if page_rows and not fresh:
+            repeated_page = True
+            break
+        if len(results) >= count:
+            break
+        time.sleep(1.5)
+
+    # Exit reporting. The proxy may have been rotated above, so this probes the
+    # session the successful page actually came over.
+    requested = proxy.country if proxy else None
+    results_meta.update(exit_fields(requested, probe_exit(proxy), proxy is not None))
+    results_meta["engine"] = "duckduckgo"
+    results_meta["depth"] = {"requested": count, "read": min(len(results), count),
+                             "pages_read": pages_read, "duplicates_dropped": dropped_total,
+                             "pagination_repeated": repeated_page}
+    return results[:count]
+
+
+def provider_serpd(query: str, count: int, *, target=None, gl="us", hl="en", **_) -> list[dict]:
+    """The local SERP daemon (scripts/serpd.py) - real Google, ~1.4s/query.
+
+    Same headed-Chrome route as --provider browser, but the daemon holds the
+    browser open and does the navigate/readiness/extract/score cycle itself, so
+    this is one HTTP call with no DOM in the caller's context. For a whole
+    research run use its /batch endpoint directly rather than looping here:
+    25 queries measured at 37s and 1.4KB of verdicts.
+    """
+    port = os.environ.get("SERPD_PORT", "8791")
+    qs = urllib.parse.urlencode({"q": query, "depth": count, "gl": gl, "hl": hl,
+                                 **({"target": target} if target else {})})
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/serp?{qs}", timeout=120) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            data = json.loads(exc.read())
+        except Exception:
+            raise RuntimeError(f"serpd HTTP {exc.code}")
+        raise RuntimeError(f"serpd: {data.get('error', 'unknown')}")
+    except Exception:
+        raise RuntimeError(
+            f"serpd is not running on 127.0.0.1:{port}. Start it with: "
+            "python3 scripts/serpd.py --start"
+        )
+    if not data.get("ok"):
+        raise RuntimeError(f"serpd: {data.get('error', 'unknown')}")
+    if data.get("ai_overview"):
+        results_meta["ai_overview"] = data["ai_overview"]
+    return data.get("results", [])[:count]
+
+
+def provider_searxng(query: str, count: int, *, instance=None, proxy=None, **_) -> list[dict]:
+    base = (instance or os.environ.get("SEARXNG_URL") or "").rstrip("/")
+    if not base:
+        raise RuntimeError("searxng needs --instance https://your-searxng or SEARXNG_URL")
+    qs = urllib.parse.urlencode({"q": query, "format": "json", "engines": "google,bing,duckduckgo", "language": "en"})
+    status, text = fetch(f"{base}/search?{qs}", proxy=proxy)
+    if status != 200:
+        raise RuntimeError(f"searxng returned HTTP {status}: {text[:160]}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        raise RuntimeError("searxng did not return JSON - is the json format enabled in settings.yml?")
+    return [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": (r.get("content") or "")[:300]}
+            for r in data.get("results", [])[:count]]
+
+
+def provider_brave(query: str, count: int, *, proxy=None, **_) -> list[dict]:
+    key = read_key("BRAVE_SEARCH_API_KEY", "~/.brave_search_key")
+    if not key:
+        raise RuntimeError("brave needs BRAVE_SEARCH_API_KEY (usage-billed; a key requires a card-backed subscription)")
+    qs = urllib.parse.urlencode({"q": query, "count": min(count, 20), "country": "us", "search_lang": "en"})
+    status, text = fetch(f"https://api.search.brave.com/res/v1/web/search?{qs}",
+                         headers={"Accept": "application/json", "X-Subscription-Token": key}, proxy=proxy)
+    if status != 200:
+        raise RuntimeError(f"brave returned HTTP {status}: {text[:160]}")
+    data = json.loads(text)
+    return [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": (r.get("description") or "")[:300]}
+            for r in (data.get("web", {}).get("results") or [])[:count]]
+
+
+def read_key(env_name: str, path: str) -> str:
+    """Env first, then a chmod-600 dotfile. Never a committed file.
+
+    The dotfile fallback exists so a key survives a new shell without anyone
+    being tempted to put it in a repo or a shell profile that gets committed.
+    """
+    val = os.environ.get(env_name, "").strip()
+    if val:
+        return val
+    try:
+        p = os.path.expanduser(path)
+        if os.path.isfile(p):
+            return open(p).read().strip()
+    except OSError:
+        pass
+    return ""
+
+
+def provider_serper(query: str, count: int, *, gl="us", hl="en", proxy=None, **_) -> list[dict]:
+    """Serper.dev - real Google, 1 credit per search, 2500 free credits.
+
+    Cheapest real-Google option per query and the fastest to set up, so it sits
+    above serpapi in the fallback order. It does NOT do top-100 in one credit
+    the way serpapi does; `num` is capped at 100 but deep pages cost more.
+    """
+    key = read_key("SERPER_API_KEY", "~/.serper_key")
+    if not key:
+        raise RuntimeError("serper needs SERPER_API_KEY (or ~/.serper_key)")
+    payload = json.dumps({"q": query, "num": min(count, 100), "gl": gl, "hl": hl})
+    status, text = fetch("https://google.serper.dev/search", data=payload,
+                         headers={"X-API-KEY": key, "Content-Type": "application/json"},
+                         timeout=45, proxy=proxy)
+    if status != 200:
+        raise RuntimeError(f"serper returned HTTP {status}: {text[:160]}")
+    data = json.loads(text)
+    if data.get("message") and not data.get("organic"):
+        raise RuntimeError(f"serper: {data['message']}")
+    results = [{"title": r.get("title", ""), "url": r.get("link", ""),
+                "snippet": (r.get("snippet") or "")[:300], "position": r.get("position")}
+               for r in (data.get("organic") or [])[:count]]
+    # Serper exposes the AI Overview as `answerBox`/`aiOverview` depending on
+    # the SERP. Record presence either way - the authority gate reads it.
+    ai = data.get("aiOverview") or data.get("answerBox")
+    if ai:
+        refs = ai.get("references") or ai.get("sources") or []
+        results_meta["ai_overview"] = {
+            "present": True,
+            "references": [{"domain": host_of(r.get("link", "")), "url": r.get("link"),
+                            "title": r.get("title")} for r in refs if isinstance(r, dict)],
+        }
+    return results
+
+
+def provider_serpapi(query: str, count: int, *, gl="us", hl="en", proxy=None, **_) -> list[dict]:
+    key = read_key("SERPAPI_KEY", "~/.serpapi_key")
+    if not key:
+        raise RuntimeError("serpapi needs SERPAPI_KEY (or ~/.serpapi_key)")
+    qs = urllib.parse.urlencode({"engine": "google", "q": query, "num": min(count, 100),
+                                 "gl": gl, "hl": hl, "api_key": key})
+    status, text = fetch(f"https://serpapi.com/search.json?{qs}", timeout=45, proxy=proxy)
+    if status != 200:
+        raise RuntimeError(f"serpapi returned HTTP {status}: {text[:160]}")
+    data = json.loads(text)
+    if data.get("error"):
+        raise RuntimeError(f"serpapi: {data['error']}")
+    results = [{"title": r.get("title", ""), "url": r.get("link", ""),
+                "snippet": (r.get("snippet") or "")[:300], "position": r.get("position")}
+               for r in (data.get("organic_results") or [])[:count]]
+    ai = data.get("ai_overview")
+    if ai:
+        # ⚠ SerpApi returns the AI Overview in TWO STAGES. The first response
+        # carries only `page_token` + `serpapi_link`; `references` and
+        # `text_blocks` are absent until that link is followed. Reading
+        # references off the first response therefore always yielded [], so
+        # `present: true, references: []` was reported for every AI Overview on
+        # earth - and any "are we cited by AI" reading built on it answers no,
+        # forever, with no error anywhere. Measured 2026-09-01: the follow-up
+        # call for a "how to play <game> in browser" query returned 7
+        # references and 1,450 characters of text.
+        refs = ai.get("references") or []
+        if not refs and ai.get("serpapi_link"):
+            try:
+                st2, t2 = fetch(f"{ai['serpapi_link']}&api_key={key}", timeout=45, proxy=proxy)
+                if st2 == 200:
+                    ai2 = (json.loads(t2) or {}).get("ai_overview") or {}
+                    refs = ai2.get("references") or []
+            except Exception:
+                refs = []                      # a failed follow-up is not "no citations"
+        results_meta["ai_overview"] = {
+            "present": True,
+            "references": [{"domain": host_of(r.get("link", "")), "url": r.get("link"),
+                            "title": r.get("title") or r.get("source")}
+                           for r in refs],
+            "references_resolved": bool(refs),
+            "note": ("references_resolved:false means the second-stage fetch did not "
+                     "run or failed - that is UNKNOWN citation, never zero citations"),
+        }
+    return results
+
+
+def provider_dataforseo(query: str, count: int, *, gl=2840, hl="en", proxy=None, **_) -> list[dict]:
+    login = os.environ.get("DATAFORSEO_LOGIN", "")
+    password = os.environ.get("DATAFORSEO_PASSWORD", "")
+    if not (login and password):
+        raise RuntimeError("dataforseo needs DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD")
+    auth = base64.b64encode(f"{login}:{password}".encode()).decode()
+    loc = int(gl) if str(gl).isdigit() else 2840
+    payload = json.dumps([{"keyword": query, "location_code": loc, "language_code": hl, "depth": min(count, 100)}])
+    status, text = fetch("https://api.dataforseo.com/v3/serp/google/organic/live/advanced", data=payload,
+                         headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+                         timeout=60, proxy=proxy)
+    if status != 200:
+        raise RuntimeError(f"dataforseo returned HTTP {status}: {text[:160]}")
+    data = json.loads(text)
+    try:
+        items = data["tasks"][0]["result"][0]["items"] or []
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"dataforseo returned no results: {text[:200]}")
+    results = []
+    for it in items:
+        if it.get("type") == "ai_overview":
+            results_meta["ai_overview"] = {"present": True, "references": []}
+            continue
+        if it.get("type") != "organic":
+            continue
+        results.append({"title": it.get("title", ""), "url": it.get("url", ""),
+                        "snippet": (it.get("description") or "")[:300], "position": it.get("rank_absolute")})
+    return results[:count]
+
+
+# -------------------------------------------------------------------- bing
+
+
+BING_URL = "https://www.bing.com/search"
+
+# Challenge markers. "One last step" is what Bing served the headed Chrome
+# (2026-10-12). The bare word "challenge" is deliberately NOT a marker: it
+# occurs 3 times in the inline JS of every normal results page measured.
+BING_CHALLENGE_TITLE = re.compile(r"one last step", re.I)
+BING_CHALLENGE_MARKERS = ("one last step", "please solve the challenge", "b_captcha",
+                          "verify you are human", "unusual traffic")
+
+# Tracking parameter Bing appends to some decoded destinations (measured on
+# retailer category pages). It is per-session, so leaving it in makes the same
+# page two different URLs across reads.
+BING_TRACKING_PARAMS = {"msockid"}
+
+# Class attributes, not substrings: `_G.adc:"b_ad"` and `"b_adTop"` occur in
+# the inline JS of a page with no ads at all.
+BING_AD_RE = re.compile(r'class="[^"]*\b(b_ad|b_adTop|b_adBottom|b_adSlug|sb_add)\b')
+BING_LI_RE = re.compile(r'<li class="(b_[A-Za-z_]+)')
+BING_NOT_MODULES = {"b_algo", "b_pag"}
+
+
+def unwrap_bing(href: str) -> tuple[str, bool]:
+    """Bing's click wrapper -> the real destination. Returns (url, resolved).
+
+    Every organic link is `https://www.bing.com/ck/a?...&u=a1<base64>`: the
+    `a1` prefix then URL-safe base64 with the '=' padding STRIPPED (measured:
+    of 190 wrapped links, 139 had a length that is not a multiple of 4). An
+    unwrapped read reports every result as bing.com, and the authority gate
+    then scores the wrapper - the same trap Google's /url?q= set."""
+    url = html.unescape(href or "").strip()
+    try:
+        p = urllib.parse.urlparse(url)
+    except ValueError:
+        return url, False
+    host = (p.hostname or "").lower()
+    if not (host == "bing.com" or host.endswith(".bing.com")):
+        return _strip_tracking(url), True
+    if not p.path.startswith("/ck/"):
+        return url, False
+    u = urllib.parse.parse_qs(p.query).get("u", [""])[0]
+    if not u.startswith("a1"):
+        return url, False
+    raw = u[2:]
+    try:
+        dec = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+    except Exception:                                            # noqa: BLE001
+        return url, False
+    if not dec.lower().startswith(("http://", "https://")):
+        return url, False
+    return _strip_tracking(dec), True
+
+
+def _strip_tracking(url: str) -> str:
+    try:
+        p = urllib.parse.urlparse(url)
+    except ValueError:
+        return url
+    if not p.query:
+        return url
+    kept = [(k, v) for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+            if k.lower() not in BING_TRACKING_PARAMS]
+    return urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(kept)))
+
+
+def _text(fragment: str) -> str:
+    return html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", fragment or ""))).strip()
+
+
+def parse_bing(page: str) -> dict:
+    """Parse one Bing results page. Pure: no network, so the control and the
+    tests drive exactly the code a live read runs."""
+    text = page or ""
+    tm = re.search(r"<title>(.*?)</title>", text, re.S | re.I)
+    title = _text(tm.group(1)) if tm else None
+    echo = None
+    inp = re.search(r'<input[^>]*\bid="sb_form_q"[^>]*>', text, re.S)
+    if inp:
+        vm = re.search(r'\bvalue="([^"]*)"', inp.group(0))
+        echo = html.unescape(vm.group(1)) if vm else ""
+
+    results = []
+    starts = [m.start() for m in re.finditer(r'<li class="b_algo\b', text)]
+    for i, s in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        block = text[s:end]
+        # A block can run on into the pagination / sidebar after the last
+        # result; cut at the list's end so their text is not read as a snippet.
+        cut = block.find("</ol>")
+        if cut > 0:
+            block = block[:cut]
+        h2 = re.search(r"<h2[^>]*>(.*?)</h2>", block, re.S)
+        if not h2:
+            continue
+        a = re.search(r'<a\b[^>]*\bhref="([^"]+)"[^>]*>(.*?)</a>', h2.group(1), re.S)
+        if not a:
+            continue
+        url, resolved = unwrap_bing(a.group(1))
+        sm = (re.search(r'<div class="b_caption[^"]*"[^>]*>.*?<p[^>]*>(.*?)</p>', block, re.S)
+              or re.search(r"<p[^>]*>(.*?)</p>", block, re.S))
+        row = {"position": len(results) + 1, "title": _text(a.group(2)), "url": url,
+               "snippet": _text(sm.group(1))[:300] if sm else ""}
+        if not resolved:
+            row["unresolved_wrapper"] = True
+        results.append(row)
+
+    low = text.lower()
+    markers = [m for m in BING_CHALLENGE_MARKERS if m in low]
+    challenge = None
+    if title and BING_CHALLENGE_TITLE.search(title):
+        challenge = "title: " + title
+    elif not results and markers:
+        challenge = "marker: " + markers[0]
+
+    ads = sorted(set(BING_AD_RE.findall(text)))
+    # Every b_ad* class belongs to the ad block (a real ad nests
+    # <li class="b_adLastChild"> inside it), so none of them is a module.
+    modules = sorted({c for c in BING_LI_RE.findall(text)
+                      if c not in BING_NOT_MODULES and not c.startswith("b_ad")})
+    return {"title": title, "echo": echo, "results": results,
+            "organic_count": len(results), "challenge": challenge,
+            "ads_detected": bool(ads), "ad_markers": ads, "modules_detected": modules}
+
+
+def _norm_q(s: str | None) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def bing_guard(query: str, parsed: dict) -> dict:
+    """Decide whether a parsed Bing page may be scored. Returns
+    {"refused": False, ...} or {"refused": True, "kind": ..., "reason": ...}.
+
+    Order matters: each check assumes the ones before it passed. A challenge
+    page has no echo and no results, and must be reported as a challenge, not
+    as "missing echo" or "no results"."""
+    if parsed.get("challenge"):
+        return {"refused": True, "kind": "challenge",
+                "reason": (f"Bing served a challenge page ({parsed['challenge']}) - the engine never "
+                           "answered. Cannot ask from this exit; rotate the session or use another "
+                           "provider. Never an empty page 1.")}
+    if not parsed.get("results"):
+        return {"refused": True, "kind": "unparsed",
+                "reason": ("HTTP 200 with no li.b_algo results and no challenge marker - a page "
+                           "this parser does not recognise. A failed read, never an empty SERP."),
+                "title": parsed.get("title")}
+
+    q = _norm_q(query)
+    echo = parsed.get("echo")
+    if echo is not None:
+        if _norm_q(echo) != q:
+            return {"refused": True, "kind": "wrong_query",
+                    "reason": f"the search box says Bing answered {echo!r}, not {query!r}",
+                    "echo_mismatch": True, "answered": echo}
+        echo_source = "searchbox"
+    elif parsed.get("title") and _norm_q(parsed["title"]).startswith(q):
+        echo_source = "title"
+    else:
+        return {"refused": True, "kind": "echo_missing",
+                "reason": ("no query echo (search box value or title) - nothing on the page says "
+                           "which query these results answer, so they cannot be attributed to it"),
+                "title": parsed.get("title")}
+
+    rows = parsed["results"]
+    col = detect_collapse(query, rows)
+    if col.get("collapse"):
+        return {"refused": True, "kind": "query_collapse",
+                "reason": (f"Bing answered the leading word {col['collapsed_to']!r} alone "
+                           f"(lead share {col['lead_share']}, rest share {col['rest_share']}). The echo "
+                           "is intact, so this is the ENGINE collapsing the query, not a wrong fetch. "
+                           "Not this query's page 1."),
+                "collapse": col, "echo_source": echo_source,
+                "observed_titles": [r.get("title") for r in rows[:5]]}
+    rel = verify_relevance(query, rows)
+    if not rel["pass"]:
+        return {"refused": True, "kind": "wrong_query",
+                "reason": (f"results are not about the query (coverage {rel['coverage']}, hit_rate "
+                           f"{rel['hit_rate']}) although the echo matches - Bing returned a "
+                           "well-formed SERP for something else"),
+                "relevance": rel, "collapse": col, "echo_source": echo_source,
+                "observed_titles": [r.get("title") for r in rows[:5]]}
+    return {"refused": False, "echo_source": echo_source, "relevance": rel, "collapse": col}
+
+
+# Bing answers some residential exits with a degraded page for the SAME
+# request: measured 2026-10-31, a verb-led query through 7 fresh sessions
+# (us x3, gb, de, ca, fi) collapsed or answered another query on 6 and was
+# correct on 1, while the identical curl from a non-proxy IP was correct, cold
+# or cookie-warmed, and URL variants (mkt=, form=, qs=) changed nothing. The
+# refusal belongs to the exit, so it is retried on a new exit in the SAME
+# market; every attempt re-confirms its exit and passes the same guard.
+# Parser refusals (unparsed, echo_missing) reproduce on any exit and are not
+# retried. unverified_market is refused before this loop.
+BING_PER_EXIT_KINDS = {"challenge", "transport", "exit_mismatch", "query_collapse", "wrong_query"}
+BING_EXIT_ATTEMPTS = 8
+
+
+def _bing_attempt(query: str, market: str, proxy: Proxy | None, hl: str) -> tuple[dict, dict, dict]:
+    """One read from one exit: confirm the exit, fetch, parse, guard. Returns
+    (parsed, verdict, exit fields) or raises SerpRefusal carrying the exit."""
+    observed = probe_exit(proxy)
+    ex = exit_fields(market if proxy else None, observed, proxy is not None)
+    results_meta.update(ex)
+    results_meta["engine"] = "bing"
+    if ex["exit_mismatch"]:
+        raise SerpRefusal("exit_mismatch",
+                          f"asked for a {market.upper()} exit and the session left from "
+                          f"{observed.upper()} - a SERP read here would be silently from the "
+                          "wrong country", exit_country=observed, exit_requested=market)
+
+    url = BING_URL + "?" + urllib.parse.urlencode({"q": query, "cc": market.upper(), "setlang": hl})
+    status, text = fetch(url, proxy=proxy, timeout=40)
+    if status != 200:
+        raise SerpRefusal("transport", f"bing returned HTTP {status}" + (f" ({text[:80]})" if status == 0 else ""),
+                          http_status=status, **ex)
+    parsed = parse_bing(text)
+    verdict = bing_guard(query, parsed)
+    if verdict["refused"]:
+        detail = {k: v for k, v in verdict.items() if k not in ("refused", "kind", "reason")}
+        raise SerpRefusal(verdict["kind"], verdict["reason"], bytes=len(text),
+                          organic_count=parsed["organic_count"], **ex, **detail)
+    return parsed, verdict, ex
+
+
+def provider_bing(query: str, count: int, *, proxy: Proxy | None = None, gl="us", hl="en",
+                  **_) -> list[dict]:
+    """Bing's HTML results page. Opt-in; see the module docstring for why it is
+    not in the default failover.
+
+    Measured 2026-10-12, and each fact is a guard below:
+      - a DIRECT request (no proxy) returned ten well-formed results for an
+        unrelated query, echo intact -> the topical-overlap guard;
+      - a headed Chrome got the "One last step" challenge -> challenge guard;
+      - through the residential proxy with a FIXED exit it answered correctly
+        for some queries -> the exit is pinned to the market and confirmed;
+      - leading-word collapse (bare verb / "best") -> detect_collapse;
+      - `first=11` and `count=30` were both ignored (page 1 served again, ten
+        rows) -> exactly one page is read and depth says so.
+    Measured 2026-10-31: the degraded answer belongs to the EXIT, not the
+    request -> a per-exit refusal is retried on a new exit in the same market
+    (BING_EXIT_ATTEMPTS), and `bing.attempts` lists every exit tried.
+    """
+    market = ((proxy.country if proxy and proxy.country else gl) or "us").lower()
+    if proxy is not None:
+        if market not in VERIFIED_COUNTRIES:
+            raise SerpRefusal("unverified_market",
+                              f"market {market!r} is not a verified exit country, so the exit "
+                              "cannot be pinned to it", verified_pool=VERIFIED_COUNTRIES)
+        if proxy.country != market:
+            # Pin a fixed exit in the market asked for. An unpinned session
+            # lands wherever the pool puts it, and `cc=` then disagrees with
+            # the IP Bing actually sees.
+            proxy = Proxy(proxy.base, country=market)
+
+    attempts: list[dict] = []
+    max_attempts = BING_EXIT_ATTEMPTS if proxy is not None else 1
+    first_refusal: SerpRefusal | None = None
+    answer_refusal: SerpRefusal | None = None
+    parsed = verdict = None
+    for n in range(max_attempts):
+        if n:
+            proxy.rotate()
+        session = proxy.session if proxy is not None else None
+        try:
+            parsed, verdict, ex = _bing_attempt(query, market, proxy, hl)
+        except SerpRefusal as exc:
+            attempts.append({"session": session, "exit_country": exc.detail.get("exit_country"),
+                             "kind": exc.kind})
+            first_refusal = first_refusal or exc
+            if exc.kind in SerpRefusal.WRONG_ANSWER:
+                answer_refusal = answer_refusal or exc
+            if exc.kind not in BING_PER_EXIT_KINDS:
+                break
+            continue
+        attempts.append({"session": session, "exit_country": ex.get("exit_country"), "kind": "ok"})
+        results_meta.update(ex)
+        if proxy is not None:
+            # The top-level `proxy` label describes the session main() built, which
+            # is unpinned ("auto") unless --proxy-country was given. This one is the
+            # session the read actually went over.
+            results_meta["proxy_pinned"] = proxy.label()
+        break
+
+    if verdict is None:
+        # An engine that ANSWERED (wrong) on some exit says more than a
+        # transport error on another, so it names the refusal.
+        final = answer_refusal or first_refusal
+        refused = sum(1 for a in attempts if a["kind"] != "ok")
+        raise SerpRefusal(final.kind, f"{final.reason} [{refused} of {len(attempts)} exits refused]",
+                          **{**final.detail, "attempts": attempts})
+
+    rows = parsed["results"]
+    results_meta["depth"] = {
+        "requested": count, "read": min(len(rows), count), "pages_read": 1,
+        "note": ("ONE page is read. Measured: Bing ignored first=11 (served page 1 again) and "
+                 "count=30 (ten rows), so asking for more cannot get more from this route. "
+                 "Never report depth beyond `read`."),
+    }
+    results_meta["bing"] = {
+        "organic_count": parsed["organic_count"],
+        "ads_detected": parsed["ads_detected"], "ad_markers": parsed["ad_markers"],
+        "modules_detected": parsed["modules_detected"],
+        "echo_source": verdict["echo_source"],
+        "market": market,
+        "attempts": attempts,
+        "detection_note": ("ads/modules are MARKER-based. `false` / [] means none of the known class "
+                           "markers matched, not that the page had none."),
+    }
+    return rows[:count]
+
+
+ENGINES = {"ddg": "duckduckgo", "serpd": "google", "browser": "google", "serper": "google",
+           "serpapi": "google", "dataforseo": "google", "brave": "brave",
+           "searxng": "searxng (aggregate)", "bing": "bing"}
+
+
+PROVIDERS = {
+    "bing": provider_bing,
+    "serpd": provider_serpd,
+    "ddg": provider_ddg,
+    "searxng": provider_searxng,
+    "brave": provider_brave,
+    "serper": provider_serper,
+    "serpapi": provider_serpapi,
+    "dataforseo": provider_dataforseo,
+}
+
+
+# -------------------------------------------------------- browser handoff
+
+
+# Readiness trichotomy, ported from veikkaus-browser/scripts/wait-cloudflare.js.
+# The distinction that matters: "challenging" (a real challenge is up) is not
+# the same as "short" (the page simply has not hydrated). Collapsing them is
+# what produced 40 false "blocked" verdicts in one recorded batch.
+BROWSER_READY = r"""(function(){
+  var t=document.body?document.body.innerText:'';
+  var markers=['Performing security verification','Just a moment','Checking your browser',
+               'Verify you are human','Verifying you are human','cf-please-wait','needs to review the security'];
+  for(var i=0;i<markers.length;i++){ if(t.indexOf(markers[i])>=0)
+    return JSON.stringify({status:'challenging',marker:markers[i]}); }
+  if(t.indexOf('Ray ID:')>=0 && t.length<600)
+    return JSON.stringify({status:'challenging',marker:'cf:ray-id-interstitial'});
+  // Hard fail: Turnstile already fingerprinted and REJECTED this browser. It
+  // renders a feedback report, never a checkbox, so clicking can only time out.
+  var fr=document.querySelector('iframe[src*="/auto/failure"],iframe[src*="cf-turnstile-feedback"]');
+  if(fr) return JSON.stringify({status:'hard-fail',marker:'turnstile-rejected',
+    hint:'fingerprint rejected - retrying is futile, change approach (new profile, proxy, or another provider)'});
+  // Deliberately NOT hard-fail. Measured: a query that returned /sorry during a
+  // 6-wide burst returned 8 clean results on its own 20s later. Conflating a
+  // transient IP rate-limit with a terminal fingerprint rejection throws away
+  // work that a short backoff would have got.
+  // Google's EU consent interstitial: no results until a button is pressed.
+  // Waiting on it reads as "never became ready" after every retry.
+  if(/consent\.google\./.test(location.hostname) ||
+     document.querySelector('form[action*="consent.google"]') ||
+     /Before you continue to Google|Bevor Sie zu Google weitergehen|Avant d'acc\u00e9der \u00e0 Google/i.test(t))
+    return JSON.stringify({status:'consent',marker:'google-consent-wall',
+      hint:'answer the consent page once in this profile (or set the CONSENT/SOCS cookie), then retry'});
+  if(/sorry\/index|unusual traffic from your computer/i.test(t))
+    return JSON.stringify({status:'rate-limited',marker:'google-sorry',
+      hint:'transient IP rate limit from bursting - back off and retry, do not treat as blocked'});
+  // Wait for the DATA, not for page chrome that loads regardless.
+  if(document.querySelectorAll('a h3').length>0)
+    return JSON.stringify({status:'ready',len:t.length,results:document.querySelectorAll('a h3').length});
+  if(t.length<1000) return JSON.stringify({status:'short',len:t.length,sample:t.substring(0,150)});
+  return JSON.stringify({status:'short',len:t.length,sample:t.substring(0,150),
+    note:'body is substantial but no result headings yet'});
+})()"""
+
+BROWSER_EXTRACT = r"""(function(){
+  var seen={}, out=[];
+  var hs=document.querySelectorAll('a h3');
+  // Every heading is accounted for: extracted, or skipped for a NAMED reason.
+  // serp.extract_accounted() refuses a read where the two do not add up.
+  var acct={headings:hs.length,no_link:0,search_link:0,duplicate_href:0};
+  for(var i=0;i<hs.length;i++){
+    var h=hs[i], a=h.closest('a'); if(!a||!a.href){acct.no_link++; continue;}
+    var href=a.href;
+    var u=a.href;
+    // Google wraps destinations two different ways and BOTH must be unwrapped,
+    // or every result reports its domain as google.com and the authority gate
+    // silently scores the wrapper instead of page 1.
+    //  1. /url?q=<real url>      - decodable here.
+    //  2. /goto?url=<protobuf>   - NOT decodable client-side; fall back to the
+    //     visible <cite>, which still shows the real host.
+    try{
+      var pu=new URL(u, location.href);
+      var gh=/(^|\.)google\.[a-z.]+$/.test(pu.hostname);
+      if(gh && /^\/(url|imgres)$/.test(pu.pathname)){
+        var q=pu.searchParams.get('q')||pu.searchParams.get('url');
+        if(q && /^https?:/i.test(q)){ u=q; pu=new URL(u); gh=false; }
+      }
+      if(gh){
+        var cbox=a.closest('div.g')||a.closest('div[data-hveid]')||a.parentElement;
+        var cite=cbox?cbox.querySelector('cite'):null;
+        var ct=cite?(cite.textContent||'').trim():'';
+        if(ct){
+          ct=ct.replace(/^https?:\/\//i,'').split(/[\s\u203a\u00bb\/?#]/)[0].toLowerCase();
+          // Must actually LOOK like a hostname. Video/social blocks put things
+          // like '10.2k+' in the same slot, and an unvalidated grab turns a
+          // view count into a page-1 'domain'.
+          if(/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(ct) && !/google\./.test(ct)) u='https://'+ct+'/';
+        }
+        // Video / discussion blocks (measured 2026-09-14) put "9.4K+ views ·
+        // 8 months ago" in <cite> and carry the SOURCE as a text label two
+        // lines under the title: "YouTube · LunchAndVR", "Reddit · r/OculusQuest",
+        // "SideQuest", "AllKeyShop.com". Without this, every such result reported
+        // google.com and the authority ceiling counted the wrapper 4-7 times.
+        if(/google\./.test(new URL(u,location.href).hostname) && cbox){
+          var brands={youtube:'youtube.com',reddit:'reddit.com',facebook:'facebook.com',tiktok:'tiktok.com',
+                      instagram:'instagram.com',x:'x.com',twitter:'x.com',quora:'quora.com',linkedin:'linkedin.com',
+                      'steam community':'steamcommunity.com',github:'github.com',sidequest:'sidequestvr.com',
+                      medium:'medium.com',pinterest:'pinterest.com',threads:'threads.net',bluesky:'bsky.app'};
+          var ls=(cbox.innerText||'').split('\n').map(function(x){return x.trim()}).filter(Boolean);
+          var lab='';
+          for(var j=1;j<Math.min(ls.length,4)&&!lab;j++){
+            var cand=ls[j].split(/\s[\u00b7\u203a\u00bb|]\s/)[0].trim();
+            if(!cand||/views|comments|ago|^\d/.test(cand)) continue;
+            var key=cand.toLowerCase();
+            if(brands[key]) lab=brands[key];
+            else if(/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(key) && !/google\./.test(key)) lab=key;
+          }
+          if(!lab){
+            var mh=(cbox.innerHTML||'').match(/\b(youtube\.com|reddit\.com|facebook\.com|tiktok\.com|instagram\.com)\b/);
+            if(mh) lab=mh[1];
+          }
+          if(lab) u='https://'+lab+'/';
+        }
+      }
+    }catch(e){}
+    var unresolved=/(^|\.)google\.[a-z.]+$/.test((function(){try{return new URL(u,location.href).hostname}catch(e){return ''}})());
+    // Dedupe on the ANCHOR's href, never on the resolved URL: two /goto-
+    // wrapped threads on one site both fall back to 'https://reddit.com/',
+    // and deduping on that merged them - dropping a real result and moving
+    // every later position up by one (measured on openserp's fixture).
+    if(seen[href]){acct.duplicate_href++; continue;}
+    if(/google\.[a-z.]+\/(search|preferences|advanced)/.test(u)){acct.search_link++; continue;}
+    seen[href]=1;
+    var box=a.closest('div.g')||a.closest('div[data-hveid]')||a.parentElement;
+    var snip='';
+    if(box){ var lines=(box.innerText||'').split('\n'); lines.shift(); snip=lines.join(' ').slice(0,240); }
+    out.push({position:out.length+1,title:h.textContent.trim(),url:u,snippet:snip,unresolved_wrapper:unresolved||undefined});
+  }
+  var body=document.body.innerText;
+  var q0=(new URLSearchParams(location.search).get('q')||'').toLowerCase();
+  var paa=[], pseen={};
+  document.querySelectorAll('[data-q]').forEach(function(e){
+    var q=(e.getAttribute('data-q')||'').trim();
+    // The search box carries data-q too and hands the query straight back.
+    if(!q||pseen[q]||q.toLowerCase()===q0) return;
+    pseen[q]=1; paa.push(q); });
+  return JSON.stringify({
+    query:new URLSearchParams(location.search).get('q'),
+    provider:'browser-google',
+    ai_overview:{present:/AI Overview|AI-powered overview/i.test(body),references:[]},
+    people_also_ask:paa.slice(0,10),
+    accounting:acct,
+    results:out
+  });
+})()"""
+
+# IANA timezone + locale per verified proxy exit country, so the browser's
+# fingerprint agrees with where its traffic appears to come from. This is
+# COHERENCE, not disguise: a UA claiming Chrome-on-Windows from a German exit
+# with an America/New_York clock is more suspicious than no override at all.
+COUNTRY_FINGERPRINT = {
+    "de": ("de_DE", "Europe/Berlin"), "nl": ("nl_NL", "Europe/Amsterdam"),
+    "se": ("sv_SE", "Europe/Stockholm"), "it": ("it_IT", "Europe/Rome"),
+    "es": ("es_ES", "Europe/Madrid"), "pl": ("pl_PL", "Europe/Warsaw"),
+    "ro": ("ro_RO", "Europe/Bucharest"), "pt": ("pt_PT", "Europe/Lisbon"),
+    "be": ("nl_BE", "Europe/Brussels"), "at": ("de_AT", "Europe/Vienna"),
+    "cz": ("cs_CZ", "Europe/Prague"), "dk": ("da_DK", "Europe/Copenhagen"),
+    "ie": ("en_IE", "Europe/Dublin"), "ch": ("de_CH", "Europe/Zurich"),
+    "gr": ("el_GR", "Europe/Athens"),
+}
+
+
+def browser_handoff(query: str, count: int, gl: str, hl: str, proxy: Proxy | None) -> dict:
+    url = "https://www.google.com/search?" + urllib.parse.urlencode(
+        {"q": query, "num": min(count, 30), "hl": hl, "gl": gl, "pws": "0"}
+    )
+    start = {
+        "headless": False,
+        "low_memory": False,
+        "user_data_dir": "/tmp/seo-serp-profile",
+        "window_size": "1440x900",
+    }
+    steps = [
+        "mcp__browser__get_browser_status - reuse a running browser rather than restarting it",
+        f"mcp__browser__start_browser({json.dumps(start)[1:-1]}) if not already running",
+    ]
+    if proxy:
+        start["proxy"] = "<SEO_PROXY_URL with the session selector - read it from the env, never paste it here>"
+        cc = proxy.country
+        fp = COUNTRY_FINGERPRINT.get(cc or "")
+        if fp:
+            steps.append(f"mcp__browser__set_locale(locale={fp[0]!r}) then "
+                         f"mcp__browser__set_timezone(timezone_id={fp[1]!r}) - match the proxy's exit country")
+    steps += [
+        f"mcp__browser__navigate(url={url!r})",
+        "mcp__browser__execute_js(script=<readiness_script>) -> parse the JSON status",
+        "  status 'ready'      -> run <extract_script>",
+        "  status 'short'      -> mcp__browser__wait(8), re-run readiness (up to 3 times)",
+        "  status 'challenging'-> mcp__browser__wait(8), re-run readiness (up to 3 times), then "
+        "ONE mcp__browser__reload_page, then 3 more polls before declaring blocked",
+        "  status 'hard-fail'  -> STOP polling. The fingerprint was rejected; clicking cannot fix it. "
+        "Rotate the proxy session, use a fresh user_data_dir, or switch provider.",
+        "mcp__browser__execute_js(script=<extract_script>)",
+        "pipe the returned JSON back: serp.py --score-json - (runs the relevance + weakness scoring)",
+    ]
+    return {
+        "ok": True,
+        "provider": "browser",
+        "action_required": "drive the browser MCP yourself - this script cannot call MCP tools",
+        "why_browser": (
+            "Google serves a JS-only shell to every HTTP client - measured 2026-07-30 at 200/~90KB "
+            "with zero <h3> and zero result links, direct AND through a residential proxy, and with "
+            "a Googlebot UA. The browser is the only route to real Google results."
+        ),
+        "start_browser_args": start,
+        "critical": [
+            "headless MUST be false: in --headless=new a Turnstile challenge is unsolvable, while a "
+            "headed browser often loads the same page with no challenge at all.",
+            "low_memory MUST be false: its flags (software WebGL, --disable-gpu) are themselves a "
+            "bot signal, and bypass_cloudflare has been measured timing out under it and solving "
+            "without it.",
+            "keep the persistent user_data_dir so cookies and any challenge clearance survive runs. "
+            "Verified by ps: this launches real /bin/google-chrome with NO --headless flag, on the "
+            "Xvfb display, with uBlock already side-loaded by the MCP - the same shape the "
+            "veikkaus-browser skill uses.",
+            "never blank the User-Agent - an empty override is MORE fingerprintable than the real one. "
+            "Only align locale/timezone, and only to match the proxy's exit country.",
+        ],
+        "url": url,
+        "readiness_script": BROWSER_READY,
+        "extract_script": BROWSER_EXTRACT,
+        "steps": steps,
+        "proxy": proxy.label() if proxy else None,
+    }
+
+
+# ------------------------------------------------------------------ scoring
+
+
+def score(results: list[dict], target_domain: str | None = None) -> dict:
+    """Annotate page-1 results with the signals the quality bar asks for.
+
+    HINTS, not verdicts. The authority count is the agent's call after reading
+    the titles - a heuristic cannot tell "recognised brand in the niche" from
+    "random blog with a good domain". What it CAN do reliably is spot the
+    weakness signals, which is the half that gets miscounted by eye.
+    """
+    weak, authorityish, target_hit, unresolved = [], [], None, []
+    for i, r in enumerate(results, 1):
+        r.setdefault("position", i)
+        dom = registrable(host_of(r.get("url", "")))
+        r["domain"] = dom
+        tags = []
+        if dom in WEAK_DOMAINS:
+            tags.append("forum/social/video")
+        if dom in DOCS_DOMAINS:
+            tags.append("repo/package-host")
+        title = r.get("title", "")
+        if THIN_TITLE.search(title):
+            tags.append("listicle")
+        year = YEAR_IN_TITLE.search(title)
+        if year:
+            r["title_year"] = int(year.group(1))
+        # A result whose real host could not be recovered from Google's redirect
+        # wrapper is UNKNOWN, and unknown is not "authority". Counting it there
+        # inflated the ceiling from 3 to 7 on a SERP that was 6/9 YouTube+Reddit.
+        if r.get("unresolved_wrapper") or dom in ("google.com", "google.co.uk"):
+            tags.append("unresolved-wrapper")
+        r["signals"] = tags
+        if "unresolved-wrapper" in tags:
+            unresolved.append({"position": r["position"], "title": title[:60]})
+        elif tags and "repo/package-host" not in tags:
+            weak.append({"position": r["position"], "domain": dom, "why": ",".join(tags)})
+        elif not tags:
+            authorityish.append({"position": r["position"], "domain": dom})
+        if target_domain and dom == registrable(target_domain) and target_hit is None:
+            target_hit = r["position"]
+
+    top10 = results[:10]
+    weak10 = [w for w in weak if w["position"] <= 10]
+    return {
+        "results_seen": len(results),
+        "weakness_signals": weak10,
+        "weakness_count": len(weak10),
+        "strong_serp_weakness": len(weak10) >= 2,
+        "authority_candidates": [a for a in authorityish if a["position"] <= 10],
+        "authority_candidate_count": len([a for a in authorityish if a["position"] <= 10]),
+        "distinct_domains_top10": len({r.get("domain") for r in top10}),
+        "unresolved_wrappers": [u for u in unresolved if u["position"] <= 10],
+        "target_position": target_hit,
+        "verdict_note": (
+            "authority_candidate_count is a CEILING on the real authority count, not the count "
+            "itself: it counts every page-1 domain that is not obviously a forum, video, repo or "
+            "listicle. Read the titles and decide which are genuinely established authority for "
+            "THIS query (recognised brands, the vendor's own domain, official docs). 4+ real ones "
+            "= DEFER the candidate (class authority) - not reject; the count is DR-relative. "
+            "unresolved_wrappers are results whose host could not be recovered and are counted "
+            "NOWHERE - if the list is long, read the titles: they are usually video/forum."
+        ),
+    }
+
+
+# --------------------------------------------------------------------- main
+
+
+
+def run_control() -> dict:
+    """Fire the relevance and shape guards at REAL captured responses.
+
+    Not synthetic. `assets/fixtures/bing-{fr,de}.json` are genuine Bing reads
+    captured 2026-07-30 that returned HTTP 200, ten clean parseable rows, and
+    results about a completely different subject. The naive rule - "does any
+    query token appear" - PASSES both of them, which is why coverage is measured
+    over distinct tokens instead.
+
+    A guard proven only against good data proves nothing. Both directions are
+    exercised here: the wrong-query reads must be REFUSED and the good reads of
+    the same query must be ACCEPTED."""
+    c = Controls("serp-control")
+    fixtures = Path(__file__).resolve().parent.parent / "assets" / "fixtures"
+    query = "self hosted rank tracker"
+
+    def rows_of(name):
+        data = json.loads((fixtures / name).read_text(encoding="utf-8"))
+        if isinstance(data, str):                 # execute_js hands back a string
+            data = json.loads(data)
+        return data["results"]
+
+    if not fixtures.is_dir():
+        return refuse("serp-control", f"no fixture directory at {fixtures} - the guards "
+                                      f"cannot be proven without the captured responses")
+
+    for name in ("bing-fr.json", "bing-de.json"):
+        try:
+            rows = rows_of(name)
+        except Exception as e:                                   # noqa: BLE001
+            c.check(f"{name}_loads", False, f"{type(e).__name__}: {e}")
+            continue
+        rel = verify_relevance(query, rows)
+        c.check(f"wrong_query_read_{name}_is_refused", not rel["pass"],
+                f"coverage={rel['coverage']} hit_rate={rel['hit_rate']} rows={len(rows)}")
+        naive = any(any(t in (r.get("title", "") + r.get("url", "")).lower()
+                        for t in query.split()) for r in rows)
+        c.check(f"{name}_would_fool_an_any_token_rule", naive,
+                "if this is False the fixture no longer exercises the trap")
+        # Re-read 2026-10-12: these real reads are leading-word collapses
+        # ("self" out of "self hosted rank tracker"), not unrelated SERPs.
+        col = detect_collapse(query, rows)
+        c.check(f"real_{name}_classifies_as_collapse_onto_self",
+                col.get("collapsed_to") == "self", str(col))
+
+    for name in ("ddg-good.json", "browser-google.json"):
+        try:
+            rows = rows_of(name)
+        except Exception as e:                                   # noqa: BLE001
+            c.check(f"{name}_loads", False, f"{type(e).__name__}: {e}")
+            continue
+        rel = verify_relevance(query, rows)
+        c.check(f"good_read_{name}_is_accepted", rel["pass"],
+                f"coverage={rel['coverage']} hit_rate={rel['hit_rate']}")
+        c.check(f"good_read_{name}_passes_the_shape_guard", shape_ok(rows))
+        c.check(f"good_read_{name}_is_not_a_collapse",
+                detect_collapse(query, rows).get("collapse") is False)
+
+    c.check("an_empty_result_set_is_refused", not shape_ok([]))
+    c.check("a_result_with_no_url_is_refused", not shape_ok([{"title": "x", "url": ""}]))
+    c.check("registrable_folds_a_subdomain", registrable("www.example.com") == "example.com")
+    c.check("registrable_handles_a_multi_part_tld",
+            registrable("a.b.example.co.uk") == "example.co.uk")
+    c.check("registrable_does_not_over_fold",
+            registrable("notexample.com") == "notexample.com")
+    c.check("the_thresholds_are_real_numbers",
+            0 < MIN_COVERAGE <= 1 and 0 < MIN_HIT_RATE <= 1,
+            f"coverage>={MIN_COVERAGE} hit_rate>={MIN_HIT_RATE}")
+
+    _bing_controls(c)
+    return c.verdict(thresholds={"min_coverage": MIN_COVERAGE, "min_hit_rate": MIN_HIT_RATE,
+                                 "collapse_lead_share": COLLAPSE_LEAD_SHARE,
+                                 "collapse_rest_share": COLLAPSE_REST_SHARE})
+
+
+def _bing_page(query_echo: str | None, rows: list[tuple[str, str, str]], *, title: str | None = None,
+               ad: bool = False, module: str | None = None) -> str:
+    """A synthetic Bing results page in the measured shape: `sb_form_q` search
+    box, `<li class="b_algo">` blocks with an h2 link and a b_caption snippet.
+    `rows` hold the already-WRAPPED href, so the unwrap is exercised too."""
+    t = title if title is not None else (f"{query_echo} - Search" if query_echo else "Bing")
+    box = (f'<input class="b_searchbox" id="sb_form_q" name="q" type="search" '
+           f'value="{html.escape(query_echo)}" maxlength="1000" />' if query_echo is not None else "")
+    parts = [f"<html><head><title>{html.escape(t)}</title></head><body>{box}",
+             # The JS that sits on every real page and must NOT read as an ad
+             # or a challenge.
+             '<script>var _G={adc:"b_ad"};if(x.className.indexOf("b_adTop")!==-1){};'
+             '/* Challenge challenge */</script><ol id="b_results">']
+    if ad:
+        parts.append('<li class="b_ad b_adTop"><ul><li class="b_adLastChild"><h2>'
+                     '<a href="https://www.bing.com/aclk?ld=1">Sponsored thing</a></h2></li></ul></li>')
+    if module:
+        parts.append(f'<li class="{module}"><div>Some results have been removed</div></li>')
+    for href, ttl, snip in rows:
+        parts.append(f'<li class="b_algo" data-id iid=SERP.1><div class="b_tpcn"></div>'
+                     f'<h2><a target="_blank" href="{html.escape(href)}" h="ID=SERP,1.1">{ttl}</a></h2>'
+                     f'<div class="b_caption"><p class="b_lineclamp2">{snip}</p></div></li>')
+    parts.append('<li class="b_pag"><a href="/search?q=x&first=11">2</a></li></ol></body></html>')
+    return "".join(parts)
+
+
+def _bing_wrap(b64: str) -> str:
+    return ("https://www.bing.com/ck/a?!&&p=0f&ptn=3&ver=2&hsh=4&fclid=00&u=a1" + b64 + "&ntb=1")
+
+
+def _bing_controls(c: Controls) -> None:
+    """The Bing parser and guards, against synthetic pages whose expected
+    verdicts are written down here by hand - never computed by the code under
+    test. The base64 literals were encoded separately; the padding-stripped
+    one is the shape that broke a naive decoder (139 of 190 real links)."""
+    # 'https://www.example.com/' and 'https://example.org/guide?x=1' encoded
+    # URL-safe; the second with its '=' padding stripped exactly as Bing does.
+    W1, U1 = "aHR0cHM6Ly93d3cuZXhhbXBsZS5jb20v", "https://www.example.com/"
+    W2, U2 = "aHR0cHM6Ly9leGFtcGxlLm9yZy9ndWlkZT94PTE", "https://example.org/guide?x=1"
+    c.probe("bing_unwraps_a_redirect_link", lambda: unwrap_bing(_bing_wrap(W1)), (U1, True))
+    c.probe("bing_unwraps_a_padding_stripped_link", lambda: unwrap_bing(_bing_wrap(W2)), (U2, True))
+    c.probe("bing_html_escaped_wrapper_unwraps",
+            lambda: unwrap_bing(_bing_wrap(W1).replace("&", "&amp;"))[0], U1)
+    c.probe("bing_undecodable_wrapper_is_flagged_not_trusted",
+            lambda: unwrap_bing("https://www.bing.com/ck/a?u=zz")[1], False)
+    c.probe("bing_tracking_param_is_stripped",
+            lambda: unwrap_bing("https://shop.example.com/c/boots?msockid=abc123")[0],
+            "https://shop.example.com/c/boots")
+
+    q = "best hiking boots"
+    good_rows = [
+        (_bing_wrap(W1), "The 9 Best Hiking Boots, Tested", "We hiked 400 miles in hiking boots."),
+        ("https://gear.example.net/hiking-boots", "Hiking Boots for Every Trail", "Waterproof hiking boots."),
+        ("https://reviews.example.org/best-hiking-boots", "Best Hiking Boots of the Year", "Our picks."),
+        ("https://shop.example.com/hiking/boots", "Men's Hiking Boots | Shop", "Free shipping on boots."),
+    ]
+    good = parse_bing(_bing_page(q, good_rows, ad=True))
+    c.check("bing_valid_page_counts_four_organic", good["organic_count"] == 4, str(good["organic_count"]))
+    c.check("bing_ad_is_detected_and_not_counted_organic",
+            good["ads_detected"] is True and good["organic_count"] == 4, str(good["ad_markers"]))
+    c.check("bing_ad_internals_are_not_modules", good["modules_detected"] == [],
+            str(good["modules_detected"]))
+    c.check("bing_first_result_is_unwrapped_to_its_real_host",
+            good["results"][0]["url"] == U1, good["results"][0]["url"])
+    c.check("bing_echo_is_read_from_the_search_box", good["echo"] == q, repr(good["echo"]))
+    c.check("bing_valid_page_is_accepted", bing_guard(q, good)["refused"] is False,
+            str(bing_guard(q, good)))
+
+    no_ad = parse_bing(_bing_page(q, good_rows))
+    c.check("bing_inline_js_is_not_an_ad", no_ad["ads_detected"] is False, str(no_ad["ad_markers"]))
+    c.check("bing_inline_js_challenge_word_is_not_a_challenge", no_ad["challenge"] is None)
+    mod = parse_bing(_bing_page(q, good_rows, module="b_msg"))
+    c.check("bing_module_is_recorded", mod["modules_detected"] == ["b_msg"], str(mod["modules_detected"]))
+
+    # Wrong query: echo intact, results about an unrelated subject (the shape
+    # a direct request produced: speed tests).
+    wrong = parse_bing(_bing_page(q, [
+        ("https://speed.example.com/", "Internet Speed Test", "Check your download speed."),
+        ("https://fast.example.net/", "Fast Speed Test", "How fast is your connection?"),
+        ("https://isp.example.org/test", "Test Your Broadband", "Upload and ping."),
+        ("https://net.example.com/speed", "Speed Test Sites Compared", "Latency explained."),
+    ]))
+    wv = bing_guard(q, wrong)
+    c.check("bing_wrong_query_page_is_refused_as_wrong_query", wv.get("kind") == "wrong_query", str(wv))
+
+    # Collapse: every row about the leading word alone. One title shares the
+    # generic word "games" with the query, as a collapsed verb SERP of game
+    # portals does - an any-rest-word rule reads that row as on-topic.
+    cq = "play trail games"
+    col = parse_bing(_bing_page(cq, [
+        ("https://store.example.com/", "Play Store - Apps", "Download apps to play."),
+        ("https://dict.example.org/play", "PLAY Definition & Meaning", "To engage in activity."),
+        ("https://console.example.net/", "PlayConsole Official Site", "Play now."),
+        ("https://portal.example.com/", "Play Free Online Games at Portal", "Thousands to play."),
+    ]))
+    cv = bing_guard(cq, col)
+    c.check("bing_collapsed_page_is_refused_as_query_collapse",
+            cv.get("kind") == "query_collapse" and cv.get("collapse", {}).get("collapsed_to") == "play",
+            str(cv))
+    c.check("collapse_and_wrong_query_are_different_kinds", cv.get("kind") != wv.get("kind"))
+
+    # The hole the collapse check closes: one relevance token left after
+    # stopwords, so verify_relevance's qualifier exemption PASSES a page of
+    # dictionary entries for the leading word.
+    hq = "best boots"
+    hole_rows = [{"title": "BEST Definition & Meaning", "url": "https://dict.example.org/best", "snippet": "best"},
+                 {"title": "Best - Wikipedia", "url": "https://wiki.example.org/Best", "snippet": "the best"},
+                 {"title": "Best Store | Official Site", "url": "https://www.bestshop.example.com/", "snippet": ""}]
+    c.check("relevance_alone_would_pass_a_one_token_collapse", verify_relevance(hq, hole_rows)["pass"] is True,
+            "if this is False the exemption changed and the control no longer exercises the hole")
+    c.check("collapse_check_catches_it", detect_collapse(hq, hole_rows)["collapse"] is True)
+
+    ch = parse_bing("<html><head><title>One last step</title></head><body>"
+                    "<p>Please solve the challenge below to continue</p></body></html>")
+    chv = bing_guard(q, ch)
+    c.check("bing_challenge_page_is_refused_as_challenge", chv.get("kind") == "challenge", str(chv))
+    c.check("bing_challenge_is_cannot_ask_class",
+            SerpRefusal(chv.get("kind", ""), "x").as_dict()["class"] == "cannot_ask")
+    c.check("bing_collapse_is_wrong_answer_class",
+            SerpRefusal("query_collapse", "x").as_dict()["class"] == "wrong_answer")
+
+    mism = parse_bing(_bing_page("internet speed test", good_rows))
+    mv = bing_guard(q, mism)
+    c.check("bing_echo_mismatch_is_wrong_query", mv.get("kind") == "wrong_query" and mv.get("echo_mismatch"),
+            str(mv))
+    miss = parse_bing(_bing_page(None, good_rows, title="Bing"))
+    c.check("bing_missing_echo_is_refused", bing_guard(q, miss).get("kind") == "echo_missing")
+    c.check("bing_empty_200_is_unparsed_not_empty",
+            bing_guard(q, parse_bing(_bing_page(q, []))).get("kind") == "unparsed")
+
+    # Exit reporting and dedupe, the DDG fixes.
+    c.check("exit_unconfirmed_is_said_out_loud",
+            exit_fields("de", None, True) == {"exit_country": None, "exit_requested": "de",
+                                              "exit_unconfirmed": True, "exit_mismatch": False,
+                                              "exit_route": "proxy"})
+    c.check("exit_mismatch_is_flagged", exit_fields("de", "gb", True)["exit_mismatch"] is True)
+    c.check("exit_confirmed_is_not_flagged",
+            exit_fields("us", "us", True)["exit_unconfirmed"] is False
+            and exit_fields("us", "us", True)["exit_mismatch"] is False)
+    page = [{"url": "https://a.example.com/x"}, {"url": "https://b.example.com/"},
+            {"url": "https://www.a.example.com/x/"}, {"url": "https://b.example.com"},
+            {"url": "https://c.example.com/"}]
+    kept, dropped = dedupe_results(page)
+    c.check("dedupe_drops_repeats_and_keeps_first_position",
+            dropped == 2 and [r["url"] for r in kept] == ["https://a.example.com/x", "https://b.example.com/",
+                                                          "https://c.example.com/"], f"{dropped} {kept}")
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("query", nargs="?", help="the search query")
+    p.add_argument("--control", action="store_true",
+                   help="fire the relevance/shape guards at the captured fixtures and exit")
+    p.add_argument("--provider", default=os.environ.get("SEO_SERP_PROVIDER", "ddg"),
+                   choices=["ddg", "serpd", "searxng", "brave", "serper", "serpapi", "dataforseo",
+                            "bing", "browser"])
+    p.add_argument("--count", type=int, default=10)
+    p.add_argument("--instance", help="searxng base URL")
+    p.add_argument("--gl", default="us",
+                   help="country (serpapi/brave; bing's market and pinned exit unless "
+                        "--proxy-country) or location_code (dataforseo)")
+    p.add_argument("--hl", default="en")
+    p.add_argument("--target-domain", help="report this domain's position if present")
+    # Failover is the DEFAULT. Until 2026-09-14 it was opt-in, while the quality
+    # bar promised "serp.py fails over across providers automatically" - so a
+    # Google-throttled daemon came back `rate-limited` with serper configured and
+    # idle, and the research run read it as a refused SERP. A keyless provider's
+    # throttle is exactly the case a keyed one is configured FOR.
+    p.add_argument("--fallback", dest="fallback", action="store_true", default=True,
+                   help="(default) on failure try the other configured providers, real-Google first")
+    p.add_argument("--no-fallback", dest="fallback", action="store_false",
+                   help="pin the named provider; a failure is reported, not routed around")
+    p.add_argument("--proxy-country", metavar="CC",
+                   help=f"pin the residential exit country. Verified pool: {' '.join(EU_COUNTRIES)}")
+    p.add_argument("--no-proxy", action="store_true", help="ignore SEO_PROXY_URL for this call")
+    p.add_argument("--score-json", metavar="PATH_OR_-",
+                   help="skip fetching: score a results JSON produced elsewhere (e.g. the browser path)")
+    p.add_argument("--query-for-scoring", help="the query --score-json results were fetched for, "
+                                               "when the payload does not carry it")
+    p.add_argument("--raw", action="store_true", help="omit the scoring block")
+    p.add_argument("--verify-countries", nargs="*", metavar="CC",
+                   help="measure which exit countries the pool actually honours (no args = the "
+                        "verified list + the known-lying ones as a control). Fetches nothing else.")
+    p.add_argument("--country", action="append", default=[],
+                   help="extra country code to include in --verify-countries")
+    a = p.parse_args()
+
+    # Offline, needs no provider and no network: the guards must be provable on
+    # a machine where every SERP source is refusing, which is exactly when you
+    # most need to know whether a refusal is real.
+    if getattr(a, "control", False):
+        out = run_control()
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(0 if out.get("ok") else 1)
+
+    if a.verify_countries is not None:
+        codes = [c.lower() for c in (a.verify_countries or [])] + [c.lower() for c in a.country]
+        # Default sweep includes the known liar as a CONTROL: a run where `fr`
+        # comes back honoured means the instrument, not the pool, has changed.
+        if not codes:
+            codes = VERIFIED_COUNTRIES + list(LYING_COUNTRIES)
+        print(json.dumps(verify_exit_countries(sorted(set(codes))), indent=2))
+        return
+
+    if a.proxy_country and a.proxy_country.lower() not in VERIFIED_COUNTRIES:
+        cc = a.proxy_country.lower()
+        if cc in LYING_COUNTRIES:
+            extra = (f" {cc!r} is measured as returning a {LYING_COUNTRIES[cc].upper()} exit instead - "
+                     "a silent geo lie, which is worse than a failure because the caller believes the "
+                     "SERP is local.")
+        else:
+            extra = (" Not on the verified list. That may mean it was never checked rather than that "
+                     "it does not work - run `serp.py verify-countries --country " + cc + "` to measure it.")
+        print(json.dumps({"ok": False, "error": f"unverified proxy country {cc!r}.{extra}",
+                          "verified_pool": VERIFIED_COUNTRIES,
+                          "known_lying": LYING_COUNTRIES,
+                          "reverify": f"python3 serp.py verify-countries --country {cc}"}, indent=2))
+        sys.exit(2)
+
+    # -- score an externally-produced payload (the browser path) -------------
+    if a.score_json:
+        text = sys.stdin.read() if a.score_json == "-" else open(a.score_json, encoding="utf-8").read()
+        data = json.loads(text)
+        if isinstance(data, str):  # execute_js hands back a JSON string
+            data = json.loads(data)
+        results = data.get("results", data if isinstance(data, list) else [])
+        payload = {**(data if isinstance(data, dict) else {}), "results": results}
+        query = a.query_for_scoring or a.query or payload.get("query") or ""
+        rel = verify_relevance(query, results)
+        payload["relevance"] = rel
+        if not rel["pass"]:
+            payload["ok"] = False
+            payload["error"] = "wrong-query results - refusing to score"
+            payload["observed_titles"] = [r.get("title") for r in results[:10]]
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            sys.exit(3)
+        payload["ok"] = True
+        payload["scoring"] = score(results, a.target_domain)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    if not a.query:
+        p.error("query is required unless --score-json is used")
+
+    proxy = resolve_proxy(a.proxy_country, enabled=not a.no_proxy)
+
+    if a.provider == "browser":
+        print(json.dumps(browser_handoff(a.query, a.count, a.gl, a.hl, proxy), indent=2))
+        return
+
+    def keyed_alternatives() -> list[str]:
+        avail = []
+        try:
+            port = os.environ.get("SERPD_PORT", "8791")
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as r:
+                if json.loads(r.read()).get("chrome_alive"):
+                    avail.append("serpd")   # real Google, so it outranks the keyed ones
+        except Exception:
+            pass
+        if read_key("SERPER_API_KEY", "~/.serper_key"):
+            avail.append("serper")
+        if read_key("SERPAPI_KEY", "~/.serpapi_key"):
+            avail.append("serpapi")
+        if read_key("BRAVE_SEARCH_API_KEY", "~/.brave_search_key"):
+            avail.append("brave")
+        if os.environ.get("DATAFORSEO_LOGIN") and os.environ.get("DATAFORSEO_PASSWORD"):
+            avail.append("dataforseo")
+        if os.environ.get("SEARXNG_URL") or a.instance:
+            avail.append("searxng")
+        return avail
+
+    chain = [a.provider]
+    if a.fallback:
+        chain += [c for c in (keyed_alternatives() + ["ddg"]) if c not in chain]
+
+    errors, refusals, results, used = {}, {}, None, a.provider
+    for cand in chain:
+        # Per-read metadata must not leak from a refused provider into the one
+        # that answered: a bing exit reported on a ddg payload is a false claim.
+        for k in EXIT_KEYS + ("engine", "depth", "bing", "proxy_pinned"):
+            results_meta.pop(k, None)
+        try:
+            got = PROVIDERS[cand](a.query, a.count, instance=a.instance, gl=a.gl, hl=a.hl, proxy=proxy)
+        except SerpRefusal as exc:
+            errors[cand] = str(exc)
+            refusals[cand] = exc.as_dict()
+            continue
+        except Exception as exc:
+            errors[cand] = str(exc)
+            continue
+        if not shape_ok(got):
+            # HTTP 200 with nothing parseable is NOT an empty page 1.
+            errors[cand] = ("returned no parseable results - treat as a failed read, never as an "
+                            "empty SERP")
+            continue
+        rel = verify_relevance(a.query, got)
+        if not rel["pass"]:
+            errors[cand] = (f"returned results for a DIFFERENT query (coverage {rel['coverage']}, "
+                            f"hit_rate {rel['hit_rate']}): "
+                            + ", ".join(f'"{r.get("title","")[:40]}"' for r in got[:3]))
+            continue
+        results, used = got, cand
+        break
+
+    if results is None:
+        payload = browser_handoff(a.query, a.count, a.gl, a.hl, proxy)
+        payload.update({
+            "ok": False,
+            "provider": a.provider,
+            # `error` mirrors the first real reason as a one-liner. Without it this
+            # payload carried ok:false with error UNSET while the actual cause sat
+            # in `errors` - and a caller reading the obvious top-level field prints
+            # "FAILED: None", which reads like an opaque crash and gets the SCRIPT
+            # blamed for a provider throttle it diagnosed perfectly. Measured
+            # 2026-08-01: that misread cost a research run's worth of confidence.
+            # The full per-provider detail stays in `errors`; this is a signpost.
+            "error": ("; ".join(f"{k}: {v}" for k, v in errors.items())[:400]
+                      or "all configured SERP providers failed - see the browser handoff"),
+            "errors": errors,
+            "refusals": refusals or None,
+            "proxy": proxy.label() if proxy else None,
+            "why_this_block": (
+                "Every configured SERP provider failed or returned results that were not for this "
+                "query, so this is the browser handoff rather than a dead end. The browser path is "
+                "keyless, takes a different network route, and returns real Google."
+            ),
+            "never": (
+                "Do NOT proceed as if page 1 were empty. No usable SERP read means no authority "
+                "count, and no authority count means the candidate does not pass. This also does "
+                "not consume one of the run's 25 SERP checks."
+            ),
+        })
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        sys.exit(2)
+
+    payload = {
+        "ok": True,
+        "query": a.query,
+        "provider": used,
+        "engine": ENGINES.get(used, used),
+        "fell_back_from": a.provider if used != a.provider else None,
+        "provider_errors": errors or None,
+        "provider_refusals": refusals or None,
+        "proxy": proxy.label() if proxy else None,
+        "results": results,
+        "relevance": verify_relevance(a.query, results),
+        **results_meta,
+    }
+    if not a.raw:
+        payload["scoring"] = score(results, a.target_domain)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

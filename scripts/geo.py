@@ -1,0 +1,1902 @@
+#!/usr/bin/env python3
+"""geo.py - do answer engines CITE us, and is what they say right?
+
+`crawllog.py` measures who CRAWLED (OAI-SearchBot: 27 verified hits) and
+`backlinks.py referrers` measures who REFERRED (chatgpt.com: 18 clicks). Neither
+asks the question that decides AI visibility: **when an assistant answers a
+question this site exists to answer, is this site one of the sources it names?**
+
+THE UNIT IS AN ANSWER, NOT A RANKING. A page can sit at position 3 and be absent
+from the overview above it, which is what happened here: measured 2026-09-01,
+Google's AI Overview for the site's head query ("how to play <game> in
+browser") cited seven sources - social, forums, a code host and a DR 35
+competitor - and the site was not among them, while the competitor was.
+
+FAIL-CLOSED, STRUCTURALLY. `cannot_ask` and `not_cited` are different states and
+never share a code path. An engine with no key reports `no_key`; an engine that
+errored reports `failing`; only an engine that actually ANSWERED can report
+`not_cited`. A sweep that could not reach any engine returns a refusal, not a
+report saying nobody cites you.
+
+    geo.py engines                          # what can be asked right now
+    geo.py ask --query "..." --domain example.com --runs 3
+    geo.py sweep --domain example.com --from-state --max 12 --runs 3
+    geo.py extractable --root ./public      # is each page's answer liftable?
+    geo.py control
+
+Stdlib only. Google's AI Overview AND AI Mode are reachable today through the
+SerpApi key this skill already uses (AI Mode was found reachable on 2026-09-20,
+nineteen days after "we lack the credential" was written down); the LLM engines
+and the four SearchApi.io fronts report `no_key` until a key exists, which is
+the point - the moment one appears they work.
+
+ANSWERS ARE NON-DETERMINISTIC. One run is an anecdote. `--runs N` asks each
+engine N times and reports the citation RATE with its n; a single observation
+is labelled as one so it cannot be read as a rate.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+import urllib.parse
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from controls import Controls, refuse, uniform_verdict  # noqa: E402
+from providers import cache_get, cache_put, http, read_secret  # noqa: E402
+from providers import registrable  # noqa: E402
+import stats  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+CACHE_TTL = 6 * 3600
+
+# The engine's OWN domains, which appear in its citation list as plumbing rather
+# than as sources. Google's AI Overview references carry google.com links
+# (support pages, redirects, "more results"), and counted naively they dominate
+# every share-of-voice table: measured 2026-09-01, google.com appeared 21 times
+# across 5 answers while the leading real source appeared 5. Same class as the
+# UGC platform chrome that polluted `brief.py`'s subtopics - excluded, but
+# reported separately so the exclusion is visible rather than silent.
+ENGINE_FURNITURE = {
+    "google_ai_overview": {"google.com", "gstatic.com", "googleusercontent.com"},
+    "google_ai_mode": {"google.com", "gstatic.com", "googleusercontent.com"},
+    "searchapi_gemini": {"google.com", "gstatic.com", "googleusercontent.com"},
+    "searchapi_bing_copilot": {"bing.com", "microsoft.com"},
+    "searchapi_chatgpt": {"openai.com", "chatgpt.com"},
+    "searchapi_perplexity": {"perplexity.ai"},
+}
+
+
+def _host(u: str) -> str:
+    try:
+        h = urllib.parse.urlsplit(u).netloc.lower()
+        return h[4:] if h.startswith("www.") else h
+    except Exception:                                             # noqa: BLE001
+        return ""
+
+
+def _registrable(h: str) -> str:
+    return registrable(h)
+
+
+def _owned(domain: str) -> list[str]:
+    """`--domain a.com,b.com`: every site the owner runs, as registrables,
+    the first being the primary. A citation of any of them is a citation of
+    the owner (Canonry's citedDomainBelongsToProject)."""
+    out = []
+    for d in (domain or "").split(","):
+        d = d.strip()
+        if d:
+            r = _registrable(_host(d) or d.lower())
+            if r and r not in out:
+                out.append(r)
+    return out
+
+
+def _supports(blocks, refs) -> list[dict]:
+    """Which domains back each answer block. SerpApi's AI Overview / AI Mode
+    and SearchApi's engines put `reference_indexes` on every text block and
+    list item, pointing at `references[].index` (serpapi.com/ai-overview,
+    searchapi.io docs, read 2026-10-25) - the sentence a cited page actually
+    supports, not just that it was cited somewhere."""
+    by_index = {}
+    for pos, r_ in enumerate(refs or []):
+        if isinstance(r_, dict):
+            by_index[r_.get("index", pos)] = _registrable(_host(r_.get("link") or r_.get("url") or ""))
+    out = []
+
+    def walk(bs):
+        for b in bs or []:
+            if not isinstance(b, dict):
+                continue
+            text = b.get("snippet") or b.get("answer")
+            idx = b.get("reference_indexes") or []
+            if text and idx:
+                doms = []
+                for i in idx:
+                    d = by_index.get(i)
+                    if d and d not in doms:
+                        doms.append(d)
+                out.append({"text": text, "domains": doms})
+            walk(b.get("list"))
+            walk(b.get("items"))
+    walk(blocks)
+    return out
+
+
+# Which engines can return the background searches behind an answer. An empty
+# list from an engine that never offers them is not "no fan-out"; from one
+# that does, it is a parser or payload change (elmo's fanout-support.ts;
+# SearchApi docs read 2026-10-25: chatgpt returns `search_queries`, gemini and
+# bing_copilot have no such field, perplexity returns it only in a mode it no
+# longer uses).
+FAN_OUT_SUPPORT = {"searchapi_chatgpt": "supported", "searchapi_gemini": "never",
+                   "searchapi_bing_copilot": "never", "searchapi_perplexity": "not_currently"}
+
+
+# ---------------------------------------------------------- citation hygiene
+
+# Engines decorate the links they cite: `utm_source=openai` on every ChatGPT
+# link, `#:~:text=` scroll-to-text fragments on Google's. Left in, one page is
+# three different "sources" and per-URL counts fragment.
+# Click IDs added 2026-10-25 from Canonry's url-normalize.ts.
+_TRACKING = re.compile(r"^(utm_[a-z]+|gclid|fbclid|msclkid|srsltid|ved|sa|usg|ttclid|li_fat_id"
+                       r"|igshid|yclid|dclid|gbraid|wbraid|mc_cid|mc_eid|_ga|_gl)$", re.I)
+
+
+def _clean_url(u: str) -> str:
+    try:
+        p = urllib.parse.urlsplit(u or "")
+    except ValueError:
+        return u or ""
+    if not p.scheme:
+        return u or ""
+    q = [(k, v) for k, v in urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+         if not _TRACKING.match(k)]
+    return urllib.parse.urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path,
+                                    urllib.parse.urlencode(q), ""))
+
+
+def _unwrap(u: str) -> str:
+    """Google's /url?q= wrapper carries its target in the query - read it, no
+    request needed."""
+    try:
+        p = urllib.parse.urlsplit(u or "")
+    except ValueError:
+        return u or ""
+    if p.netloc.lower().endswith("google.com") and p.path in ("/url", "/goto"):
+        q = dict(urllib.parse.parse_qsl(p.query))
+        tgt = q.get("q") or q.get("url")
+        if tgt and tgt.startswith("http"):
+            return tgt
+    return u
+
+
+# Gemini grounding cites `vertexaisearch.cloud.google.com/grounding-api-redirect/
+# ...` instead of the page; only a request reveals the target (its Location).
+# One non-following GET each, capped per process so a big sweep cannot turn
+# into a crawl of Google's redirector.
+_REDIRECT_HOSTS = {"vertexaisearch.cloud.google.com"}
+_RESOLVE_CAP = 12
+_resolved: dict[str, str | None] = {}
+
+
+def _resolve_wrapper(u: str) -> str | None:
+    if u in _resolved:
+        return _resolved[u]
+    if len(_resolved) >= _RESOLVE_CAP:
+        return None
+    r = http(u, timeout=15, follow=False)
+    loc = r.get("location") or (r.get("headers") or {}).get("location")
+    _resolved[u] = loc if loc and loc.startswith("http") else None
+    return _resolved[u]
+
+
+def _ref(url: str, fallback_domain: str = "") -> dict:
+    """One cited link -> {url, domain, wrapped}. A wrapper that cannot be
+    resolved keeps its own host and says so, rather than inventing a target."""
+    u = _unwrap(url or "")
+    # 252 of 2,023,979 citations in ansvisor's production rows had no scheme
+    # (`example.com/page`); urlsplit reads that as a PATH, so the domain was
+    # blank and a page of ours cited that way read as not cited.
+    if u and "://" not in u and re.match(r"^[\w-]+(?:\.[\w-]+)+(?:[/?#]|$)", u):
+        u = "https://" + u
+    wrapped = False
+    if _host(u) in _REDIRECT_HOSTS:
+        tgt = _resolve_wrapper(u)
+        if tgt:
+            u = tgt
+        else:
+            wrapped = True
+    u = _clean_url(u)
+    return {"url": u, "domain": _host(u) or fallback_domain, "unresolved_wrapper": wrapped}
+
+
+# Where an answer engine's sources come from, by KIND. A gap domain is not one
+# thing: a forum thread is earned by participation, a review site by a listing,
+# a listicle by outreach, a reference page by notability. Order matters - first
+# match wins. Lists are small and named (elmohq/elmo's taxonomy, MIT, reduced to
+# the hosts that recur in answer citations); host-prefix and TLD rules carry the
+# long tail, and a page-type rule on the PATH catches listicles and comparisons
+# on otherwise unremarkable blogs.
+SOURCE_HOSTS = {
+    "forum": {"reddit.com", "quora.com", "stackexchange.com", "stackoverflow.com",
+              "discord.com", "steamcommunity.com", "news.ycombinator.com", "ycombinator.com",
+              "tripadvisor.com", "producthunt.com", "indiehackers.com", "lemmy.world"},
+    "video": {"youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "twitch.tv", "dailymotion.com"},
+    "pr": {"prnewswire.com", "businesswire.com", "globenewswire.com", "einpresswire.com",
+           "accesswire.com", "newswire.com", "prweb.com"},
+    "reviews": {"g2.com", "capterra.com", "trustpilot.com", "trustradius.com", "getapp.com",
+                "softwareadvice.com", "yelp.com", "sitejabber.com", "alternativeto.net",
+                "slant.co", "clutch.co", "gartner.com"},
+    "ecommerce": {"amazon.com", "ebay.com", "etsy.com", "walmart.com", "aliexpress.com",
+                  "bestbuy.com", "target.com", "shopify.com", "temu.com"},
+    "social": {"x.com", "twitter.com", "facebook.com", "instagram.com", "linkedin.com",
+               "pinterest.com", "threads.net", "bsky.app", "medium.com", "substack.com"},
+    "developer": {"github.com", "gitlab.com", "bitbucket.org", "npmjs.com", "pypi.org",
+                  "dev.to", "readthedocs.io", "mozilla.org"},
+    "reference": {"wikipedia.org", "wikidata.org", "britannica.com", "wiktionary.org",
+                  "fandom.com", "wikihow.com", "investopedia.com", "merriam-webster.com"},
+}
+_PREFIX_KIND = [
+    (re.compile(r"^(forums?|community|discuss|boards?)\."), "forum"),
+    (re.compile(r"^(shop|store|shopping|checkout)\."), "ecommerce"),
+    (re.compile(r"^(docs?|developers?|dev|api|apis|sdks?|engineering)\."), "developer"),
+    (re.compile(r"^(press|newsroom)\."), "pr"),
+]
+_INSTITUTIONAL = re.compile(r"\.(gov|edu|mil|int)(\.[a-z]{2})?$|\.(ac|gob|govt|go)\.[a-z]{2}$")
+_LISTICLE = re.compile(r"(^|[/\-_])(best|top-\d+|\d+-best)([/\-_]|$)", re.I)
+_COMPARISON = re.compile(r"(^|[/\-_])(vs|versus|alternatives?|comparison|compare)([/\-_]|$)", re.I)
+
+
+def classify_source(domain: str, url: str = "") -> str:
+    host = (_host(url) if url else "") or (domain or "").lower()
+    reg = _registrable(host)
+    for kind, hosts in SOURCE_HOSTS.items():
+        if reg in hosts or host in hosts:
+            return kind
+    for rx, kind in _PREFIX_KIND:
+        if rx.match(host):
+            return kind
+    if _INSTITUTIONAL.search(host):
+        return "institutional"
+    path = urllib.parse.urlsplit(url).path if url else ""
+    if _COMPARISON.search(path):
+        return "comparison"
+    if _LISTICLE.search(path):
+        return "listicle"
+    return "other"
+
+
+_LIST_ITEM = re.compile(r"^[ \t]*(?:(\d{1,2})[.)]|[-*•])[ \t]+(.*)$")
+
+
+def _list_rank(text: str, patterns) -> int | None:
+    """Rank of the first LIST ITEM naming us; None for a prose-only mention.
+    Numbering restarts on an explicit '1.' or when prose follows a blank line
+    (limelit-co/open's listRanks rule)."""
+    rank, prev_blank = 0, False
+    for line in (text or "").split("\n"):
+        if not line.strip():
+            prev_blank = True
+            continue
+        m = _LIST_ITEM.match(line)
+        if not m:
+            if prev_blank:
+                rank = 0
+            prev_blank = False
+            continue
+        if m.group(1) == "1":
+            rank = 0
+        rank += 1
+        prev_blank = False
+        if any(r.search(_prose(m.group(2))) for r in patterns):
+            return rank
+    return None
+
+
+# ------------------------------------------------------------------- engines
+def engine_google_ai_overview(query: str, gl="us", hl="en") -> dict:
+    """Google's AI Overview, through SerpApi.
+
+    ⚠ TWO-STAGE. The first response carries only a `page_token` + `serpapi_link`;
+    `references` and `text_blocks` do not exist until that link is followed.
+    Reading citations off the first response yields [] for every overview on
+    earth, which answers "are we cited" with a permanent silent no."""
+    key = read_secret("SERPAPI_KEY", "~/.serpapi_key")
+    if not key:
+        return {"state": "no_key", "detail": "needs SERPAPI_KEY or ~/.serpapi_key"}
+    qs = urllib.parse.urlencode({"engine": "google", "q": query, "gl": gl, "hl": hl,
+                                 "api_key": key})
+    r = http(f"https://serpapi.com/search.json?{qs}", timeout=60)
+    if not r.ok:
+        return {"state": "failing", "detail": f"HTTP {r.get('status')} {r.get('error') or ''}"}
+    d = r.json() or {}
+    if d.get("error"):
+        return {"state": "failing", "detail": str(d["error"])[:200]}
+    ai = d.get("ai_overview")
+    if not ai:
+        # A SERP with no overview is a MEASURED absence of the surface, which is
+        # different from being absent FROM one. Both are reported, separately.
+        return {"state": "answered", "has_answer": False, "text": "", "references": [],
+                "detail": "no AI Overview on this SERP"}
+    refs, text = ai.get("references") or [], ai.get("text_blocks") or []
+    if not refs and ai.get("serpapi_link"):
+        r2 = http(f"{ai['serpapi_link']}&api_key={key}", timeout=60)
+        if not r2.ok:
+            return {"state": "failing",
+                    "detail": f"overview follow-up HTTP {r2.get('status')} - citation "
+                              f"state UNKNOWN, not zero"}
+        ai2 = (r2.json() or {}).get("ai_overview") or {}
+        refs, text = ai2.get("references") or [], ai2.get("text_blocks") or []
+
+    def flatten(blocks, out):
+        for b in blocks or []:
+            if b.get("snippet"):
+                out.append(b["snippet"])
+            flatten(b.get("list"), out)
+        return out
+
+    body = " ".join(flatten(text, []))
+    if not body.strip() and not refs:
+        # An overview block with nothing in it - SerpApi returns `{"error": "An AI
+        # Overview is not available..."}` here - is NO answer surface. Read as an
+        # answer, it was a confident "not cited" for an overview that never rendered.
+        return {"state": "answered", "has_answer": False, "text": "", "references": [],
+                "detail": str(ai.get("error") or "empty ai_overview block")[:200]}
+    return {"state": "answered", "has_answer": True,
+            "text": body[:6000], "supports": _supports(text, refs),
+            "references": [{"domain": _host(x.get("link", "")), "url": x.get("link"),
+                            "source": x.get("source") or x.get("title")} for x in refs]}
+
+
+def _flatten_blocks(blocks, out):
+    for b in blocks or []:
+        if b.get("snippet"):
+            out.append(b["snippet"])
+        _flatten_blocks(b.get("list"), out)
+    return out
+
+
+def engine_google_ai_mode(query: str, gl="us", hl="en") -> dict:
+    """Google's AI MODE, through SerpApi - a second answer surface on the SAME key.
+
+    Probed live 2026-09-20: HTTP 200, and unlike the AI Overview it is
+    SINGLE-STAGE - `text_blocks`, `references` and `reconstructed_markdown` all
+    arrive on the first response. This engine did not exist here until that
+    probe; "we lack the credential" was a remembered constraint nobody checked
+    against the credential in hand (prior-art.md #2, repeated)."""
+    key = read_secret("SERPAPI_KEY", "~/.serpapi_key")
+    if not key:
+        return {"state": "no_key", "detail": "needs SERPAPI_KEY or ~/.serpapi_key"}
+    qs = urllib.parse.urlencode({"engine": "google_ai_mode", "q": query, "gl": gl,
+                                 "hl": hl, "api_key": key})
+    r = http(f"https://serpapi.com/search.json?{qs}", timeout=90)
+    if not r.ok:
+        return {"state": "failing", "detail": f"HTTP {r.get('status')} {r.get('error') or ''}"}
+    d = r.json() or {}
+    if d.get("error"):
+        return {"state": "failing", "detail": str(d["error"])[:200]}
+    if "text_blocks" not in d and "references" not in d:
+        # A 200 with neither key is an unrecognised shape, not an empty answer.
+        return {"state": "failing",
+                "detail": f"unexpected payload keys {sorted(d)[:8]} - parser out of date?"}
+    refs = d.get("references") or []
+    text = " ".join(_flatten_blocks(d.get("text_blocks"), []))
+    if not text and not refs:
+        return {"state": "answered", "has_answer": False, "text": "", "references": [],
+                "detail": "AI Mode produced no answer for this query"}
+    return {"state": "answered", "has_answer": True, "text": text[:6000],
+            "supports": _supports(d.get("text_blocks"), refs),
+            "references": [{"domain": _host(x.get("link", "")), "url": x.get("link"),
+                            "source": x.get("source") or x.get("title")} for x in refs]}
+
+
+def _searchapi_location(engine: str, gl: str, hl: str) -> tuple[str | None, str | None]:
+    """SearchApi names the location differently per engine (docs read
+    2026-10-25): chatgpt `country`, gemini `gl`, bing_copilot `market_code`
+    as `lang-COUNTRY`; perplexity has none. Before this nothing was sent, so a
+    `--gl de` sweep was answered from the US under a `de` cache key."""
+    gl = (gl or "").lower()
+    if not gl:
+        return None, None
+    if engine == "chatgpt":
+        return "country", gl
+    if engine == "gemini":
+        return "gl", gl
+    if engine == "bing_copilot":
+        return "market_code", f"{(hl or 'en').split('-')[0].lower()}-{gl.upper()}"
+    return None, None
+
+
+def _searchapi_engine(engine: str):
+    """SearchApi.io - a DIFFERENT company from SerpApi, with a unified endpoint
+    that fronts ChatGPT, Gemini, Perplexity and Bing Copilot as answer engines.
+    Mapped from `dannwaneri/seo-agent`'s client (prior-art.md, third pass);
+    unprobed here because no key exists, so it reports `no_key` - the correct
+    reachable state, not a stub. `chatgpt` only cites live sources when
+    `web_search=true` is sent; without it the answer comes from memory and
+    "not cited" would be an artefact of the request."""
+    def run(query: str, gl="us", hl="en", **_) -> dict:
+        key = read_secret("SEARCHAPI_KEY", "~/.searchapi_key")
+        if not key:
+            return {"state": "no_key", "detail": "needs SEARCHAPI_KEY or ~/.searchapi_key"}
+        params = {"engine": engine, "q": query, "api_key": key}
+        if engine == "chatgpt":
+            params["web_search"] = "true"
+        loc_key, loc = _searchapi_location(engine, gl, hl)
+        if loc_key:
+            params[loc_key] = loc
+        method = {"provider": "searchapi", "engine": engine, "location_requested": gl,
+                  "location_sent": loc if loc_key else None,
+                  "search_forced": True if engine == "chatgpt" else None}
+        r = http("https://www.searchapi.io/api/v1/search?" + urllib.parse.urlencode(params),
+                 timeout=90)
+        if not r.ok:
+            return {"state": "failing", "detail": f"HTTP {r.get('status')} {r.get('error') or ''}"}
+        d = r.json() or {}
+        status = (d.get("search_metadata") or {}).get("status")
+        if status and status != "Success":
+            return {"state": "failing", "detail": f"SearchApi status {status}: "
+                                                  f"{str(d.get('error', ''))[:160]}"}
+        if "markdown" not in d and "reference_links" not in d:
+            return {"state": "failing",
+                    "detail": f"unexpected payload keys {sorted(d)[:8]} - parser out of date?"}
+        text = d.get("markdown") or ""
+        refs = d.get("reference_links") or []
+        if not text and not refs:
+            return {"state": "answered", "has_answer": False, "text": "", "references": [],
+                    "method": method, "detail": f"{engine} produced no answer"}
+        out = {"state": "answered", "has_answer": True, "text": text[:6000], "method": method,
+               "supports": _supports(d.get("text_blocks"), refs),
+               "references": [{"domain": _host(x.get("link", "")), "url": x.get("link"),
+                               "source": x.get("source") or x.get("title")}
+                              for x in refs if isinstance(x, dict)]}
+        # ChatGPT's FAN-OUT: the literal background searches it ran before
+        # answering (`search_queries`, measured live 2026-09-20 - the first one
+        # carried "official", the post-5.6 pattern). Coverage planning, never a
+        # page-per-query list; see workflow-geo-scan.md.
+        # RETRIEVED, never cited: ChatGPT's `web_results` and Perplexity's
+        # `search_results` are pages read while answering (elmohq/elmo and
+        # niubigeo both keep them apart from `reference_links`). Mapped from
+        # their payloads; unprobed here, so the field names are documented
+        # assumptions until a key exists.
+        got_ret = d.get("web_results") or d.get("search_results") or []
+        if isinstance(got_ret, list):
+            out["retrieved"] = [{"domain": _host(x.get("link") or x.get("url") or ""),
+                                 "url": x.get("link") or x.get("url")}
+                                for x in got_ret if isinstance(x, dict)]
+        if isinstance(d.get("search_queries"), list):
+            out["fan_out_queries"] = [q for q in d["search_queries"] if isinstance(q, str)][:12]
+        return out
+    run.__name__ = f"engine_searchapi_{engine}"
+    return run
+
+
+def _llm_engine(name: str, env: str, dotfile: str, url: str, build, parse):
+    """build(key, query, gl, hl) -> (body, headers, method);
+    parse(json) -> (text, references, retrieved)."""
+    def run(query: str, gl="us", hl="en", **_) -> dict:
+        key = read_secret(env, dotfile)
+        if not key:
+            return {"state": "no_key", "detail": f"needs {env} or {dotfile}"}
+        body, headers, method = build(key, query, gl, hl)
+        r = http(url, data=body, headers=headers, timeout=90, method="POST")
+        if not r.ok:
+            return {"state": "failing",
+                    "detail": f"HTTP {r.get('status')}: {(r.text() or '')[:200]}"}
+        try:
+            text, refs, retrieved = parse(r.json() or {})
+        except Exception as e:                                    # noqa: BLE001
+            return {"state": "failing", "detail": f"unparseable answer: {e}"}
+        return {"state": "answered", "has_answer": bool(text), "text": text[:6000],
+                "references": refs, "retrieved": retrieved, "method": method}
+    run.__name__ = f"engine_{name}"
+    return run
+
+
+def _output_items(d: dict, kind: str) -> list[dict]:
+    return [o for o in d.get("output") or [] if isinstance(o, dict) and o.get("type") == kind]
+
+
+def _output_text(d: dict) -> tuple[str, list[dict]]:
+    """Text and annotations of a Responses-shaped `output[]` message."""
+    text, notes = [], []
+    for m in _output_items(d, "message"):
+        for c in m.get("content") or []:
+            if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
+                text.append(c.get("text") or "")
+                notes += [a for a in c.get("annotations") or [] if isinstance(a, dict)]
+    return "\n".join(t for t in text if t), notes
+
+
+# Perplexity ended Sonar chat completions 2026-09-27; the Agent API takes an
+# `effort` preset and returns sources as an `output[]` item of type
+# `search_results` (docs.perplexity.ai/docs/agent-api/migrate-from-sonar, read
+# 2026-10-25). It documents no location parameter, so none is claimed.
+def _perplexity_build(key, q, gl, hl):
+    return (json.dumps({"effort": "fast", "input": q}).encode(),
+            {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            {"provider": "perplexity", "endpoint": "agent", "effort": "fast",
+             "location_requested": gl, "location_sent": None, "search_forced": True})
+
+
+def _perplexity_parse(d):
+    text, _notes = _output_text(d)
+    cites = [x for item in _output_items(d, "search_results") for x in item.get("results") or []]
+    refs = [{"domain": _host(c.get("url", "")), "url": c.get("url"), "source": c.get("title")}
+            for c in cites if isinstance(c, dict) and c.get("url")]
+    return text, refs, []
+
+
+# The search-preview chat models were SHUT DOWN 2026-07-23. The Responses API
+# `web_search` tool replaces them; `tool_choice: "required"` forces the search
+# (with "auto" the model may answer from memory, and "not cited" is then an
+# artefact of the request), and `user_location` takes an ISO country.
+# Annotations of type url_citation are the CITED links; the sources the search
+# read come back only with `include: ["web_search_call.action.sources"]` and
+# are the RETRIEVED rung. Read on developers.openai.com/api/docs/guides/
+# tools-web-search, 2026-10-25. The model is the doc's own example; override
+# with GEO_OPENAI_MODEL.
+OPENAI_SEARCH_MODEL = os.environ.get("GEO_OPENAI_MODEL") or "gpt-6-astra"
+
+
+def _openai_build(key, q, gl, hl):
+    tool = {"type": "web_search"}
+    if gl:
+        tool["user_location"] = {"type": "approximate", "country": gl.upper()}
+    return (json.dumps({"model": OPENAI_SEARCH_MODEL, "input": q, "tools": [tool],
+                        "tool_choice": "required",
+                        "include": ["web_search_call.action.sources"]}).encode(),
+            {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            {"provider": "openai", "endpoint": "responses", "model": OPENAI_SEARCH_MODEL,
+             "location_requested": gl, "location_sent": gl.upper() if gl else None,
+             "search_forced": True})
+
+
+def _openai_parse(d):
+    text, notes = _output_text(d)
+    refs = [{"domain": _host(a.get("url", "")), "url": a.get("url"), "source": a.get("title")}
+            for a in notes if a.get("type") == "url_citation" and a.get("url")]
+    read = [s_ for call in _output_items(d, "web_search_call")
+            for s_ in ((call.get("action") or {}).get("sources") or []) if isinstance(s_, dict)]
+    retrieved = [{"domain": _host(x.get("url", "")), "url": x.get("url")} for x in read if x.get("url")]
+    return text, refs, retrieved
+
+
+ENGINES = {
+    "google_ai_overview": engine_google_ai_overview,
+    "google_ai_mode": engine_google_ai_mode,
+    "searchapi_chatgpt": _searchapi_engine("chatgpt"),
+    "searchapi_gemini": _searchapi_engine("gemini"),
+    "searchapi_perplexity": _searchapi_engine("perplexity"),
+    "searchapi_bing_copilot": _searchapi_engine("bing_copilot"),
+    "perplexity": _llm_engine("perplexity", "PERPLEXITY_API_KEY", "~/.perplexity_key",
+                              "https://api.perplexity.ai/v1/agent",
+                              _perplexity_build, _perplexity_parse),
+    "openai": _llm_engine("openai", "OPENAI_API_KEY", "~/.openai_key",
+                          "https://api.openai.com/v1/responses",
+                          _openai_build, _openai_parse),
+}
+
+
+def engines_status() -> dict:
+    rows = []
+    for name, fn in ENGINES.items():
+        try:
+            probe = fn("what is photosynthesis")
+        except Exception as e:                                    # noqa: BLE001
+            probe = {"state": "failing", "detail": f"{type(e).__name__}: {e}"}
+        rows.append({"engine": name, "state": probe["state"],
+                     "detail": probe.get("detail"),
+                     "answered": probe.get("has_answer"),
+                     "citations": len(probe.get("references") or [])})
+    usable = [r for r in rows if r["state"] == "answered"]
+    return {"ok": bool(usable), "check": "geo-engines", "engines": rows,
+            "usable": [r["engine"] for r in usable],
+            "note": ("`no_key` is CANNOT ASK, not a finding. A sweep with no usable "
+                     "engine refuses rather than reporting that nobody cites you."),
+            **({} if usable else
+               {"reason": "no answer engine is reachable - nothing can be measured"})}
+
+
+# ------------------------------------------------------------------- the ask
+# ⚠ SENTENCE BOUNDARIES ARE NOT ASCII. `(?<=[.!?])\s+` never fires on Japanese
+# (which ends sentences with 。 and uses no spaces), on Hindi/Bengali (danda ।)
+# or on Urdu (۔). Measured 2026-09-01 across 21 locale homes: it returned the
+# WHOLE paragraph as "one sentence" for hi and ur - 55 and 57 words - and a
+# 3-"word" fragment for ja, producing three confident findings about the site
+# that were entirely artefacts of this regex.
+# ⚠ TWO ALTERNATIVES, not one relaxed rule. An ASCII terminator must be
+# FOLLOWED BY WHITESPACE or the dot in `Example.com` ends a sentence -
+# which is precisely what a first attempt at this did, silently breaking the
+# "which sentences name us" extraction. CJK and Indic terminators carry no
+# trailing space, so they match zero-width.
+_SENT = re.compile(r"(?<=[.!?])\s+|(?<=[。！？।॥۔])\s*")
+
+# Scripts that do not delimit words with spaces. A whitespace word count is
+# meaningless for these - the same sentence reads as 3 "words" in Japanese and
+# 20 in English - so they are measured in CHARACTERS against their own bounds.
+_NOSPACE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0e7f]")
+# Does the paragraph HAVE sentence structure? Three attempts got this wrong, so
+# the reasoning is worth keeping:
+#   1. "did the split fire" - no. The split needs whitespace after an ASCII
+#      terminator, so a paragraph that is exactly ONE sentence ending at the end
+#      of the string has no split point, and the length check gets waived on
+#      most paragraphs on the site.
+#   2. "is a terminator present anywhere" - no. The dot in `Star-Runner 2.4`
+#      is a terminator by that test, so a Thai paragraph with no sentence
+#      punctuation at all still counted as structured.
+#   3. What actually answers it: either the split produced more than one piece,
+#      or the paragraph ENDS on a terminator. Thai satisfies neither, English
+#      and Japanese satisfy one or both.
+_TERM_END = re.compile(r"[.!?。！？।॥۔][\"'\u2019\u201d)\]]*\s*$")
+
+
+def _mentions(text: str, domain: str, brand: str | None) -> list[str]:
+    """Sentences that name us - returned VERBATIM for a human to judge.
+
+    Deliberately NOT an automated fact-check. Deciding whether an assistant's
+    claim about a site is true needs the site's own ground truth and a judgement;
+    what this can do honestly is surface the exact sentences so the judgement is
+    made on the real words rather than on a summary of them."""
+    rx = _name_patterns(domain, brand)
+    if not rx:
+        return []
+    # Definitions and file markers can sit on their own line or span a
+    # sentence break, so the markup goes first and sentences are split after.
+    # Each sentence is still returned VERBATIM from the original text.
+    out = []
+    for s in _SENT.split(text or ""):
+        if any(r.search(_prose(s)) for r in rx):
+            out.append(s.strip())
+    return out[:8]
+
+
+# A citation is not a mention. Citation MARKUP is blanked before matching, so
+# a cited answer counts on the CITED rung only - left in, every cited answer
+# also read as "mentioned" and the two rungs merged. That markup is more than
+# link targets: ChatGPT's chips put our HOST in the link LABEL
+# (`([nova.app](https://nova.app/x?utm_source=chatgpt.com))`), and answers carry
+# footnote definitions, `[n]` markers, file-citation brackets and private-use
+# cite spans. Rules from Canonry's answerProseForMentions (contracts/src/
+# answer-prose.ts), each linear - no nested quantifiers.
+_HOSTLIKE = re.compile(r"^\s*(?:https?://)?(?:www\.)?[\w-]+(?:\.[\w-]+)+(?:/\S*)?\s*$|^\s*\d+\s*$")
+_LINK = re.compile(r"\[([^\]\n]*)\]\(([^)\s]*)\)")
+_MARKUP = [
+    re.compile("\ue200[^\ue201]*\ue201"),                   # OpenAI cite span
+    re.compile("\u3010[^\u3011]*\u3011"),                   # 【4:0†host】
+    re.compile(r"(?m)^[ \t]*\[\^?[^\]\n]+\]:.*$"),           # footnote / reference definition
+    re.compile(r"!\[[^\]\n]*\]\([^)\s]*\)"),                # image, alt text and all
+]
+_AFTER_LINKS = [
+    re.compile(r"\[\^?\d+(?:[,\s]+\d+)*\]"),                  # [1] [^2] [1, 3]
+    re.compile(r"<https?://[^>\s]*>", re.I),                  # autolink
+    re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),               # email: not a name
+    # A bare URL: RFC 3986 ASCII only, never ending on punctuation, so it stops
+    # at an em dash, a CJK comma or a closing bracket. The lookbehind is not
+    # \b, which never fires after a CJK character.
+    re.compile(r"(?<![A-Za-z0-9])https?://[A-Za-z0-9\-._~:/?#@!$&*+;=%]*[A-Za-z0-9\-_~/#@$&*+=%]", re.I),
+]
+# Kept for _list_rank's item text (link targets and URLs only).
+_URL_SPAN = re.compile(r"\]\([^)\s]*\)|<https?://[^>\s]*>|(?<![A-Za-z0-9])https?://[^\s)\]>\"']+", re.I)
+
+# Scripts written without word spaces (or, for Hangul, with particles glued
+# on): a name there has no edges to test, so it matches anywhere. Everything
+# else gets a Unicode word edge that EXCLUDES these, so `Notion` in
+# `Notionは便利` still matches while `Nova` in `ÉNova` does not.
+_NOEDGE = "\u0e00-\u0e7f\u1100-\u11ff\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"
+_CJK = re.compile(f"[{_NOEDGE}]")
+_W = f"[^\\W{_NOEDGE}]"
+_ZERO_WIDTH = re.compile("[\u200b-\u200d\u2060\ufeff]")
+
+
+def _foldable(ch: str) -> bool:
+    o = ord(ch)
+    return o < 0x0250 or 0x0370 <= o < 0x0530 or 0x1E00 <= o < 0x1F00
+
+
+def _fold(s: str) -> str:
+    """One spelling per name: NFKC (full-width -> ASCII), zero-width dropped,
+    accents stripped from Latin/Greek/Cyrillic only - a Japanese dakuten or a
+    Hangul jamo is part of the letter, not decoration."""
+    s = unicodedata.normalize("NFKD", _ZERO_WIDTH.sub("", s or ""))
+    out, base = [], ""
+    for ch in s:
+        if unicodedata.category(ch) == "Mn":
+            if base and _foldable(base):
+                continue
+        else:
+            base = ch
+        out.append(ch)
+    return unicodedata.normalize("NFKC", "".join(out))
+
+
+def _prose(s: str) -> str:
+    """The words of an answer with its citation markup blanked, folded."""
+    for rx in _MARKUP:
+        s = rx.sub(" ", s)
+    s = _LINK.sub(lambda m: " " if _HOSTLIKE.match(m.group(1)) else f" {m.group(1)} ", s)
+    for rx in _AFTER_LINKS:
+        s = rx.sub(" ", s)
+    return _fold(s)
+
+
+def _name_patterns(domain: str, brand: str | None) -> list[re.Pattern]:
+    """How we are NAMED: the domain and its registrable form, plus every brand
+    alias (comma-separated). A name is a token, not a substring: `nova` inside
+    `Casanova`, `nova.app` inside `supernova.app` or `play-nova.app`, and the
+    brand `Nova` as the label of `nova.io` are all somebody else.
+
+    Terms under 3 characters are dropped - a blank alias matched every answer
+    in elmo before it was guarded, and a 1-2 letter one nearly does. CJK names
+    have no ASCII word edges, so they match anywhere."""
+    pats = []
+    doms = {d for raw in (domain or "").split(",") for d in (raw.lower().strip(),
+                                                             _registrable(raw.lower().strip())) if d}
+    for d in sorted(doms, key=len, reverse=True):
+        # `www.` is the one prefix that is still us; any other label, dot,
+        # hyphen or word character in front is somebody else's host.
+        pats.append(re.compile(r"(?:(?<=www\.)|(?<![.\-@])(?<!" + _W + r"))" + re.escape(d)
+                               + r"(?!" + _W + r"|-)(?!\.[a-z0-9])", re.I))
+    for alias in (brand or "").split(","):
+        alias = _fold(" ".join(alias.split()))
+        if len(alias) < 3 and not (alias and _CJK.search(alias)):
+            continue
+        # `Vexlo IQ` also as `Vexlo-IQ`, `VexloIQ`, `Vexlo  IQ`.
+        body = r"[\s\-_]*".join(re.escape(t) for t in re.split(r"[\s\-_]+", alias) if t)
+        if _CJK.search(alias):
+            pats.append(re.compile(body, re.I))
+        else:
+            pats.append(re.compile(r"(?<!" + _W + r")" + body + r"(?!" + _W + r")(?!\.[a-z0-9])", re.I))
+    return pats
+
+
+def _observe(fn, name: str, query: str, gl: str, hl: str, use_cache: bool) -> dict:
+    ck = f"{name}:{gl}:{hl}:{query}"
+    got = cache_get("geo", ck, CACHE_TTL) if use_cache else None
+    if got is None:
+        try:
+            got = fn(query, gl=gl, hl=hl)
+        except Exception as e:                                    # noqa: BLE001
+            got = {"state": "failing", "detail": f"{type(e).__name__}: {e}"}
+        if use_cache and got.get("state") in ("answered", "no_key"):
+            cache_put("geo", ck, got)
+    return got
+
+
+def _observation(got: dict, name: str, domain: str, brand: str | None) -> dict:
+    """One engine answer -> one observation. Never a verdict on its own."""
+    refs = [_ref(r.get("url") or "", r.get("domain") or "") for r in got.get("references") or []]
+    furniture = ENGINE_FURNITURE.get(name, set())
+    raw = [_registrable(r["domain"]) for r in refs if r.get("domain")]
+    doms = [d for d in raw if d not in furniture]
+    urls: dict[str, str] = {}
+    for r in refs:
+        d = _registrable(r["domain"])
+        if d and d not in furniture and d not in urls:
+            urls[d] = r["url"]
+    owned = _owned(domain)
+    ours = next((d for d in doms if d in owned), owned[0] if owned else "")
+    cited = ours in doms and ours in owned
+    # RETRIEVED is the rung below CITED: pages the engine read while answering
+    # (ChatGPT's `web_results`, Perplexity's `search_results`) and did not put
+    # in front of the user. Kept apart - merging them inflated "cited" in
+    # every tool niubigeo's source classes were written to correct.
+    retrieved = [_registrable(_ref(r.get("url") or "", r.get("domain") or "")["domain"])
+                 for r in got.get("retrieved") or []]
+    retrieved = [d for d in retrieved if d and d not in furniture]
+    sentences = _mentions(got.get("text", ""), domain, brand)
+    return {"cited": cited,
+            "retrieved": any(d in owned for d in retrieved),
+            "fan_out_queries": got.get("fan_out_queries"),
+            "citation_position": (doms.index(ours) + 1) if cited else None,
+            "cited_domains": doms,
+            "domain_urls": urls,
+            "references_seen": len(raw),
+            "unresolved_wrappers": sum(1 for r in refs if r.get("unresolved_wrapper")),
+            "engine_furniture_excluded": sorted(set(raw) & furniture),
+            "sentences_naming_us": sentences,
+            "sentences_backed_by_us": [x["text"] for x in got.get("supports") or []
+                                       if any(d in owned for d in x.get("domains") or [])],
+            "list_rank": _list_rank(got.get("text", ""), _name_patterns(domain, brand)),
+            "answer_excerpt": (got.get("text") or "")[:400]}
+
+
+# Rate bands for the "is this stable" reading: a band name is only reported as
+# settled when BOTH ends of the Wilson interval fall in it.
+PARSER_MIN = 5
+RATE_BANDS = [(0.5, "usually_cited"), (1e-9, "sometimes_cited"), (0.0, "not_cited")]
+
+
+def _default_method(name: str, gl: str, hl: str) -> dict | None:
+    """SerpApi's Google engines take gl/hl as sent; a cached answer from
+    before methods were recorded has none, and says so with None."""
+    if name in ("google_ai_overview", "google_ai_mode"):
+        return {"provider": "serpapi", "engine": name, "location_requested": gl,
+                "location_sent": gl, "language_sent": hl}
+    return None
+
+
+def ask(query: str, domain: str, *, brand: str | None = None,
+        engines: list[str] | None = None, gl="us", hl="en",
+        use_cache: bool = True, runs: int = 1) -> dict:
+    """One question, every reachable engine, `runs` times each.
+
+    ⚠ AI ANSWERS ARE NON-DETERMINISTIC. The same prompt returns different
+    sources run to run, so a single answer is an anecdote and `cited: false`
+    from one run is a coin toss reported as a state. With `runs > 1` every
+    engine is asked that many times (cache bypassed - a cached answer replayed
+    N times is ONE observation wearing N hats) and the row carries the citation
+    RATE with its n. `runs == 1` is still allowed and is marked
+    `single_observation: true` so nobody reads it as a rate."""
+    domain = ",".join(_host(d.strip()) or d.strip().lower() for d in domain.split(",") if d.strip())
+    want = engines or list(ENGINES)
+    runs = max(1, int(runs or 1))
+    # A question that names us gets an answer that names us back - that is an
+    # echo, not visibility (oneglanse's analysis rule). Flagged here, and kept
+    # out of the unbranded rate in sweep().
+    names_us = any(r.search(_prose(query)) for r in _name_patterns(domain, brand))
+    if runs > 1:
+        use_cache = False
+    rows = []
+    for name in want:
+        fn = ENGINES.get(name)
+        if not fn:
+            rows.append({"engine": name, "state": "failing", "detail": "unknown engine",
+                         "cited": None})
+            continue
+        obs, states, details = [], [], []
+        method = None
+        for _ in range(runs):
+            got = _observe(fn, name, query, gl, hl, use_cache)
+            states.append(got["state"])
+            method = got.get("method") or method or _default_method(name, gl, hl)
+            if got["state"] != "answered":
+                details.append(got.get("detail"))
+                continue
+            if not got.get("has_answer"):
+                obs.append(None)          # surface absent on this run
+                continue
+            obs.append(_observation(got, name, domain, brand))
+        answered = [o for o in obs if o is not None]
+        surfaceless = sum(1 for o in obs if o is None)
+        asked_ok = len(obs)               # runs where the engine actually answered
+        if asked_ok == 0:
+            # Every run was cannot-ask. NOT evidence of anything about citation.
+            worst = "failing" if "failing" in states else (states[0] if states else "failing")
+            rows.append({"engine": name, "state": worst,
+                         "detail": next((d for d in details if d), None),
+                         "cited": None,
+                         "runs": {"requested": runs, "answered": 0, "cited": 0,
+                                  "rate": None, "single_observation": False},
+                         "why": "cannot ask - this is NOT evidence of not being cited"})
+            continue
+        if not answered:
+            # ⚠ NO ANSWER SURFACE IS NOT "NOT CITED". A SERP with no AI Overview is
+            # not an answer we were left out of - there was nothing to be in. Folding
+            # the two produces a citation rate computed against answers that never
+            # existed, which understates every result and cannot be told from a real
+            # miss once it is a number.
+            rows.append({"engine": name, "state": "answered", "has_answer": False,
+                         "cited": None, "citations": 0,
+                         "runs": {"requested": runs, "answered": 0,
+                                  "no_answer_surface": surfaceless, "cited": 0,
+                                  "rate": None, "single_observation": False},
+                         "why": "no answer surface on this query - nothing to be cited BY"})
+            continue
+        n_cited = sum(1 for o in answered if o["cited"])
+        counts: dict[str, int] = {}
+        first_seen: list[str] = []
+        for o in answered:
+            for d in o["cited_domains"]:
+                if d not in counts:
+                    counts[d] = 0
+                    first_seen.append(d)
+            for d in set(o["cited_domains"]):
+                counts[d] += 1
+        owned = _owned(domain)
+        # Most-cited first; ties keep the engine's own citation order, which is
+        # the position signal on a single run.
+        union = sorted(first_seen, key=lambda d: -counts[d])
+        sentences = []
+        for o in answered:
+            for x in o["sentences_naming_us"]:
+                if x not in sentences:
+                    sentences.append(x)
+        last = answered[-1]
+        band = stats.stable_band(n_cited, len(answered), RATE_BANDS)
+        domain_urls: dict[str, str] = {}
+        for o in answered:
+            for d, u in o["domain_urls"].items():
+                domain_urls.setdefault(d, u)
+        ranks = [o["list_rank"] for o in answered if o.get("list_rank")]
+        rows.append({
+            "engine": name, "state": "answered", "has_answer": True, "method": method,
+            # `cited` is CITED IN AT LEAST ONE RUN - the answer to "can this engine
+            # cite us". How often is `runs.rate`; the two are reported together
+            # so neither can be read alone.
+            "cited": n_cited > 0,
+            "retrieved_not_cited": any(o["retrieved"] and not o["cited"] for o in answered),
+            "runs": {"requested": runs, "answered": len(answered),
+                     "no_answer_surface": surfaceless, "cited": n_cited,
+                     "mentioned": sum(1 for o in answered if o["sentences_naming_us"]),
+                     "rate": round(n_cited / len(answered), 3),
+                     "ci95": band["ci"], "band": band["band"], "stable": band["stable"],
+                     "small_sample": stats.small_sample(len(answered)),
+                     "single_observation": len(answered) == 1},
+            "references_seen": sum(o["references_seen"] for o in answered),
+            "unresolved_wrappers": sum(o["unresolved_wrappers"] for o in answered),
+            "domain_urls": domain_urls,
+            "best_list_rank": min(ranks) if ranks else None,
+            "citation_position": next((o["citation_position"] for o in answered
+                                       if o["cited"]), None),
+            "citations": len(last["cited_domains"]),
+            "cited_domains": union,
+            "domain_run_counts": counts,
+            "engine_furniture_excluded": sorted({d for o in answered
+                                                 for d in o["engine_furniture_excluded"]}),
+            "competitors_cited": [d for d in union if d not in owned],
+            "sentences_backed_by_us": list(dict.fromkeys(
+                x for o in answered for x in o.get("sentences_backed_by_us") or []))[:8],
+            "fan_out": ("returned" if any(o.get("fan_out_queries") for o in answered)
+                        else "missing" if FAN_OUT_SUPPORT.get(name) == "supported"
+                        else "not_offered" if FAN_OUT_SUPPORT.get(name) in ("never", "not_currently")
+                        else "unknown"),
+            # THE LADDER: retrieved (crawllog) -> cited -> mentioned -> recommended.
+            # `mentioned` is mechanical; whether a mention is a RECOMMENDATION, a
+            # hedge or a warning is a reading of the verbatim sentence, and it is
+            # left to the reader on purpose - an auto-label here would be the
+            # same instrument grading its own answer.
+            "fan_out_queries": sorted({q for o in answered for q in (o.get("fan_out_queries") or [])}) or None,
+            "mentioned": bool(sentences),
+            "sentences_naming_us": sentences[:8],
+            "framing": ("read `sentences_naming_us` verbatim - recommended, neutral, "
+                        "hedged or recommended-against is a human call, never auto-labelled"),
+            "answer_excerpt": last["answer_excerpt"],
+        })
+    answered = [r for r in rows if r["state"] == "answered" and r.get("has_answer")]
+    if not answered:
+        surfaceless = [r for r in rows if r["state"] == "answered" and not r.get("has_answer")]
+        if surfaceless and len(surfaceless) == len([r for r in rows if r["state"] == "answered"]):
+            return {"ok": True, "check": "geo-ask", "query": query, "domain": domain,
+                    "runs_per_engine": runs, "query_names_us": names_us,
+                    "engines_asked": len(rows), "engines_answered": 0,
+                    "cited_by": [], "not_cited_by": [],
+                    "no_answer_surface": [r["engine"] for r in surfaceless],
+                    "could_not_ask": [r["engine"] for r in rows if r["state"] != "answered"],
+                    "results": rows,
+                    "note": ("every engine reached this query and NONE produced an answer "
+                             "surface. That is a fact about the query, not about us.")}
+        return refuse("geo-ask",
+                      "no engine answered, so nothing is known about citation. This is "
+                      "'cannot ask', which must never be reported as 'not cited'.",
+                      query=query, engines=rows)
+    return {
+        "ok": True, "check": "geo-ask", "query": query, "domain": domain,
+        "runs_per_engine": runs, "query_names_us": names_us,
+        "engines_asked": len(rows), "engines_answered": len(answered),
+        "cited_by": [r["engine"] for r in answered if r["cited"]],
+        "not_cited_by": [r["engine"] for r in answered if r["cited"] is False],
+        "mentioned_by": [r["engine"] for r in answered if r.get("mentioned")],
+        "no_answer_surface": [r["engine"] for r in rows
+                              if r["state"] == "answered" and not r.get("has_answer")],
+        "could_not_ask": [r["engine"] for r in rows if r["state"] != "answered"],
+        "results": rows,
+        **({"note": ("runs_per_engine is 1: every `cited` is a SINGLE OBSERVATION of a "
+                     "non-deterministic system. Pass --runs 3 or more before reading it "
+                     "as a rate.")} if runs == 1 else {}),
+    }
+
+
+def _bank_from_state(root: str | None, limit: int) -> tuple[list[str], str | None]:
+    """The question bank comes from TRACKED KEYWORDS, not from imagination.
+
+    A hand-written bank measures whatever its author already believed the site
+    was about; the tracked list is what the site is actually trying to rank for,
+    and it is already curated."""
+    cmd = [sys.executable, str(HERE / "seostate.py")]
+    if root:
+        cmd += ["--root", root]
+    cmd += ["keywords"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        d = json.loads(p.stdout or "{}")
+    except Exception as e:                                        # noqa: BLE001
+        return [], f"cannot read tracked keywords: {e}"
+    rows = d.get("keywords") if isinstance(d, dict) else d
+    if not isinstance(rows, list) or not rows:
+        return [], "no tracked keywords in .seo/ - pass --bank instead"
+    out = []
+    for r in rows:
+        kw = r.get("keyword") if isinstance(r, dict) else r
+        if isinstance(kw, str) and kw.strip():
+            out.append(kw.strip())
+    return out[:limit], None
+
+
+def sweep(domain: str, questions: list[str], *, brand=None, engines=None,
+          gl="us", hl="en", use_cache: bool = True, runs: int = 1) -> dict:
+    if not questions:
+        return refuse("geo-sweep", "no questions - pass --bank or --from-state")
+    st = engines_status()
+    if not st["ok"]:
+        return refuse("geo-sweep",
+                      "no answer engine is reachable, so a sweep would report 'not cited' "
+                      "for every question without having asked anything",
+                      engines=st["engines"])
+    asked, refused = [], []
+    for q in questions:
+        r = ask(q, domain, brand=brand, engines=engines, gl=gl, hl=hl,
+                use_cache=use_cache, runs=runs)
+        (refused if r.get("control_failed") else asked).append(r)
+
+    if not asked:
+        return refuse("geo-sweep", "every question failed to reach an engine",
+                      examples=[r.get("reason") for r in refused][:3])
+
+    owned = _owned(domain)
+    ours = owned[0] if owned else ""
+    # PARSER-DRIFT CONTROL. An engine that answered at least PARSER_MIN
+    # distinct questions and returned ZERO references across all of them is
+    # far likelier to have renamed a payload field than to cite nobody - and
+    # read naively, every one of those answers is a confident "not cited".
+    # Its answers leave the rate (unknown, not zero) and the engine is named.
+    per_engine: dict[str, list[int]] = {}
+    for r in asked:
+        for e in r["results"]:
+            if e["state"] == "answered" and e.get("has_answer"):
+                q = per_engine.setdefault(e["engine"], [0, 0])
+                q[0] += 1
+                q[1] += e.get("references_seen", 0)
+    suspect = sorted(k for k, (nq, refs) in per_engine.items() if nq >= PARSER_MIN and refs == 0)
+    share: dict[str, int] = {}
+    urls: dict[str, str] = {}
+    surfaced = cited = 0
+    for r in asked:
+        for e in r["results"]:
+            if e["state"] != "answered" or not e.get("has_answer"):
+                continue
+            if e["engine"] in suspect:
+                continue
+            for d, u in (e.get("domain_urls") or {}).items():
+                urls.setdefault(d, u)
+            # Every RUN that produced an answer is one answer. With --runs N a
+            # question contributes up to N answers per engine, and the rate is
+            # over answers, so it stays a rate and never a count of questions.
+            surfaced += e["runs"]["answered"]
+            cited += e["runs"]["cited"]
+            # ⚠ ONE VOTE PER ANSWER. Counting every citation lets a single answer
+            # that links a domain four times outweigh four answers that each link
+            # it once, and `share` then exceeds 1.0 - which it did, at 4.2.
+            for d, n in e["domain_run_counts"].items():
+                share[d] = share.get(d, 0) + n
+    top = sorted(share.items(), key=lambda kv: -kv[1])
+    lo, hi = stats.wilson(cited, surfaced)
+    # Branded and unbranded questions are different measurements: "Nova vs
+    # Acme" is answered with Nova's name by construction, so a blended rate
+    # rises with the share of branded questions in the bank, not with anything
+    # the site did. Reported apart (open-seo's ai-visibility-audit split).
+    segs: dict[str, dict] = {}
+    for r in asked:
+        seg = segs.setdefault("branded" if r.get("query_names_us") else "unbranded",
+                              {"questions": 0, "answers": 0, "answers_citing_us": 0,
+                               "answers_mentioning_us": 0})
+        seg["questions"] += 1
+        for e in r["results"]:
+            if e["state"] != "answered" or not e.get("has_answer") or e["engine"] in suspect:
+                continue
+            seg["answers"] += e["runs"]["answered"]
+            seg["answers_citing_us"] += e["runs"]["cited"]
+            seg["answers_mentioning_us"] += e["runs"].get("mentioned", 0)
+    for seg in segs.values():
+        n = seg["answers"]
+        for k in ("citing", "mentioning"):
+            x = seg[f"answers_{k}_us"]
+            ci = stats.wilson(x, n)
+            seg[f"{k}_rate"] = round(x / n, 3) if n else None
+            seg[f"{k}_rate_ci95"] = [round(ci[0], 4), round(ci[1], 4)] if ci[0] is not None else None
+    kinds: dict[str, int] = {}
+    for d, n in top:
+        if d not in owned:
+            k = classify_source(d, urls.get(d, ""))
+            kinds[k] = kinds.get(k, 0) + n
+    return {
+        "ok": True, "check": "geo-sweep", "domain": ours,
+        "parser_suspect_engines": suspect,
+        "parser_suspect_rule": (f"an engine that answered >= {PARSER_MIN} questions with zero "
+                                f"references in all of them is a likely broken reader; its "
+                                f"answers are excluded from every rate below"),
+        "citation_rate_ci95": [round(lo, 4), round(hi, 4)] if lo is not None else None,
+        "small_sample": stats.small_sample(surfaced),
+        "competitor_citations_by_kind": dict(sorted(kinds.items(), key=lambda kv: -kv[1])),
+        "runs_per_engine": max(1, int(runs or 1)),
+        "questions_asked": len(asked), "questions_refused": len(refused),
+        "answers_seen": surfaced,
+        "single_observations": (max(1, int(runs or 1)) == 1),
+        "answers_citing_us": cited,
+        "citation_rate": (round(cited / surfaced, 3) if surfaced else None),
+        "by_query_type": segs,
+        # How each engine was ASKED (model, endpoint, location sent). `diff`
+        # refuses to pair two sweeps whose method for an engine differs.
+        "methods": {e["engine"]: e["method"] for r in asked for e in r["results"]
+                    if e.get("method")},
+        "share_of_voice": [{"domain": d, "answers_citing_it": n,
+                            "share": round(n / surfaced, 3) if surfaced else None,
+                            "kind": classify_source(d, urls.get(d, "")), "example": urls.get(d)}
+                           for d, n in top[:20]],
+        "our_rank_in_share_of_voice": (
+            next((i + 1 for i, (d, _n) in enumerate(top) if d in owned), None)),
+        "uniform_verdict_tell": uniform_verdict(
+            [str(e["cited"]) for r in asked for e in r["results"]
+             if e["state"] == "answered" and e.get("has_answer")],
+            subject="answers"),
+        "per_question": [{"query": r["query"], "query_names_us": r.get("query_names_us"),
+                          "cited_by": r["cited_by"],
+                          "not_cited_by": r["not_cited_by"],
+                          "mentioned_by": r.get("mentioned_by") or [],
+                          "rates": {e["engine"]: e["runs"]["rate"] for e in r["results"]
+                                    if e["state"] == "answered" and e.get("has_answer")},
+                          # [cited, answered] per engine - what `diff` pairs on.
+                          "counts": {e["engine"]: [e["runs"]["cited"], e["runs"]["answered"]]
+                                     for e in r["results"]
+                                     if e["state"] == "answered" and e.get("has_answer")
+                                     and e["engine"] not in suspect},
+                          "no_answer_surface": r.get("no_answer_surface") or [],
+                          "could_not_ask": r["could_not_ask"]} for r in asked],
+        "reading": (
+            "`answers_seen` counts engine answers that actually EXISTED - a SERP with no "
+            "AI Overview is not an answer we were left out of, and it is excluded rather "
+            "than counted as a miss. `citation_rate` is over those. `questions_refused` "
+            "are questions no engine answered at all: unknown, never zero. "
+            "`share` is one vote per ANSWER, not per citation link, so it cannot exceed "
+            "1.0. The engine's own domains are excluded and listed in "
+            "`engine_furniture_excluded` per result. With `single_observations: true` "
+            "every rate here is built from ONE answer per engine per question - a "
+            "non-deterministic system sampled once. Re-run with --runs 3+ before "
+            "reading a movement in `citation_rate` as a change."),
+    }
+
+
+# ------------------------------------------------------------------ diff
+# Below this many DISCORDANT questions an exact test cannot reach p < 0.05 even
+# when every one moved the same way (5 unanimous flips: p = 0.0625), so the
+# engine is reported as too few changes rather than tested.
+MIN_DISCORDANT = 6
+
+
+def diff_sweeps(before: dict, after: dict) -> dict:
+    """Did citation change between two sweeps? Questions answered by the same
+    engine in BOTH runs are paired; each pair votes up, down or same, and the
+    votes get an exact sign test (McNemar when each side is one run). Engines
+    are Holm-corrected together. A rate compared across different question
+    sets is not a change - it is a different denominator."""
+    def table(sw):
+        out = {}
+        for q in sw.get("per_question") or []:
+            for eng, (c, n) in (q.get("counts") or {}).items():
+                if n:
+                    out.setdefault(eng, {})[q["query"]] = c / n
+        return out
+    b, a = table(before), table(after)
+    # A changed method is a changed instrument: a model swap or a location
+    # that started being sent moves the rate on its own. Those engines are
+    # not compared. A sweep from before methods were recorded cannot be
+    # checked; it is compared and named.
+    mb, ma = before.get("methods") or {}, after.get("methods") or {}
+    changed = {e: {"before": mb[e], "after": ma[e]} for e in set(mb) & set(ma) if mb[e] != ma[e]}
+    unrecorded = sorted(e for e in set(a) & set(b) if e not in mb or e not in ma)
+    for e in changed:
+        a.pop(e, None)
+        b.pop(e, None)
+    engines, pvals = {}, []
+    paired_total = 0
+    for eng in sorted(set(b) & set(a)):
+        qs = sorted(set(b[eng]) & set(a[eng]))
+        paired_total += len(qs)
+        up = sum(1 for q in qs if a[eng][q] > b[eng][q])
+        down = sum(1 for q in qs if a[eng][q] < b[eng][q])
+        row = {"paired_questions": len(qs), "gained": up, "lost": down,
+               "unchanged": len(qs) - up - down}
+        if up + down < MIN_DISCORDANT:
+            row.update(verdict="too_few_changes", p=None,
+                       why=f"{up + down} question(s) moved; an exact test needs {MIN_DISCORDANT}+ "
+                           f"to be able to reach p < 0.05")
+        else:
+            row["p"] = stats.mcnemar_exact(down, up)
+            pvals.append((eng, row["p"]))
+        engines[eng] = row
+    if pvals:
+        for (eng, _p), adj in zip(pvals, stats.holm([p_ for _e, p_ in pvals])):
+            r = engines[eng]
+            r["p_holm"] = round(adj, 6)
+            r["verdict"] = (("gained" if r["gained"] > r["lost"] else "lost") if adj < 0.05
+                            else "no_detectable_change")
+    return {"ok": True, "check": "geo-diff", "paired_questions": paired_total,
+            "engines": engines,
+            "unpaired_engines": sorted(set(a) ^ set(b)),
+            "method_changed": changed,
+            "method_unrecorded": unrecorded,
+            "reading": ("Only questions both runs asked the same engine are compared. "
+                        "`too_few_changes` is not 'no change' - it is a sample that cannot "
+                        "tell. Engines are Holm-corrected together.")}
+
+
+# ------------------------------------------------------------------- gap
+POS_BUCKETS = [(1, 1.5, "1"), (1.5, 2.5, "2"), (2.5, 3.5, "3"), (3.5, 5.5, "4-5"),
+               (5.5, 10.5, "6-10"), (10.5, 20.5, "11-20"), (20.5, 1e9, "21+")]
+
+
+def _bucket(pos: float) -> str:
+    for lo, hi, name in POS_BUCKETS:
+        if lo <= pos < hi:
+            return name
+    return "21+"
+
+
+def _gsc_query_rows(gsc: dict) -> list[dict]:
+    dims = gsc.get("dimensions") or gsc.get("request", {}).get("dimensions") or ["query"]
+    qi = dims.index("query") if "query" in dims else 0
+    out = []
+    for r in gsc.get("rows") or []:
+        keys = r.get("keys") or []
+        if len(keys) <= qi:
+            continue
+        out.append({"query": keys[qi], "clicks": float(r.get("clicks") or 0),
+                    "impressions": float(r.get("impressions") or 0),
+                    "position": float(r.get("position") or 0)})
+    return out
+
+
+def gap_tiers(gsc: dict, obs: dict[str, dict], min_impressions: int = 25) -> dict:
+    """Search Console rows joined to the answer surface for the same query.
+
+        B  ranks 1-4, an overview exists, and it cites someone else (or nobody):
+           the page Google already trusts is not the one its answer quotes
+        A  ranks 5-20 and a competitor is cited: the answer is the way in
+        C  cited, but CTR below what OUR OWN no-overview queries earn at that
+           position: cited and still losing the click
+        D  no answer surface on this query
+        X  could not ask, or no observation: unknown, never a tier
+
+    The C baseline is the median CTR of this site's own no-overview queries
+    in the same position bucket - derived from the data, never a CTR curve
+    from somebody else's study. Under 3 such queries it is unknown."""
+    rows = [r for r in _gsc_query_rows(gsc) if r["impressions"] >= min_impressions]
+    for r in rows:
+        r["ctr"] = r["clicks"] / r["impressions"] if r["impressions"] else 0.0
+        r["bucket"] = _bucket(r["position"])
+    base: dict[str, list[float]] = {}
+    for r in rows:
+        o = obs.get(r["query"]) or {}
+        if o.get("state") == "answered" and not o.get("has_answer"):
+            base.setdefault(r["bucket"], []).append(r["ctr"])
+
+    def median(xs):
+        xs = sorted(xs)
+        return xs[len(xs) // 2] if len(xs) % 2 else (xs[len(xs) // 2 - 1] + xs[len(xs) // 2]) / 2
+
+    out = []
+    for r in rows:
+        o = obs.get(r["query"])
+        row = {k: r[k] for k in ("query", "clicks", "impressions", "position", "bucket")}
+        row["ctr"] = round(r["ctr"], 4)
+        if not o or o.get("state") != "answered":
+            row.update(tier="X", why="no usable observation - unknown")
+        elif not o.get("has_answer"):
+            row.update(tier="D", why="no answer surface")
+        elif o.get("cited"):
+            b = base.get(r["bucket"], [])
+            if len(b) >= 3:
+                bl = median(b)
+                row["baseline_ctr"] = round(bl, 4)
+                row.update(tier="C" if r["ctr"] < bl else "cited",
+                           why=("cited, CTR below this site's no-overview median at this position"
+                                if r["ctr"] < bl else "cited, CTR at or above baseline"))
+            else:
+                row.update(tier="cited", why="cited; too few no-overview queries in this bucket "
+                                              "for a CTR baseline")
+        elif r["position"] <= 4.5:
+            row.update(tier="B", why="ranks top-4, the overview cites " +
+                       (", ".join(o.get("competitors") or []) or "no one"))
+        elif r["position"] <= 20.5:
+            row.update(tier="A", why="ranks 5-20, the overview cites " +
+                       (", ".join(o.get("competitors") or []) or "no one"))
+        else:
+            row.update(tier="not_cited", why="ranks beyond page 2 and is not cited")
+        out.append(row)
+    order = {"B": 0, "A": 1, "C": 2, "D": 3, "cited": 4, "not_cited": 5, "X": 6}
+    out.sort(key=lambda x: (order.get(x["tier"], 9), -x["impressions"]))
+
+    # AI-Overview impact at equal position: pooled clicks/impressions for
+    # queries WITH an overview against those without, per position bucket.
+    impact = []
+    for _lo, _hi, name in POS_BUCKETS:
+        with_ = [r for r in rows if r["bucket"] == name and (obs.get(r["query"]) or {}).get("has_answer")]
+        without = [r for r in rows if r["bucket"] == name
+                   and (obs.get(r["query"]) or {}).get("state") == "answered"
+                   and not (obs.get(r["query"]) or {}).get("has_answer")]
+        if not with_ or not without:
+            continue
+        cmp_ = stats.compare_rates(int(sum(r["clicks"] for r in without)),
+                                   int(sum(r["impressions"] for r in without)),
+                                   int(sum(r["clicks"] for r in with_)),
+                                   int(sum(r["impressions"] for r in with_)))
+        impact.append({"bucket": name, "queries_without": len(without), "queries_with": len(with_),
+                       "ctr_without": cmp_["before"]["rate"], "ctr_with": cmp_["after"]["rate"],
+                       "verdict": cmp_["verdict"], "ci95_difference": cmp_["ci95"]})
+    tiers = {}
+    for r in out:
+        tiers[r["tier"]] = tiers.get(r["tier"], 0) + 1
+    return {"ok": True, "check": "geo-gap", "queries": len(out), "tiers": tiers, "rows": out,
+            "ai_overview_ctr_impact": impact,
+            "impact_caveat": ("Impressions are not independent trials (one searcher can see a "
+                              "result many times), so the interval is approximate. Queries with "
+                              "an overview also differ in intent from those without; read a "
+                              "difference as a lead, not a measured cause.")}
+
+
+def _obs_from_ask(r: dict, engine: str) -> dict:
+    for e in r.get("results") or []:
+        if e["engine"] != engine:
+            continue
+        if e["state"] != "answered":
+            return {"state": e["state"]}
+        return {"state": "answered", "has_answer": bool(e.get("has_answer")),
+                "cited": bool(e.get("cited")), "competitors": e.get("competitors_cited") or []}
+    return {"state": "failing"}
+
+
+# ------------------------------------------------------- extractable answers
+_TAG = re.compile(r"<[^>]+>")
+# ⚠ SCRIPT-AWARE ON PURPOSE. The first version tokenised headings with
+# `[a-z0-9]{4,}`, which extracts NOTHING from a pure-CJK heading - so the
+# "does the lead sentence name its own subject" test could not run, and
+# returned False. Measured 2026-09-01: that flagged a CJK locale homepage, the
+# page earning 68% of this site's clicks, as not liftable, on a check that never executed.
+# "Cannot evaluate" reported as "fails" is the exact error this skill exists to
+# prevent, reproduced from scratch in new code.
+#
+# \w with re.UNICODE covers Cyrillic, Arabic, Devanagari, Greek and Latin.
+# CJK and Thai have no word boundaries at all, so a token rule cannot work
+# there: those fall back to CHARACTER BIGRAMS, which is what a reader matching
+# a Chinese title against a Chinese sentence is actually doing.
+_WORD = re.compile(r"\w{3,}", re.UNICODE)
+_CJK_THAI = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0e7f]")
+_BLOCK = re.compile(r"(?is)<(script|style|nav|header|footer|aside)[^>]*>.*?</\1>")
+_P = re.compile(r"(?is)<p[^>]*>(.*?)</p>")
+_H1 = re.compile(r"(?is)<h1[^>]*>(.*?)</h1>")
+
+
+def _sentence_length(sentence: str) -> tuple[int, str, bool]:
+    """(size, unit, within_bounds). A liftable sentence is one a reader could be
+    quoted; how that is measured depends on the script."""
+    stripped = re.sub(r"\s+", "", sentence)
+    # ANY CJK/Thai presence switches to characters. A ratio threshold looks
+    # principled and is not: the real Japanese lead here is 28% kana/kanji
+    # because the product and engine names stay in Latin, so a 0.3 cutoff
+    # measured it as 3 "words" and flagged the page.
+    if _NOSPACE.search(sentence):
+        n = len(stripped)
+        return n, "chars", 12 <= n <= 120
+    n = len(sentence.split())
+    return n, "words", 6 <= n <= 45
+
+
+# A capitalised multi-word or hyphenated name - "Star-Runner", "Pixel
+# Harbor", "Moon-Base". Used as a FALLBACK subject signal.
+# Two shapes, because products are named both ways. `Star-Runner`,
+# `Pixel Harbor`, `Moon-Base` - and the all-caps abbreviation with an
+# optional version, `SR 2.4`, which the first pattern misses entirely and which
+# is how half a site's own prose may refer to its product.
+# ⚠ The all-caps branch needs TWO capitals, so an ordinary sentence-initial word
+# ("There", "Organising") cannot satisfy it.
+_PROPER = re.compile(
+    r"\b[A-Z][a-z]{2,}(?:[-\u2011][A-Z][a-z]+|\s+[A-Z][a-z]{2,})+"
+    r"|\b[A-Z]{2,}(?:\s*\d+(?:\.\d+)*)?\b"
+    # Model names: M3, X100, RTX, A7. One capital plus digits is a name, and
+    # `The M3 is a compact camera` was flagged for lacking a subject because
+    # neither the 3-character word rule nor the two-capital rule reaches it.
+    r"|\b[A-Z][0-9]+\b")
+
+
+def _names_subject(h1: str, sentence: str, *, extra: tuple[str, ...] = ()) -> tuple[bool, str]:
+    """Does the lead sentence stand on its own - does it name what it is about?
+
+    ⚠ THE H1 IS EVIDENCE, NOT THE DEFINITION. A first version matched only
+    against h1 tokens and flagged `/landers/classic` - h1 "A Classic That
+    Never Needed Replacing", lead "Star-Runner started life in 1999 as a
+    mod for Moon-Base" - which names its subject about as clearly as a sentence
+    can. The h1 was a stylish headline; the rule was measuring vocabulary
+    agreement between two elements rather than whether the SENTENCE is
+    self-contained, which is the thing an assistant cares about.
+
+    So: h1/title/slug tokens first, then a proper-noun fallback. What still
+    fails is a lead that names nothing at all - "There is no purchase, no
+    subscription and no account" - which is exactly what should fail.
+
+    Returns (verdict, basis); `not-evaluable` is NOT `False`."""
+    if not sentence:
+        return False, "not-evaluable"
+    if not h1 and not extra:
+        return (bool(_PROPER.search(sentence)), "proper-noun") if _PROPER.search(sentence) \
+            else (False, "not-evaluable")
+    low_h, low_s = h1.lower(), sentence.lower()
+    # ⚠ CJK IS CHECKED FIRST, and this ordering is the fix. `\w` with re.UNICODE
+    # DOES match CJK - it tokenises a Chinese heading into whole runs between
+    # punctuation ("在线玩星际跑者"), which are far too long to appear verbatim in
+    # a sentence. So the word branch does not fail to find tokens, it finds
+    # useless ones, and a bigram fallback placed after it never runs.
+    if _CJK_THAI.search(h1):
+        bigrams = {h1[i:i + 2] for i in range(len(h1) - 1)
+                   if _CJK_THAI.match(h1[i]) and _CJK_THAI.match(h1[i + 1])}
+        if bigrams:
+            return any(b in sentence for b in bigrams), "cjk-bigrams"
+    sources = " ".join([h1, *extra]).lower()
+    words = [w for w in _WORD.findall(sources)
+             if not w.isdigit() and not _CJK_THAI.search(w)]
+    if words and any(w in low_s for w in words):
+        return True, "words"
+    # FALLBACK: the sentence names a proper entity of its own. This is what
+    # rescues a well-written lead under a headline-style h1.
+    if _PROPER.search(sentence):
+        return True, "proper-noun"
+    return (False, "words") if words else (False, "not-evaluable")
+
+
+def extractable(root: str, limit: int = 400) -> dict:
+    """Does each page state its answer in ONE self-contained, liftable sentence?
+
+    The geolook thesis, applied: an assistant lifts a sentence, not a page. A
+    definition split across three paragraphs, or one that opens on a pronoun
+    with no antecedent, cannot be quoted - so the page can rank and still never
+    be the sentence that gets used."""
+    d = Path(root)
+    if not d.is_dir():
+        return refuse("geo-extractable", f"{root} is not a directory")
+    files = [p for p in sorted(d.rglob("*"))
+             if p.suffix.lower() in (".html", ".htm") and p.is_file()][:limit]
+    if not files:
+        return refuse("geo-extractable", f"no HTML under {root}")
+    rows = []
+    for p in files:
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        body = _BLOCK.sub(" ", raw)
+        h1 = _TAG.sub("", (_H1.search(body) or [None, ""])[1]).strip() if _H1.search(body) else ""
+        paras = [re.sub(r"\s+", " ", _TAG.sub(" ", m)).strip() for m in _P.findall(body)]
+        lead = next((x for x in paras if len(x) > 60), "")
+        pieces = [t.strip() for t in _SENT.split(lead) if t.strip()] if lead else []
+        first = pieces[0] if pieces else ""
+        words, unit, len_ok = _sentence_length(first)
+        # ⚠ If the paragraph carries NO sentence terminator, "the first sentence"
+        # IS the whole paragraph and its length says nothing. Thai writes without
+        # sentence-ending punctuation at all, so this fires there every time -
+        # and reporting 270 chars as "too long to quote" is a statement about
+        # Thai orthography, not about the page. Not evaluable, so it does not vote.
+        has_terminator = len(pieces) > 1 or bool(lead and _TERM_END.search(lead))
+        if not has_terminator:
+            len_ok = True
+        # A liftable sentence names its subject and stands alone. The two ways it
+        # fails are opening on a pronoun with no antecedent, and being so long
+        # that quoting it means quoting a paragraph.
+        # ⚠ A PRONOUN AND AN EXISTENTIAL ARE NOT THE SAME FAULT.
+        # "It does not mean a stripped-down clone" dangles: the quote carries
+        # nothing to resolve `It` against. But "There are three ways to get
+        # Star-Runner 2.4 running on a Chromebook" is a perfectly quotable
+        # sentence - the existential opener is a construction, not a defect,
+        # and it fails only when the sentence ALSO names nothing. Treating the
+        # two alike flagged a genuinely good lead on /guides/chromebook.
+        slug_words = p.stem.replace("-", " ").replace("_", " ")
+        names_subject, subject_basis = _names_subject(h1, first, extra=(slug_words,))
+        bare_pronoun = bool(re.match(
+            r"(?i)^(it|this|that|they|these|those|he|she)\b", first))
+        existential = bool(re.match(r"(?i)^there\s+(is|are|was|were)\b", first))
+        starts_pronoun = bare_pronoun or (existential and not names_subject)
+        # A subject test that could not run must not vote. `evaluable` is False
+        # only when there is no h1 at all, and then the page is judged on the
+        # rules that DID run rather than failed on the one that did not.
+        ok = (bool(first) and len_ok and not starts_pronoun
+              and (names_subject or subject_basis == "not-evaluable"))
+        rows.append({"file": str(p.relative_to(d)), "h1": h1[:80],
+                     "lead_sentence": first[:200], "length": words, "unit": unit,
+                     "liftable": ok, "subject_check": subject_basis,
+                     "length_check": "words/chars" if has_terminator else "not-evaluable",
+                     "why": None if ok else ", ".join(filter(None, [
+                         "no lead paragraph" if not first else "",
+                         f"{words} {unit}" if first and not len_ok and has_terminator else "",
+                         ("opens on a pronoun with no antecedent" if bare_pronoun else
+                          "opens on `there is/are` and names no subject" if starts_pronoun
+                          else ""),
+                         ("does not name its own subject"
+                          if first and not names_subject
+                          and subject_basis != "not-evaluable" else ""),
+                     ]))})
+    bad = [r for r in rows if not r["liftable"]]
+    return {
+        "ok": True, "check": "geo-extractable", "scanned": len(rows),
+        "liftable": len(rows) - len(bad), "not_liftable": len(bad),
+        "uniform_verdict_tell": uniform_verdict([str(r["liftable"]) for r in rows],
+                                                subject="pages"),
+        "worst": bad[:25],
+        "reading": ("An assistant lifts a SENTENCE, not a page. A page can rank and still "
+                    "never be the sentence that gets quoted. ⚠ This is a shape check, not "
+                    "a quality one - a liftable sentence that is wrong still passes."),
+    }
+
+
+# -------------------------------------------------------------------- control
+def run_control() -> dict:
+    c = Controls("geo-control")
+
+    c.check("host_is_normalised", _host("https://WWW.Example.com/x") == "example.com")
+    c.check("registrable_folds_a_subdomain",
+            _registrable("a.b.example.com") == "example.com")
+    c.check("registrable_does_not_over_fold",
+            _registrable("notexample.com") == "notexample.com")
+
+    text = ("Pixelharbor.example runs the game in a browser. Rival.example also does. "
+            "Nothing here names anyone else.")
+    m = _mentions(text, "pixelharbor.example", None)
+    c.check("a_sentence_naming_us_is_surfaced", len(m) == 1 and "Pixelharbor" in m[0], str(m))
+    c.check("a_sentence_naming_a_competitor_is_not_ours",
+            not any("Rival" in x for x in m))
+    c.check("mentions_are_case_insensitive",
+            len(_mentions("visit PIXELHARBOR.EXAMPLE now.", "pixelharbor.example", None)) == 1)
+    c.check("no_mention_yields_nothing",
+            _mentions("A sentence about nothing in particular.", "x.test", None) == [])
+
+    # ⚠ THE CENTRAL DISTINCTION. `cannot_ask` must never become `not_cited`.
+    saved = dict(ENGINES)
+    try:
+        ENGINES.clear()
+        ENGINES["nokey"] = lambda q, **_: {"state": "no_key", "detail": "no key"}
+        r = ask("q", "example.com", use_cache=False)
+        c.check("an_unaskable_engine_refuses_rather_than_reporting_not_cited",
+                r.get("control_failed") is True, str(r)[:160])
+        c.check("the_refusal_says_so_in_words",
+                "never be reported as 'not cited'" in str(r.get("reason", "")))
+        c.check("engines_status_is_not_ok_with_no_usable_engine",
+                engines_status()["ok"] is False)
+        # ⚠ use_cache=False on EVERY control sweep. The cache is keyed on
+        # (engine, gl, hl, query) and knows nothing about which fixture was
+        # installed, so a previous control run's stub answers this one's
+        # question - `answers_seen` came back 0 for a fixture that plainly
+        # returns an answer.
+        c.check("a_sweep_with_no_engine_refuses",
+                sweep("example.com", ["q"], use_cache=False).get("control_failed") is True)
+
+        ENGINES.clear()
+        ENGINES["fake"] = lambda q, **_: {
+            "state": "answered", "has_answer": True,
+            "text": "Rival.example is the usual answer here.",
+            "references": [{"domain": "rival.example", "url": "https://rival.example"},
+                           {"domain": "other.example", "url": "https://other.example"}]}
+        miss = ask("q", "example.com", use_cache=False)
+        c.check("an_answer_without_us_is_not_cited",
+                miss["results"][0]["cited"] is False and miss["not_cited_by"] == ["fake"])
+        c.check("competitors_are_named", miss["results"][0]["competitors_cited"] ==
+                ["rival.example", "other.example"])
+
+        ENGINES["fake"] = lambda q, **_: {
+            "state": "answered", "has_answer": True, "text": "Example.com does it.",
+            "references": [{"domain": "rival.example", "url": "https://rival.example"},
+                           {"domain": "www.example.com", "url": "https://www.example.com/a"}]}
+        hit = ask("q", "example.com", use_cache=False)
+        c.check("an_answer_citing_us_is_cited", hit["results"][0]["cited"] is True)
+        c.check("the_citation_position_is_reported",
+                hit["results"][0]["citation_position"] == 2)
+        c.check("a_www_citation_still_matches_the_bare_domain",
+                hit["cited_by"] == ["fake"])
+        c.check("cited_and_not_cited_are_distinguishable",
+                miss["results"][0]["cited"] != hit["results"][0]["cited"])
+
+        ENGINES["fake"] = lambda q, **_: {
+            "state": "answered", "has_answer": True, "text": "",
+            "references": [{"domain": "google.com", "url": "https://google.com/a"},
+                           {"domain": "google.com", "url": "https://google.com/b"},
+                           {"domain": "rival.example", "url": "https://rival.example"},
+                           {"domain": "rival.example", "url": "https://rival.example/x"}]}
+        ENGINE_FURNITURE["fake"] = {"google.com"}
+        f = ask("q", "example.com", use_cache=False)
+        c.check("the_engines_own_domain_is_excluded",
+                "google.com" not in f["results"][0]["cited_domains"],
+                str(f["results"][0]["cited_domains"]))
+        c.check("but_the_exclusion_is_reported_not_silent",
+                f["results"][0]["engine_furniture_excluded"] == ["google.com"])
+        sv = sweep("example.com", ["q1", "q2"], use_cache=False)
+        c.check("share_of_voice_is_one_vote_per_answer",
+                all(r["share"] <= 1.0 for r in sv["share_of_voice"]),
+                str(sv["share_of_voice"]))
+        c.check("a_domain_cited_twice_in_one_answer_gets_one_vote",
+                next(r["answers_citing_it"] for r in sv["share_of_voice"]
+                     if r["domain"] == "rival.example") == 2,
+                "2 answers, not 4 citations")
+        ENGINE_FURNITURE.pop("fake", None)
+
+        # A SERP with no overview is not an answer we were left out of.
+        ENGINES["fake"] = lambda q, **_: {"state": "answered", "has_answer": False,
+                                          "text": "", "references": []}
+        sw = sweep("example.com", ["q1", "q2"], use_cache=False)
+        c.check("an_absent_answer_surface_is_not_counted_as_a_miss",
+                sw["answers_seen"] == 0 and sw["citation_rate"] is None,
+                str({k: sw[k] for k in ("answers_seen", "citation_rate")}))
+        one = ask("q", "example.com", use_cache=False)
+        c.check("no_answer_surface_is_not_reported_as_not_cited",
+                one["not_cited_by"] == [] and one["no_answer_surface"] == ["fake"],
+                str({k: one.get(k) for k in ("not_cited_by", "no_answer_surface")}))
+        c.check("and_it_is_not_a_refusal_either", one["ok"] is True,
+                "the query genuinely has no answer surface - that is a fact about "
+                "the query, not an inability to ask")
+
+        # ⚠ NON-DETERMINISM. An engine that cites us on odd runs and not on even
+        # ones is a coin, and a single run reports the coin as a state.
+        calls = {"n": 0}
+
+        def flip(q, **_):
+            calls["n"] += 1
+            refs = [{"domain": "rival.example", "url": "https://rival.example"}]
+            if calls["n"] % 2:
+                refs.append({"domain": "example.com", "url": "https://example.com/g"})
+            return {"state": "answered", "has_answer": True,
+                    "text": "Example.com is one option.", "references": refs}
+        ENGINES.clear()
+        ENGINES["coin"] = flip
+        calls["n"] = 0
+        single = ask("q", "example.com", use_cache=False)
+        c.check("a_single_run_is_labelled_a_single_observation",
+                single["results"][0]["runs"]["single_observation"] is True
+                and "SINGLE OBSERVATION" in single.get("note", ""))
+        calls["n"] = 0
+        four = ask("q", "example.com", use_cache=False, runs=4)
+        r0 = four["results"][0]["runs"]
+        c.check("four_runs_are_four_observations", r0["requested"] == 4 and r0["answered"] == 4,
+                str(r0))
+        c.check("the_rate_is_over_answered_runs", r0["cited"] == 2 and r0["rate"] == 0.5, str(r0))
+        c.check("cited_means_cited_in_at_least_one_run", four["results"][0]["cited"] is True)
+        c.check("a_rate_is_not_a_single_observation", r0["single_observation"] is False)
+        c.check("domain_run_counts_carry_the_per_domain_rate",
+                four["results"][0]["domain_run_counts"] == {"rival.example": 4, "example.com": 2},
+                str(four["results"][0]["domain_run_counts"]))
+        c.check("the_mentioned_rung_is_reported",
+                four["results"][0]["mentioned"] is True and four["mentioned_by"] == ["coin"])
+        c.check("framing_is_never_auto_labelled",
+                "human call" in four["results"][0]["framing"])
+
+        # A run whose surface was absent is not in the denominator.
+        calls["n"] = 0
+
+        def sometimes(q, **_):
+            calls["n"] += 1
+            if calls["n"] % 3 == 0:
+                return {"state": "answered", "has_answer": False, "text": "", "references": []}
+            return {"state": "answered", "has_answer": True, "text": "",
+                    "references": [{"domain": "example.com", "url": "https://example.com"}]}
+        ENGINES["coin"] = sometimes
+        six = ask("q", "example.com", use_cache=False, runs=6)
+        r6 = six["results"][0]["runs"]
+        c.check("an_absent_surface_run_is_excluded_from_the_rate",
+                r6["answered"] == 4 and r6["no_answer_surface"] == 2 and r6["rate"] == 1.0,
+                str(r6))
+
+        # Every run cannot-ask is still cannot-ask, not a 0/N rate.
+        ENGINES["coin"] = lambda q, **_: {"state": "failing", "detail": "HTTP 503"}
+        dead = ask("q", "example.com", use_cache=False, runs=3)
+        c.check("all_runs_cannot_ask_is_a_refusal_not_a_zero_rate",
+                dead.get("control_failed") is True, str(dead)[:120])
+
+        # The sweep rate is over answers, and --runs multiplies answers not questions.
+        ENGINES["coin"] = flip
+        calls["n"] = 0
+        sv = sweep("example.com", ["q1", "q2"], use_cache=False, runs=2)
+        c.check("a_sweep_counts_every_answered_run_as_an_answer",
+                sv["answers_seen"] == 4 and sv["answers_citing_us"] == 2
+                and sv["citation_rate"] == 0.5, str({k: sv[k] for k in
+                                                     ("answers_seen", "answers_citing_us",
+                                                      "citation_rate")}))
+        c.check("share_of_voice_still_cannot_exceed_one",
+                all(r["share"] <= 1.0 for r in sv["share_of_voice"]))
+        c.check("a_sweep_says_when_it_is_single_observations",
+                sv["single_observations"] is False
+                and sweep("example.com", ["q1"], use_cache=False)["single_observations"] is True)
+    finally:
+        ENGINES.clear()
+        ENGINES.update(saved)
+    c.check("the_engine_registry_is_restored", set(ENGINES) == set(saved))
+    c.check("ai_mode_and_searchapi_engines_are_registered",
+            {"google_ai_mode", "searchapi_chatgpt", "searchapi_gemini",
+             "searchapi_perplexity", "searchapi_bing_copilot"} <= set(ENGINES))
+
+    # AI Mode parser: the recorded shape from the 2026-09-20 live probe, and the
+    # two shapes that must NOT read as an answer.
+    aimode_fixture = {
+        "text_blocks": [{"type": "paragraph", "snippet": "Playing in a browser is easy."},
+                        {"type": "list", "list": [{"snippet": "Open rival.example"}]}],
+        "references": [{"title": "t", "link": "https://rival.example/en/", "source": "Rival.example"},
+                       {"title": "u", "link": "https://other.example/x/", "source": "Other"}],
+    }
+    c.check("ai_mode_flattens_nested_list_blocks",
+            _flatten_blocks(aimode_fixture["text_blocks"], []) ==
+            ["Playing in a browser is easy.", "Open rival.example"])
+    c.check("ai_mode_furniture_excludes_google",
+            "google.com" in ENGINE_FURNITURE["google_ai_mode"])
+    ob = _observation({"text": "x", "references": [
+        {"domain": _host(r["link"])} for r in aimode_fixture["references"]]},
+        "google_ai_mode", "example.com", None)
+    c.check("ai_mode_references_resolve_to_registrable_domains",
+            ob["cited_domains"] == ["rival.example", "other.example"], str(ob["cited_domains"]))
+
+    # Extractability, both directions.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "good.html").write_text(
+            "<html><body><h1>Wall climbing</h1><p>Wall climbing is the technique of "
+            "chaining jumps to keep speed above the engine's run cap.</p></body></html>",
+            encoding="utf-8")
+        (d / "pronoun.html").write_text(
+            "<html><body><h1>Wall climbing</h1><p>It is the thing everyone asks about "
+            "first, and it takes a while to learn properly.</p></body></html>",
+            encoding="utf-8")
+        e = extractable(str(d))
+        by = {r["file"]: r for r in ([*e["worst"]] + [])}
+        c.check("a_self_contained_lead_is_liftable", e["liftable"] == 1, str(e))
+        c.check("a_pronoun_lead_is_not", "pronoun.html" in by, str(sorted(by)))
+        c.check("the_reason_is_given",
+                "pronoun" in (by.get("pronoun.html") or {}).get("why", ""),
+                str((by.get("pronoun.html") or {}).get("why")))
+        c.check("extractability_discriminates",
+                e["liftable"] == 1 and e["not_liftable"] == 1,
+                f"1 of each expected, got {e['liftable']} liftable / "
+                f"{e['not_liftable']} not - a checker that passes or fails "
+                f"everything is measuring the template, not the prose")
+        (d / "long.html").write_text(
+            "<html><body><h1>Wall climbing</h1><p>Wall climbing " + "and more words " * 30
+            + "ends here.</p></body></html>", encoding="utf-8")
+        e2 = extractable(str(d))
+        c.check("an_over_long_lead_is_not_liftable",
+                any(r["file"] == "long.html" for r in e2["worst"]),
+                "quoting a 60-word sentence means quoting a paragraph")
+        c.check("an_empty_directory_refuses",
+                extractable(str(d / "nope")).get("control_failed") is True)
+    # 2026-10-03 readers, each both ways.
+    c.check("registrable_keeps_a_public_suffix_site_whole",
+            _registrable("news.bbc.co.uk") == "bbc.co.uk" and _registrable("a.example.com") == "example.com")
+    c.check("a_citation_link_is_not_a_prose_mention",
+            _mentions("See [1](https://x.test/a).", "x.test", None) == []
+            and len(_mentions("X.test explains it.", "x.test", None)) == 1)
+    c.check("a_brand_inside_a_word_is_not_a_mention",
+            _mentions("Casanova.", "nova.app", "Nova") == [] and len(_mentions("Nova.", "nova.app", "Nova")) == 1)
+    c.check("tracking_and_text_fragment_stripped",
+            _clean_url("https://a.test/p?utm_source=openai#:~:text=x") == "https://a.test/p")
+    c.check("source_kinds_discriminate",
+            classify_source("reddit.com", "https://reddit.com/r/x") == "forum"
+            and classify_source("plainblog.test", "https://plainblog.test/about") == "other")
+    d_ = diff_sweeps({"per_question": [{"query": f"q{i}", "counts": {"e": [0, 1]}} for i in range(9)]},
+                     {"per_question": [{"query": f"q{i}", "counts": {"e": [1, 1]}} for i in range(9)]})
+    c.check("diff_detects_a_unanimous_9_question_gain", d_["engines"]["e"]["verdict"] == "gained")
+    d_ = diff_sweeps({"per_question": [{"query": "q", "counts": {"e": [0, 1]}}]},
+                     {"per_question": [{"query": "q", "counts": {"e": [1, 1]}}]})
+    c.check("diff_refuses_to_test_one_flip", d_["engines"]["e"]["verdict"] == "too_few_changes")
+    c.check("a_link_chip_labelled_with_our_host_is_not_a_mention",
+            _mentions("Book at [nova.app](https://nova.app/x).", "nova.app", None) == [])
+    c.check("CONTROL_a_prose_mention_survives_markup_stripping",
+            len(_mentions("Nova [1] is fine.", "nova.app", "Nova")) == 1)
+    c.check("a_hangul_brand_is_matched", len(_mentions("\uc0bc\uc131 \uc88b\ub2e4.", "z.test", "\uc0bc\uc131")) == 1)
+    return c.verdict(engines=sorted(ENGINES))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="action", required=True)
+    sub.add_parser("engines", help="which answer engines can be asked right now")
+
+    a1 = sub.add_parser("ask", help="one question, every reachable engine")
+    a1.add_argument("--query", required=True)
+    a1.add_argument("--domain", required=True)
+    a1.add_argument("--brand")
+    a1.add_argument("--engine", action="append")
+    a1.add_argument("--gl", default="us")
+    a1.add_argument("--hl", default="en")
+    a1.add_argument("--no-cache", action="store_true")
+    a1.add_argument("--runs", type=int, default=1,
+                    help="ask each engine N times and report the citation RATE with n "
+                         "(answers are non-deterministic; 3-5 is the useful range)")
+
+    a2 = sub.add_parser("sweep", help="a question bank, and the share of voice it reveals")
+    a2.add_argument("--domain", required=True)
+    a2.add_argument("--brand")
+    a2.add_argument("--bank", help="file with one question per line")
+    a2.add_argument("--from-state", action="store_true",
+                    help="use the TRACKED keywords in .seo/ as the bank")
+    a2.add_argument("--root")
+    a2.add_argument("--max", type=int, default=10, help="cap the questions (each costs calls)")
+    a2.add_argument("--engine", action="append")
+    a2.add_argument("--gl", default="us")
+    a2.add_argument("--hl", default="en")
+    a2.add_argument("--no-cache", action="store_true")
+    a2.add_argument("--runs", type=int, default=1,
+                    help="ask each engine N times per question (each run costs a call)")
+
+    a3 = sub.add_parser("extractable", help="is each page's answer one liftable sentence?")
+    a3.add_argument("--root", required=True)
+    a3.add_argument("--limit", type=int, default=400)
+
+    d1 = sub.add_parser("diff", help="two sweeps -> paired, exact-tested citation change")
+    d1.add_argument("--before", required=True)
+    d1.add_argument("--after", required=True)
+
+    g1 = sub.add_parser("gap", help="Search Console queries x the answer surface: who ranks "
+                                    "and is not quoted")
+    g1.add_argument("--domain", required=True)
+    g1.add_argument("--gsc", required=True, help="JSON from `gsc.py query --dimensions query`")
+    g1.add_argument("--engine", default="google_ai_overview")
+    g1.add_argument("--top", type=int, default=30, help="ask about the N highest-impression queries")
+    g1.add_argument("--min-impressions", type=int, default=25)
+    g1.add_argument("--brand")
+    g1.add_argument("--gl", default="us")
+    g1.add_argument("--hl", default="en")
+    g1.add_argument("--runs", type=int, default=1)
+
+    sub.add_parser("control", help="prove cannot_ask never becomes not_cited")
+
+    a = ap.parse_args()
+    if a.action == "engines":
+        out = engines_status()
+    elif a.action == "control":
+        out = run_control()
+    elif a.action == "extractable":
+        out = extractable(a.root, a.limit)
+    elif a.action == "ask":
+        out = ask(a.query, a.domain, brand=a.brand, engines=a.engine, gl=a.gl, hl=a.hl,
+                  use_cache=not a.no_cache, runs=a.runs)
+    elif a.action == "diff":
+        out = diff_sweeps(json.loads(Path(a.before).read_text(encoding="utf-8")),
+                          json.loads(Path(a.after).read_text(encoding="utf-8")))
+    elif a.action == "gap":
+        gsc = json.loads(Path(a.gsc).read_text(encoding="utf-8"))
+        rows = sorted(_gsc_query_rows(gsc), key=lambda r: -r["impressions"])
+        rows = [r for r in rows if r["impressions"] >= a.min_impressions][: a.top]
+        if not rows:
+            out = refuse("geo-gap", "no Search Console query rows at --min-impressions - "
+                                    "nothing to join (check the export has the query dimension)")
+        elif a.engine not in ENGINES:
+            out = refuse("geo-gap", f"unknown engine {a.engine}")
+        else:
+            obs = {r["query"]: _obs_from_ask(
+                ask(r["query"], a.domain, brand=a.brand, engines=[a.engine], gl=a.gl, hl=a.hl,
+                    runs=a.runs), a.engine) for r in rows}
+            if not any(o.get("state") == "answered" for o in obs.values()):
+                out = refuse("geo-gap", f"{a.engine} answered none of {len(rows)} queries - "
+                                        f"cannot ask is not 'not cited'",
+                             states=sorted({o.get('state') for o in obs.values()}))
+            else:
+                out = {**gap_tiers(gsc, obs, a.min_impressions), "engine": a.engine,
+                       "asked": len(rows)}
+    else:
+        qs, err = ([], None)
+        if a.bank:
+            try:
+                qs = [x.strip() for x in Path(a.bank).read_text(encoding="utf-8").splitlines()
+                      if x.strip() and not x.startswith("#")]
+            except OSError as e:
+                err = f"cannot read {a.bank}: {e}"
+        elif a.from_state:
+            qs, err = _bank_from_state(a.root, a.max)
+        out = (refuse("geo-sweep", err) if err else
+               sweep(a.domain, qs[:a.max], brand=a.brand, engines=a.engine,
+                     gl=a.gl, hl=a.hl, use_cache=not a.no_cache, runs=a.runs))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0 if out.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

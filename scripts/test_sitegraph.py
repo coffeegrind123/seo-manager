@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Controls for sitegraph.py.
+
+Every case below is a bug that existed during the build and was caught, or a
+distinction that silently produces a confident wrong answer. In order:
+
+  1. tag-only boilerplate detection missed a nav rendered as <p class="sectionnav">,
+     so 3,900 furniture links counted as editorial and the broken silo looked fine
+  2. self-referential hreflang counted as an inbound link, so every English-only
+     silo looked reachable from elsewhere
+  3. a silo that only links to itself has healthy inlink counts and is reachable
+     from nowhere - the actual 2026-08-31 failure
+  4. a start node that was never crawled reports "unreachable: everything", which
+     reads as a catastrophic site fault rather than a bad --start
+  5. zero extracted links must refuse a verdict, not report every page an orphan
+  6. a page that IS the global nav hub is the most reachable page on the site, so
+     counting it as a contextual orphan pads the number until it means nothing
+  7. a LOCALE home is furniture inside its own locale and invisible to a
+     site-wide frequency rule - and the fix for that must not be able to hide
+     the island silo, which has an almost identical share
+"""
+import json
+import subprocess
+import sys
+import tempfile
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sitegraph as sg  # noqa: E402
+
+FAILS = []
+
+
+def check(name, cond):
+    if cond:
+        print(f"  ok   {name}")
+    else:
+        print(f"  FAIL {name}")
+        FAILS.append(name)
+
+
+def build(pages: dict[str, str]) -> sg.Graph:
+    """pages: url -> html. Builds a graph the way the offline walker would."""
+    g = sg.Graph()
+    for url, html in pages.items():
+        p = sg.parse(html)
+        src = g.uid(url)
+        g.meta[src] = {"exists": True, "words": p.words, "title": p.title}
+        for href in p.alternates:
+            g.adj[src].append((g.uid(sg.norm(href)), g.aid("[hreflang]"), True))
+        for href, anchor, boiler in p.links:
+            if not sg.is_internal(href, None):
+                continue
+            g.adj[src].append((g.uid(sg.norm(href)), g.aid(anchor), boiler))
+    return g
+
+
+print("parser + url controls")
+r = sg.run_control()
+check("run_control all green", r["ok"])
+check("norm collapses double slashes", sg.norm("/a//b") == "/a/b")
+check("norm handles query drop", sg.norm("/a?b=1") == "/a")
+check("norm keeps query when asked", sg.norm("/a?b=1", keep_query=True) == "/a?b=1")
+
+print("\n1. statistical boilerplate beats tag-only detection")
+# A nav rendered as a plain <p> - exactly a real site's `sectionnav`.
+pages = {f"/p{i}": '<p class="sectionnav"><a href="/hub">Hub</a></p>' for i in range(80)}
+pages["/p0"] += '<a href="/only">the one editorial link</a>'   # linked from ONE page
+pages["/hub"] = "<a href='/p0'>x</a>"
+pages["/only"] = "<p>nothing</p>"
+g = build(pages)
+sw = g.site_wide(0.3)
+check("frequent target flagged site-wide despite <p> markup", g._uid["/hub"] in sw)
+check("rare target NOT flagged site-wide", g._uid["/only"] not in sw)
+ctx = g.inbound(contextual_only=True, site_wide=sw)
+check("furniture excluded from contextual inbound", len(ctx.get(g._uid["/hub"], [])) == 0)
+check("editorial link kept in contextual inbound", len(ctx.get(g._uid["/only"], [])) == 1)
+
+print("\n2. self-referential hreflang is not an inbound link")
+g = build({"/en/x": '<link rel="alternate" hreflang="en" href="/en/x">'
+                    '<link rel="alternate" hreflang="x-default" href="/en/x">'})
+check("self-loop yields zero inbound", len(g.inbound().get(g._uid["/en/x"], [])) == 0)
+g2 = build({"/en/x": '<link rel="alternate" hreflang="es" href="/es/x">',
+            "/es/x": '<link rel="alternate" hreflang="en" href="/en/x">'})
+check("cross-locale alternate IS an inbound link",
+      len(g2.inbound().get(g2._uid["/es/x"], [])) == 1)
+
+print("\n3. island silo: healthy inlinks, reachable from nowhere")
+# Five pages that cross-link each other and nothing else points in.
+isl = {f"/iso/{i}": "".join(f'<a href="/iso/{j}">sib</a>' for j in range(5) if j != i)
+       for i in range(5)}
+isl["/other/a"] = '<a href="/other/b">x</a>'
+isl["/other/b"] = '<a href="/other/a">x</a><a href="/iso/0">into the island</a>'
+g = build(isl)
+inb = g.inbound(contextual_only=True, site_wide=g.site_wide(0.3))
+ext_for = lambda u: sum(1 for s, _a in inb.get(g._uid[u], [])
+                        if sg.silo_of(g.urls[s]) != sg.silo_of(u))
+check("island page has healthy RAW inbound", len(inb.get(g._uid["/iso/3"], [])) == 4)
+check("island page has ZERO external-silo inbound", ext_for("/iso/3") == 0)
+check("the one linked-in page is not an island", ext_for("/iso/0") == 1)
+
+print("\n3a. a silo with a well-linked HUB is not an island")
+# 60 leaves whose only inbound is the hub, plus a hub that IS linked from outside.
+# Leaves must NOT all link back to the hub, or the frequency rule correctly calls
+# the hub furniture and the silo has no entry point at all. The first version of
+# this test got that wrong. It is also the real distinction: /maps on the live
+# site earns its 992 entry points from MODE pages linking individual maps, not
+# from its own hub link, which IS furniture.
+hub = {f"/big/{i}": f'<a href="/big/{(i+1)%60}">sib</a>' for i in range(60)}
+hub["/big/hub"] = "".join(f'<a href="/big/{i}">leaf</a>' for i in range(60))
+for i in range(40):
+    hub[f"/else/{i}"] = '<a href="/else/0">x</a>'
+hub["/else/0"] = '<a href="/big/hub">the hub</a>'
+g = build(hub)
+sw = g.site_wide(0.3)
+inb = g.inbound(contextual_only=True, site_wide=sw)
+ext = [sum(1 for s2, _a in inb.get(g._uid[u], []) if sg.silo_of(g.urls[s2]) != "/big")
+       for u in hub if u.startswith("/big/")]
+entry = sum(1 for v in ext if v > 0)
+check("leaves have zero external inbound", sorted(ext)[len(ext) // 2] == 0)
+check("but the silo HAS an entry point (the hub)", entry >= 1)
+island_at = lambda e, n: e <= max(1, n // 100)
+# A SINGLE entry point still counts as an island, and that is deliberate rather
+# than a rounding accident: pre-fix /guides had exactly one and Google had still
+# never crawled any of its pages nine days in. One link into a silo is not a
+# crawl path. Plenty of entry points - /maps had 992 - is.
+check("one entry point is still an island (the measured /guides case)",
+      island_at(1, 60) is True)
+check("many entry points is not an island (the measured /maps case)",
+      island_at(992, 3435) is False)
+
+print("\n3b. locale prefixes fold into the content silo")
+loc = {}
+for lg in ("es", "de", "fr", "ar"):
+    for i in range(15):
+        loc[f"/{lg}/maps/m{i}"] = f'<a href="/{lg}/maps/m{(i+1)%15}">sib</a>'
+for i in range(15):
+    loc[f"/maps/m{i}"] = f'<a href="/maps/m{(i+1)%15}">sib</a>'
+g = build(loc)
+locs = sg.locale_prefixes(g)
+check("detects the four locale prefixes", locs == {"es", "de", "fr", "ar"})
+check("localized map folds into /maps", sg.silo_of("/ar/maps/m3", 1, locs) == "/maps")
+check("english map stays /maps", sg.silo_of("/maps/m3", 1, locs) == "/maps")
+check("without folding they differ", sg.silo_of("/ar/maps/m3", 1, set()) == "/ar")
+g2 = build({"/ui/a": '<a href="/ui/b">x</a>', "/ui/b": '<a href="/ui/a">y</a>'})
+check("a lone two-letter silo is NOT treated as a locale", sg.locale_prefixes(g2) == set())
+
+print("\n4. depth refuses on a start that was never crawled")
+with tempfile.TemporaryDirectory() as td:
+    gp = os.path.join(td, "g.json")
+    g = build({"/real": '<a href="/never-crawled">x</a>'})
+    with open(gp, "w") as fh:
+        json.dump(g.to_json({"mode": "offline"}), fh)
+    p = subprocess.run([sys.executable, os.path.join(os.path.dirname(sg.__file__), "sitegraph.py"),
+                        "depth", "--graph", gp, "--start", "/never-crawled"],
+                       capture_output=True, text=True)
+    d = json.loads(p.stdout)
+    check("refuses rather than reporting mass unreachability", d.get("control_failed") is True)
+    check("refusal exits non-zero", p.returncode != 0)
+
+print("\n5. a graph with no links refuses a verdict")
+g = build({"/a": "<p>no links</p>", "/b": "<p>none either</p>"})
+guard = sg.graph_guard(g, {})
+check("zero-edge graph refuses", guard is not None and guard.get("control_failed"))
+g = build({"/a": '<a href="/b">x</a>', "/b": '<a href="/a">y</a>'})
+check("healthy graph passes the guard", sg.graph_guard(g, {}) is None)
+
+print("\n6. offline path mapping")
+with tempfile.TemporaryDirectory() as td:
+    os.makedirs(os.path.join(td, "guides"))
+    os.makedirs(os.path.join(td, "how-to-play"))
+    open(os.path.join(td, "guides", "walljump.html"), "w").write('<a href="/x">x</a>')
+    open(os.path.join(td, "how-to-play", "index.html"), "w").write('<a href="/y">y</a>')
+    g, info = sg.build_offline([(td, "/")], False, ["index.html"])
+    check("file -> /guides/walljump", "/guides/walljump" in g._uid)
+    check("index.html -> /how-to-play", "/how-to-play" in g._uid)
+    g, _ = sg.build_offline([(td, "/")], False, ["index.html"], [(r"^/guides/", "/")])
+    check("--rewrite remaps the served path", "/walljump" in g._uid and "/guides/walljump" not in g._uid)
+
+print("\n7. a global-nav hub is not a contextual orphan")
+# 80 leaf pages whose nav links the hub, exactly like a real site's sectionnav.
+# The hub gets 80 inbound links and ZERO body links - the shape that made every
+# one of the site's 27 "contextual orphans" a false positive on 2026-09-01.
+pages = {f"/p{i}": '<p class="sectionnav"><a href="/hub">Hub</a></p>' for i in range(80)}
+# The hub body-links its leaves, so the leaves are properly reachable and the only
+# two interesting pages left are the hub itself and the genuinely unlinked one.
+pages["/hub"] = ("<p>the hub, linked from every nav and from no article body</p>"
+                 + "".join(f'<p><a href="/p{i}">leaf {i}</a></p>' for i in range(80)))
+pages["/lost"] = "<p>genuinely linked from nowhere</p>"
+g = build(pages)
+
+
+class A:
+    graph = None
+    contextual = True
+    near = 0
+    limit = 200
+    ignore = None
+    boiler_threshold = 0.3
+
+
+with tempfile.TemporaryDirectory() as td:
+    f = os.path.join(td, "g.json")
+    with open(f, "w", encoding="utf-8") as fh:
+        json.dump(g.to_json({"mode": "offline"}), fh)
+    A.graph = f
+    out = sg.cmd_orphans(A)
+
+check("the nav hub is NOT counted as an orphan", "/hub" not in out["orphan_urls"])
+check("the nav hub is still listed for review",
+      any(r["url"] == "/hub" for r in out["nav_hub_urls"]))
+check("the hub's real reachability is reported",
+      any(r["url"] == "/hub" and r["all_inlinks"] == 80 for r in out["nav_hub_urls"]))
+check("the genuinely unlinked page IS still an orphan", "/lost" in out["orphan_urls"])
+check("orphan count excludes the hub", out["orphans"] == 1)
+
+print("\n8. section-scoped furniture, without hiding the island")
+# A locale: 60 pages under /ja, every one linking to /ja by breadcrumb, and /ja
+# linked editorially from nowhere. The real 2026-09-01 shape.
+pages = {f"/ja/p{i}": '<nav><a href="/ja">\u9996\u9875</a></nav><p>content</p>'
+         for i in range(60)}
+# The locale home links its own silo, so the children are not orphans and the
+# only page under test is /ja itself.
+pages["/ja"] = ("<p>the locale home</p>"
+                + "".join(f'<p><a href="/ja/p{i}">page {i}</a></p>' for i in range(60)))
+# ...and, in the SAME graph, the island: 17 guides that cross-link each other and
+# are reached from nowhere outside. 16/17 = 0.94 share, which is higher than the
+# locale nav's own threshold - so only the parent-path rule separates them.
+for i in range(17):
+    body = "".join(f'<p><a href="/guides/g{j}">guide {j}</a></p>'
+                   for j in range(17) if j != i)
+    pages[f"/guides/g{i}"] = body
+# Filler, and it is load-bearing rather than padding: the whole bug is that a
+# locale nav is a LARGE share of its section and a TINY share of the site. With
+# only the pages above, /ja's 60 linkers are 77% of the corpus and site_wide
+# sees it fine - the fixture has to be big enough for the blindness to exist.
+for i in range(250):
+    # They carry their own nav, like any real page - a page with NO outbound link
+    # at all is implausible, and graph_guard correctly refuses a verdict on it.
+    pages[f"/maps/m{i}"] = ('<nav><a href="/maps">Maps</a></nav>'
+                            f'<p><a href="/maps/m{(i + 1) % 250}">next map</a></p>')
+g = build(pages)
+
+roots = g.section_roots()
+check("the locale home is detected as section furniture", g._uid["/ja"] in roots)
+check("a cross-linked guide is NOT - it is not its linkers' parent",
+      g._uid["/guides/g0"] not in roots)
+check("site_wide alone could never have seen the locale nav",
+      g._uid["/ja"] not in g.site_wide(0.3))
+
+with tempfile.TemporaryDirectory() as td:
+    f = os.path.join(td, "g.json")
+    with open(f, "w", encoding="utf-8") as fh:
+        json.dump(g.to_json({"mode": "offline"}), fh)
+    A.graph = f
+    out = sg.cmd_orphans(A)
+check("the locale home is not reported as an orphan",
+      "/ja" not in out["orphan_urls"])
+check("it is listed for review with its real inbound count",
+      any(r["url"] == "/ja" and r["all_inlinks"] == 60 for r in out["nav_hub_urls"]))
+check("and the island guides are STILL not swallowed as furniture",
+      all(not r["url"].startswith("/guides/") for r in out["nav_hub_urls"]))
+
+print("\n9. canonicals: the one that makes a page unindexable")
+# The real 2026-07-17 shape: a case-collision left /maps/harbor_1 carrying
+# /maps/Harbor_1's canonical, and that URL does not exist. Both halves look
+# fine in isolation, which is why only a tree-wide check finds it.
+pages = {
+    "/maps/a": '<link rel="canonical" href="/maps/a"><a href="/maps/b">b</a>',
+    "/maps/b": '<link rel="canonical" href="/maps/Nope"><a href="/maps/a">a</a>',
+    "/maps/c": '<link rel="canonical" href="/maps/a"><a href="/maps/a">a</a>',
+    "/maps/d": '<a href="/maps/a">a</a>',
+}
+g = sg.Graph()
+for url, html in pages.items():
+    pp = sg.parse(html)
+    src = g.uid(url)
+    g.meta[src] = {"exists": True, "words": pp.words, "title": pp.title,
+                   "canonical": sg.norm(pp.canonical) if pp.canonical else ""}
+    for href, anchor, boiler in pp.links:
+        g.adj[src].append((g.uid(sg.norm(href)), g.aid(anchor), boiler))
+
+
+class AC:
+    graph = None
+    limit = 50
+    ignore = None
+    boiler_threshold = 0.3
+
+
+with tempfile.TemporaryDirectory() as td:
+    f = os.path.join(td, "g.json")
+    with open(f, "w", encoding="utf-8") as fh:
+        json.dump(g.to_json({"mode": "offline"}), fh)
+    AC.graph = f
+    out = sg.cmd_canonicals(AC)
+
+check("a canonical naming a non-existent URL is DANGLING",
+      out["dangling_canonical"] == 1
+      and out["dangling_urls"][0]["url"] == "/maps/b")
+check("a canonical naming another REAL page is non_self, not dangling",
+      out["non_self_canonical"] == 1 and out["dangling_canonical"] == 1)
+check("a page with no canonical is reported separately",
+      out["missing_canonical"] == 1 and "/maps/d" in out["missing_urls"])
+check("a correct self-canonical is not reported at all",
+      "/maps/a" not in out["missing_urls"]
+      and all(r["url"] != "/maps/a" for r in out["dangling_urls"] + out["non_self_urls"]))
+check("an offline run says the URL set is complete",
+      "OFFLINE" in out["reading"])
+
+print()
+print("\nlink suggestions - which existing page should link to the weak one")
+pages = {
+    "/guides/wall-climb": "<title>Wall climb guide for beginners</title><p>x</p>",
+    "/guides/strafe-jump": "<title>Strafe jump and wall climb timing</title><p>Strafe and wall climb "
+                           "timing go together.</p>",
+    "/maps/harbor": "<title>Harbor callouts</title><p>Map guide.</p>",
+    "/guides/already": "<title>Wall climb already linking</title><a href='/guides/wall-climb'>wc</a>",
+    "/about": "<title>About us</title>",
+}
+g = build(pages)
+pq = {"/guides/wall-climb": {"wall climb": 400.0, "wallclimb trick": 50.0},
+      "/guides/strafe-jump": {"wall climb": 30.0, "strafe jump": 900.0},
+      "/maps/harbor": {"harbor callouts": 500.0}}
+sug = sg.suggest_links(g, [g.uid("/guides/wall-climb")], pq, set(), per_target=5)
+rows = sug[0]["suggestions"]
+srcs = [r["source"] for r in rows]
+check("a page sharing a QUERY and title words is a high-confidence source",
+      rows and rows[0]["source"] == "/guides/strafe-jump" and rows[0]["confidence"] == "high")
+check("the suggested anchor is the shared query", rows and rows[0]["anchor"] == "wall climb")
+check("a page ALREADY linking to the target is never suggested", "/guides/already" not in srcs)
+check("an unrelated page is not suggested", "/about" not in srcs and "/maps/harbor" not in srcs)
+check("the target never suggests itself", "/guides/wall-climb" not in srcs)
+none = sg.suggest_links(g, [g.uid("/about")], pq, set(), per_target=5)
+check("CONTROL: a target nothing relates to gets no suggestions, not padding",
+      none[0]["suggestions"] == [])
+
+print("\n7. a crawl fetch that failed is unreadable, not broken (live mode)")
+import argparse as _ap  # noqa: E402
+import json as _json  # noqa: E402
+import tempfile as _tf  # noqa: E402
+gl = sg.Graph()
+home, slow, gone, fine = gl.uid("/"), gl.uid("/modes"), gl.uid("/gone"), gl.uid("/ok")
+for t in (slow, gone, fine):
+    gl.adj[home].append((t, gl.aid("x"), False))
+    gl.adj[t].append((home, gl.aid("home"), True))   # the guard wants most pages linking out
+gl.meta[home] = {"status": 200}
+gl.meta[slow] = {"status": -1}     # timed out during the crawl
+gl.meta[gone] = {"status": 404}
+gl.meta[fine] = {"status": 200}
+with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+    _json.dump(gl.to_json({"mode": "live"}), fh)
+br = sg.cmd_broken(_ap.Namespace(graph=fh.name, limit=20, ignore=None, boiler_threshold=0.5))
+check("a 404 target is broken", [r_["url"] for r_ in br["worst"]] == ["/gone"])
+check("a target whose fetch failed is listed as unreadable, not broken",
+      [r_["url"] for r_ in br.get("unreadable", [])] == ["/modes"] and br["targets_without_a_page"] == 1)
+
+if FAILS:
+    print(f"FAILED: {len(FAILS)} -> {FAILS}")
+    sys.exit(1)
+print("all sitegraph tests passed")
