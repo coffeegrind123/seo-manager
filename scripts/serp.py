@@ -242,17 +242,33 @@ def _read_proxy_file() -> dict:
     return out
 
 
+PROXY_SELECTOR_STYLES = ("password", "username")
+
+
+def _selector_style() -> str:
+    """SEO_PROXY_SELECTORS from the env, else ~/.seo-proxy; 'password' unless it says 'username'."""
+    raw = os.environ.get("SEO_PROXY_SELECTORS") or _read_proxy_file().get("SEO_PROXY_SELECTORS", "")
+    raw = raw.strip().lower()
+    return raw if raw in PROXY_SELECTOR_STYLES else "password"
+
+
 class Proxy:
-    """A residential proxy with password-encoded sticky sessions.
+    """A residential proxy with sticky sessions encoded in the credentials.
 
     What this is actually for, after measurement: a non-datacenter exit for the
     browser, and geo-pinned SERPs (checking how a page ranks from Germany).
     It is NOT a way around DuckDuckGo's 202 - see provider_ddg.
 
-    Selectors ride on the PASSWORD, '_'-joined (reverse-engineered in
-    against one commercial provider):
+    Providers put the selectors in one of two places, chosen with
+    SEO_PROXY_SELECTORS (env or ~/.seo-proxy):
 
-        <pass>[_country-<cc>]_session-<6char>_lifetime-<min>
+        password  (default)  <pass>[_country-<cc>]_session-<6char>_lifetime-<min>
+        username             <user>[-country-<cc>]-lifetime-<min>-session-<6char>
+
+    Both shapes were measured against real accounts. Username-style providers
+    commonly accept a session only on their STICKY port range and refuse it on
+    the rotating one ("Can not use -session- on rotating ports"), so put the
+    sticky port in the URL itself.
 
     Same session token => same exit IP. No token => a NEW exit IP per request,
     which sounds better and is not: a rotating exit breaks any engine that does
@@ -260,10 +276,12 @@ class Proxy:
     So this class is sticky by default and rotates only on demand.
     """
 
-    def __init__(self, url: str, country: str | None = None, lifetime: int = 10):
+    def __init__(self, url: str, country: str | None = None, lifetime: int = 10,
+                 style: str | None = None):
         self.base = url
         self.country = country
         self.lifetime = lifetime
+        self.style = style if style in PROXY_SELECTOR_STYLES else _selector_style()
         self.session = self._token()
 
     @staticmethod
@@ -280,12 +298,26 @@ class Proxy:
         self.session = self._token()
 
     def url(self) -> str:
+        at = self.base.rfind("@")
+        if at <= 0:
+            return self.base
+
+        if self.style == "username":
+            sel = f"-country-{self.country}" if self.country else ""
+            sel += f"-lifetime-{self.lifetime}-session-{self.session}"
+            # Insert at the end of the username: before the ':' that starts the password,
+            # or before the '@' when there is no password. Spliced as text so the password's
+            # own percent-encoding is left exactly as configured.
+            start = self.base.find("//") + 2 if "//" in self.base else 0
+            colon = self.base.find(":", start, at)
+            end = colon if colon != -1 else at
+            return self.base[:end] + sel + self.base[end:]
+
         sel = f"_country-{self.country}" if self.country else ""
         sel += f"_session-{self.session}_lifetime-{self.lifetime}"
         # Insert the selector at the end of the password, i.e. just before the
         # final '@' that separates credentials from the host.
-        at = self.base.rfind("@")
-        return self.base[:at] + sel + self.base[at:] if at > 0 else self.base
+        return self.base[:at] + sel + self.base[at:]
 
     def label(self) -> str:
         """Loggable identity. NEVER returns credentials."""

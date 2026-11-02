@@ -237,6 +237,14 @@ def _proxy_file_url() -> str:
 _PROXY_URL_CACHE: str | None = None
 
 
+def has_session_selector(url: str) -> bool:
+    """True when the URL's CREDENTIALS already carry a session selector, in either style
+    serp.Proxy writes (`_session-` on the password, `-session-` on the username). Only the
+    part before the last '@' is looked at, so a host named session-1.example is not one."""
+    at = (url or "").rfind("@")
+    return at > 0 and "session-" in url[:at]
+
+
 def resolve_proxy_url() -> str:
     """Env first, then ~/.seo-proxy. One resolver, used everywhere.
 
@@ -261,7 +269,7 @@ def resolve_proxy_url() -> str:
     url = (os.environ.get("SERPD_PROXY")
            or os.environ.get("SEO_PROXY_URL")
            or _proxy_file_url()).strip()
-    if url and "_session-" not in url:
+    if url and not has_session_selector(url):
         try:
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             import serp  # same directory; imported lazily so serpd runs without it

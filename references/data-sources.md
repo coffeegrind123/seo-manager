@@ -327,8 +327,9 @@ Measured 2026-08-01: a research run was Google-rate-limited after ~8 queries and
 stayed limited across repeated retries, while rotating the session token cleared
 **7 refused queries on the first fresh exit**.
 
-So `resolve_proxy_url()` appends `_session-<6char>_lifetime-10` when the URL does
-not already carry one. The session is **sticky for the life of the daemon** (an
+So `resolve_proxy_url()` adds a session selector (via `serp.Proxy`, in the style
+`SEO_PROXY_SELECTORS` names, see below) when the URL's credentials do not already
+carry one. The session is **sticky for the life of the daemon** (an
 engine's redirect + cookie hop must land on one exit — see `serp.Proxy`) and
 **fresh on every restart**. That is what turns the quality bar's prescribed
 response to a refused read — `seodoctor.py --hard` — into an actual fix rather
@@ -409,11 +410,24 @@ responses, and HTTP CONNECT is what curl and the browser want natively.
 
 ### Sticky sessions, not per-request rotation
 
-Many residential providers carry session selectors on the **password**,
-`_`-joined. A common shape:
+Residential providers carry session selectors in the credentials, in one of two
+shapes. Tell the skill which with `SEO_PROXY_SELECTORS` (env or `~/.seo-proxy`):
 
 ```
-<pass>[_country-<cc>]_session-<6char>_lifetime-<min>
+password  (default)  <pass>[_country-<cc>]_session-<6char>_lifetime-<min>
+username             <user>[-country-<cc>]-lifetime-<min>-session-<6char>
+```
+
+Username-style providers commonly accept a session **only on their sticky port
+range** and answer the rotating one with an error such as "Can not use -session-
+on rotating ports range". Put the sticky port in `SEO_PROXY_URL` itself; the skill
+never rewrites ports. Measured on such an account: the same session token held
+one exit on 3/3 requests on the sticky port, and HTTPS through it returned 200.
+
+```bash
+# ~/.seo-proxy for a username-style provider (sticky HTTP port in the URL)
+SEO_PROXY_URL=http://USER:PASS@proxy.example-provider.com:10000
+SEO_PROXY_SELECTORS=username
 ```
 
 Same token → same exit IP; no token → a new exit **every request**. Rotation
